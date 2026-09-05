@@ -265,7 +265,7 @@ func (s *Strategy) ComputeEvidenceKey() string {
 	// malformed / non-positive) adds no suffix, keeping the pre-budget key
 	// stable for the non-evolved path (zero-value usable).
 	if budget, ok := normalizeBudgetKey(s.Params); ok {
-		evidenceKey = evidenceKey + fmt.Sprintf("|budget=%d", budget)
+		evidenceKey += fmt.Sprintf("|budget=%d", budget)
 	}
 
 	// Y1 C5: include the trimmed prior hint so strategies that differ only in

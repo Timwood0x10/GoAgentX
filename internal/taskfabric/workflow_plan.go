@@ -35,7 +35,8 @@ type PlanStep struct {
 // CompilePlan validates a batch of PlanSteps and creates them as READY tasks
 // in one all-or-nothing transaction:
 //
-//   - every DependsOn reference must resolve to a step in the batch;
+//   - every DependsOn reference must resolve — inside the batch first, then
+//     against tasks already in the fabric (see resolveDependencies);
 //   - the dependency graph must be acyclic (topological check);
 //   - every Create must succeed — any failure rolls back the tasks already
 //     created in this batch so a half-built DAG never pollutes the ready queue.
@@ -67,13 +68,16 @@ func (f *Fabric) CompilePlan(ctx context.Context, steps []PlanStep) ([]string, e
 		}
 		byID[s.ID] = s
 	}
-	// Dependency closure: every DependsOn must resolve inside the batch.
-	for _, s := range steps {
-		for _, dep := range s.DependsOn {
-			if _, ok := byID[dep]; !ok {
-				return nil, fmt.Errorf("taskfabric: compile plan: step %q depends on unknown step %q", s.ID, dep)
-			}
-		}
+	// Dependency closure: batch first, then tasks already in the fabric
+	// (see resolveDependencies). Cross-batch resolution is what makes
+	// runtime graph growth possible — a node grown at runtime depends on
+	// nodes compiled by an earlier batch, which are typically already
+	// COMPLETED and therefore let the new task go READY immediately.
+	f.mu.Lock()
+	err := resolveDependencies(steps, byID, f.tasks)
+	f.mu.Unlock()
+	if err != nil {
+		return nil, fmt.Errorf("taskfabric: compile plan: %w", err)
 	}
 	if err := detectPlanCycle(steps, byID); err != nil {
 		return nil, err
@@ -130,8 +134,80 @@ func (f *Fabric) CompilePlan(ctx context.Context, steps []PlanStep) ([]string, e
 	return created, nil
 }
 
+// CompileNode compiles a single PlanStep into exactly one task. It is the
+// entry point the incremental compiler uses when the live MutableDAG grows a
+// node at runtime (TOOL_DAG_MAINLINE_DESIGN §4.1): one graph change, one
+// task, and every other task of the graph is left untouched — including the
+// ones that are currently RUNNING.
+//
+// The dependency rules are CompilePlan's, so a node may depend on a task
+// compiled by an earlier batch (typically an already-COMPLETED plan node);
+// depsCompletedLocked then reports it READY on the spot.
+//
+// Args:
+//   - ctx: bounds the compile (see CompilePlan).
+//   - step: the single step to compile; ID must be non-empty.
+//
+// Returns:
+//   - string: the created task ID (== step.ID).
+//   - error: ErrTaskExists / ErrTaskIDRequired / validation errors, wrapped.
+func (f *Fabric) CompileNode(ctx context.Context, step PlanStep) (string, error) {
+	ids, err := f.CompilePlan(ctx, []PlanStep{step})
+	if err != nil {
+		return "", err
+	}
+	if len(ids) != 1 {
+		// Unreachable: CompilePlan returns one id per input step or an
+		// error. Guarded so the 1:1 contract cannot silently widen.
+		return "", fmt.Errorf("taskfabric: compile node %q: expected 1 task, got %d", step.ID, len(ids))
+	}
+	return ids[0], nil
+}
+
+// resolveDependencies validates the dependency closure of a compile batch.
+//
+// Resolution order is the whole point of this function:
+//
+//  1. inside the batch — the classic whole-graph compile;
+//  2. a task already in the fabric — the runtime-growth case, where the new
+//     node depends on something compiled by an earlier batch;
+//  3. neither → an error, naming both ids.
+//
+// Order matters: a batch-local definition always wins, so a batch that
+// redefines a node does not silently bind to a same-id task left behind from
+// an earlier compile (that binding would resurrect a stale dependency edge).
+//
+// Caller must hold f.mu.
+//
+// Args:
+//   - steps: the batch being compiled.
+//   - byID: id → step for the batch.
+//   - existing: the fabric's live task index (read-only here).
+//
+// Returns:
+//   - error: the first unresolved dependency, or nil.
+func resolveDependencies(steps []PlanStep, byID map[string]PlanStep, existing map[string]*Task) error {
+	for _, s := range steps {
+		for _, dep := range s.DependsOn {
+			if _, ok := byID[dep]; ok {
+				continue
+			}
+			if _, ok := existing[dep]; ok {
+				continue
+			}
+			return fmt.Errorf("step %q depends on unknown step %q", s.ID, dep)
+		}
+	}
+	return nil
+}
+
 // detectPlanCycle runs a depth-first color walk over the batch dependency
 // graph and reports the first cycle found.
+//
+// Dependencies that resolve outside the batch (a task already in the fabric)
+// are not walked: they existed before this batch, so no cycle introduced by
+// this batch can pass through them, and treating them as zero-value batch
+// members would pollute the walk with phantom nodes.
 //
 // Args:
 //   - steps: the batch in input order.
@@ -152,6 +228,10 @@ func detectPlanCycle(steps []PlanStep, byID map[string]PlanStep) error {
 		color[id] = gray
 		next := append(append([]string(nil), path...), id)
 		for _, dep := range byID[id].DependsOn {
+			if _, ok := byID[dep]; !ok {
+				// Resolves to a task outside this batch: not ours to walk.
+				continue
+			}
 			switch color[dep] {
 			case gray:
 				return fmt.Errorf("taskfabric: compile plan: dependency cycle: %v -> %s", next, dep)

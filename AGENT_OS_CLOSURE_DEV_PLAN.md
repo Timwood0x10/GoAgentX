@@ -720,6 +720,8 @@ Step 1-5 交付「判决语义正确」；Step 6 交付「判决输入可归因�
 
 > 状态：**方向草案，需按 code\_rules\_v2 §0.4 经确认后再动手**。目标：单 agent 内按 `MutableDAG` 逐步推进，撤销顶层 ReAct 循环；ReAct 只保留为单个节点类型，不再作为执行模型。约束：不引入新依赖、不并存两套执行循环（§5.1）、零值可用（§5.4）、单文件<1000 行 / 单函数<100 行。
 
+**状态注记（2026-09-05，仅追加，不改原文）**：M.3 方向草案已升格为独立主线文档 `TOOL_DAG_MAINLINE_DESIGN.md`（两层同构 MutableDAG、M0–M6 落地序列、四缺口附录 R），本 M.3 保留为草案历史。后续实施以主线文档为唯一依据。
+
 ### M.3.1 为什么
 
 - 现在：`chat_cognition.go` 的 `chatStepState{Messages[]}` 线性推进，进化只能拧 `Params["tools"]`，拓扑靠事后投影（`toolprojection`）硬造。
