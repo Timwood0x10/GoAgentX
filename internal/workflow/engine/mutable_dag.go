@@ -535,6 +535,14 @@ func (m *MutableDAG) Unsubscribe(id string) {
 	m.hub.Unsubscribe(id)
 }
 
+// DroppedEvents returns how many graph events the subscriber missed because
+// its buffer was full. The incremental compiler polls it to catch drops at
+// the tail of a burst (no later event arrives to reveal the sequence gap) and
+// runs a full reconcile when the counter moves.
+func (m *MutableDAG) DroppedEvents(subID string) uint64 {
+	return m.hub.Dropped(subID)
+}
+
 // NodeCount returns the number of nodes.
 func (m *MutableDAG) NodeCount() int {
 	m.mu.RLock()

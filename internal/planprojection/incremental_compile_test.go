@@ -14,11 +14,9 @@ import (
 	"github.com/Timwood0x10/ares/internal/workflow/engine"
 )
 
-// M0 acceptance suite (TOOL_DAG_MAINLINE_DESIGN §4.1).
-//
-// These four assertions are the gate for the whole mainline: without an
-// incremental compiler, runtime graph growth (M2's plannerCognition growing
-// tool nodes) dies on ErrTaskExists — verified, not estimated. Every test
+// These four assertions are the gate for runtime graph growth: without an
+// incremental compiler, a planner adding tool nodes on the fly dies on
+// ErrTaskExists — verified, not estimated. Every test
 // here drives a real Fabric and a real MutableDAG; none of them recompile.
 
 // waitForChange drives one graph mutation through the event subscription and
@@ -53,7 +51,7 @@ func sortedIDs(t *testing.T, fabric *taskfabric.Fabric) []string {
 	return ids
 }
 
-// Assertion 1 (§4.1): one AddNode creates exactly one task, and every other
+// Assertion 1: one AddNode creates exactly one task, and every other
 // task keeps its CreatedAt — proving nothing was rebuilt.
 func TestM0_AddNodeCreatesExactlyOneTaskWithoutRebuilding(t *testing.T) {
 	dag, err := engine.NewMutableDAG([]*engine.Step{
@@ -103,7 +101,7 @@ func TestM0_AddNodeCreatesExactlyOneTaskWithoutRebuilding(t *testing.T) {
 	assert.Equal(t, []string{"grep"}, task.Dependencies)
 }
 
-// Assertion 2 (§4.1): a node grown onto an already-COMPLETED task is READY
+// Assertion 2: a node grown onto an already-COMPLETED task is READY
 // on the spot. This is the whole point of cross-batch dependency resolution
 // — without it CompilePlan rejects the dependency as unknown.
 func TestM0_NodeDependingOnCompletedTaskIsReadyImmediately(t *testing.T) {
@@ -144,7 +142,7 @@ func TestM0_NodeDependingOnCompletedTaskIsReadyImmediately(t *testing.T) {
 	assert.Contains(t, fabric.ReadyTasks(), "grep")
 }
 
-// Assertion 3 (§4.1) — the one that matters most: with a RUNNING task in the
+// Assertion 3 — the one that matters most: with a RUNNING task in the
 // fabric, AddNode still compiles, and the RUNNING task is untouched.
 //
 // Under the old full-recompile path this scenario failed the entire batch:
@@ -197,14 +195,14 @@ func TestM0_AddNodeWithRunningTaskPresentLeavesItUntouched(t *testing.T) {
 	_, err = fabric.Task("read")
 	require.NoError(t, err)
 
-	// The contrast is the point of M0: a FULL recompile in this state fails.
+	// The contrast is the point: a FULL recompile in this state fails.
 	fullCtx := context.Background()
 	_, err = coord.CompileDAG(fullCtx, dag)
-	require.Error(t, err, "a full recompile cannot reclaim a RUNNING task — that is why M0 exists")
+	require.Error(t, err, "a full recompile cannot reclaim a RUNNING task — that is why the incremental path exists")
 	assert.Contains(t, err.Error(), "slow", "the error must name the task that could not be reclaimed")
 }
 
-// Assertion 4 (§4.1): SetNodeMetadata rewrites the payload in place — the
+// Assertion 4: SetNodeMetadata rewrites the payload in place — the
 // task is not recreated, but the new metadata is visible to the executor.
 func TestM0_SetNodeMetadataUpdatesPayloadWithoutRecreatingTask(t *testing.T) {
 	dag, err := engine.NewMutableDAG([]*engine.Step{

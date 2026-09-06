@@ -21,9 +21,9 @@ const (
 	EventTaskExpired      EventType = "task.expired"
 	EventTaskStolen       EventType = "task.stolen"
 	// EventTaskUpdated records an in-place rewrite of a task's scheduling
-	// shape (Dependencies) or its payload by the incremental compiler
-	// (TOOL_DAG_MAINLINE_DESIGN §4.1): one graph change moves one task
-	// instead of rebuilding the whole compiled batch.
+	// shape (Dependencies) or its payload by the incremental compiler: one
+	// graph change moves one task instead of rebuilding the whole compiled
+	// batch.
 	//
 	// It is observability-only BY DESIGN — absent from isMustPersistEvent
 	// and unmapped in taskEventType, so nothing is written to the durable

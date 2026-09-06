@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"log/slog"
 	"math/rand"
 	"sync/atomic"
 	"time"
@@ -291,6 +292,21 @@ func createPeerAgents(
 	}
 	kernel.agents = agents
 
+	// The DAG execution gate. Zero value = legacy ReAct behavior (chat
+	// cognition for every peer, L2 machinery test-only).
+	//
+	// The gate MUST stay off until BOTH prerequisites are true: (1) peers
+	// advertise the full capability set the router needs (ares/root,
+	// ares/plan, ares/answer, tool/<name>) instead of a single primary type,
+	// and (2) the per-session graph registry is wired. Flipping Enabled now
+	// yields NO schedulable candidate for any L2 task, so it would break
+	// every peer — do not enable until M2 session wiring + M3 capability
+	// advertisement land.
+	peerDAGExecution := agentfabric.DAGExecution{}
+	// The router body is stateless (one instance drives many nodes), so it is
+	// built once and shared by every spawned peer.
+	peerRouter := agentfabric.NewRouterCognition(toolBinder, slog.Default())
+
 	// C1: configured sub-agents ARE the fabric's dynamic population — each is
 	// spawned WITH its execution body (ChatCognition) and its distilled
 	// experience prior (G1), instead of living only in the static executor
@@ -317,7 +333,7 @@ func createPeerAgents(
 			// moved down into agentfabric — a fabric agent is fully
 			// self-contained (LLM + tools), no sub.Agent wrapper.
 			CognitionFactory: func([]string) agentfabric.Cognition {
-				return cog
+				return peerDAGExecution.Select(cog, peerRouter)
 			},
 			ExperiencePrior: loadExperiencePrior(ctx, expRepo, sa.ID()),
 		}); err != nil {

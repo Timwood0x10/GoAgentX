@@ -301,3 +301,49 @@ func TestGraphEvent_ErrorField(t *testing.T) {
 	assert.False(t, event.Success)
 	assert.ErrorIs(t, event.Error, ErrCycleDetected)
 }
+
+// TestGraphEventHub_SeqAndDroppedCount pins hub-level gap accounting:
+// published events carry hub-wide monotonic sequence numbers, and a
+// subscriber that falls behind a burst loses events LOUDLY — the per-subscriber
+// drop counter moves by exactly the overflow.
+func TestGraphEventHub_SeqAndDroppedCount(t *testing.T) {
+	hub := NewGraphEventHub()
+	subID, ch := hub.Subscribe()
+	defer hub.Unsubscribe(subID)
+
+	// No reader runs during the burst, so every event past the buffer is a
+	// deterministic drop — no timing involved.
+	const burst = graphEventBufferSize + 20
+	for i := 0; i < burst; i++ {
+		hub.Publish(GraphEvent{Change: GraphChange{Type: ChangeAddNode, NodeID: "n"}, Success: true})
+	}
+	assert.Equal(t, uint64(burst-graphEventBufferSize), hub.Dropped(subID),
+		"every event past the 64-buffer must be counted, never silently lost")
+
+	var last uint64
+	for i := 0; i < graphEventBufferSize; i++ {
+		evt := <-ch
+		require.Greater(t, evt.Seq, last, "delivered events keep monotonic sequence numbers")
+		last = evt.Seq
+	}
+	assert.Equal(t, uint64(graphEventBufferSize), last, "the first 64 events are delivered in order")
+	assert.Equal(t, uint64(0), hub.Dropped("sub-unknown"), "unknown subscriber drops nothing")
+}
+
+// TestGraphEventHub_UnsubscribeReclaimsDropCounter pins that the drop
+// bookkeeping dies with its subscriber: subscription IDs are never reused, so
+// a counter left behind on Unsubscribe would accumulate one dead entry per
+// subscribe/unsubscribe cycle for the life of the hub.
+func TestGraphEventHub_UnsubscribeReclaimsDropCounter(t *testing.T) {
+	hub := NewGraphEventHub()
+	subID, _ := hub.Subscribe()
+	for i := 0; i < graphEventBufferSize+1; i++ {
+		hub.Publish(GraphEvent{Change: GraphChange{Type: ChangeAddNode, NodeID: "n"}, Success: true})
+	}
+	require.Equal(t, uint64(1), hub.Dropped(subID), "precondition: the subscriber has a live drop counter")
+
+	hub.Unsubscribe(subID)
+
+	assert.Equal(t, uint64(0), hub.Dropped(subID), "the counter is reclaimed with the subscriber")
+	assert.Empty(t, hub.dropped, "no bookkeeping outlives its subscriber")
+}

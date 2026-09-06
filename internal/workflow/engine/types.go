@@ -50,10 +50,10 @@ const (
 
 // Step represents a single step in a workflow.
 //
-// NOTE (TOOL_DAG_MAINLINE_DESIGN App.S decision C): the Output field is
-// reserved but nothing in production writes it today — L2 session graphs must
-// keep it that way. Execution facts live in the fabric task envelope, and M3
-// reads predecessor output by joining the envelope, never this field.
+// The Output field is reserved but nothing in production writes it today — L2
+// session graphs keep it that way. Execution facts live in the fabric task
+// envelope; predecessor output is read by joining the envelope, never this
+// field.
 type Step struct {
 	ID             string            `json:"id"`
 	Name           string            `json:"name"`

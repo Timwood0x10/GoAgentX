@@ -8,7 +8,7 @@
 // Fabric.CompilePlan.
 //
 // Two compile paths exist, and the difference between them is the whole
-// point of TOOL_DAG_MAINLINE_DESIGN §4.1:
+// point of the incremental compiler:
 //
 //   - CompileDAG is the FULL path (cold start, ResetFromSteps): it reclaims
 //     the tasks of the previous compile and rebuilds the batch.
@@ -19,6 +19,7 @@ package planprojection
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sort"
 	"strings"
@@ -189,7 +190,14 @@ const (
 	opDelete          = "delete"
 	opSetDependencies = "set_dependencies"
 	opUpdatePayload   = "update_payload"
+	opCreate          = "create"
 )
+
+// reconcilePollInterval is how often the event subscription polls the hub
+// drop counter. Event-driven gap detection (sequence skip on the next
+// delivered event) cannot see drops at the TAIL of a burst — no later event
+// arrives to reveal them — so the counter poll is what converges the tail.
+const reconcilePollInterval = 250 * time.Millisecond
 
 // SkippedOp is one incremental-compile action that could not be applied
 // because the target task was in a state that forbids it (RUNNING/LEASED/
@@ -243,7 +251,7 @@ func (r *ChangeResult) markUpdated(id string) {
 }
 
 // ApplyChange projects ONE graph change onto the fabric — the incremental
-// compile path behind runtime graph growth (TOOL_DAG_MAINLINE_DESIGN §4.1).
+// compile path behind runtime graph growth.
 //
 // It is dispatching on ChangeType, not recompiling, because a full rebuild
 // is exactly what the growth path cannot survive: Fabric.Delete refuses a
@@ -301,6 +309,14 @@ func (c *CompileCoordinator) ApplyChange(ctx context.Context, dag *engine.Mutabl
 		return res, fmt.Errorf("planprojection: apply change: unknown change type %d", evt.Change.Type)
 	}
 
+	return c.finishChange(ctx, res), nil
+}
+
+// finishChange stamps the compile provenance for one incremental compile
+// action (ApplyChange or Reconcile) and emits the introspection event. Both
+// paths share it so "which compile moved which tasks" is answered one way no
+// matter which path moved them.
+func (c *CompileCoordinator) finishChange(ctx context.Context, res ChangeResult) ChangeResult {
 	c.mu.Lock()
 	c.lastCompile = CompileRecord{
 		Generation: c.generation,
@@ -315,7 +331,133 @@ func (c *CompileCoordinator) ApplyChange(ctx context.Context, dag *engine.Mutabl
 
 	c.recordCompileEvent(ctx, record, &res)
 
-	return res, nil
+	return res
+}
+
+// Reconcile re-projects the DAG's CURRENT state onto the fabric — the
+// compensation for missed graph events. The DAG is the source of truth, not
+// the event stream: every node without a tracked task is created (in
+// topological order, so one pass converges a wholly-missed burst), every
+// tracked task is refreshed from the graph, and every tracked id the graph no
+// longer holds is deleted. Refusals (a RUNNING task cannot move) land in
+// Skipped; only a structural failure is an error.
+func (c *CompileCoordinator) Reconcile(ctx context.Context, dag *engine.MutableDAG) (ChangeResult, error) {
+	if c == nil || c.fabric == nil {
+		return ChangeResult{}, fmt.Errorf("planprojection: reconcile: nil fabric")
+	}
+	if dag == nil {
+		return ChangeResult{}, fmt.Errorf("planprojection: reconcile: nil dag")
+	}
+	res := ChangeResult{
+		Change:     engine.ChangeReconcile,
+		CompileID:  c.nextCompileID(),
+		DAGVersion: dag.Version(),
+	}
+
+	order, err := dag.GetExecutionOrder()
+	if err != nil {
+		return res, fmt.Errorf("planprojection: reconcile: %w", err)
+	}
+	steps := dag.StepIndex()
+
+	c.mu.RLock()
+	tracked := make(map[string]struct{}, len(c.planIDs))
+	for id := range c.planIDs {
+		tracked[id] = struct{}{}
+	}
+	c.mu.RUnlock()
+
+	for _, id := range order {
+		if err := ctx.Err(); err != nil {
+			return res, fmt.Errorf("planprojection: reconcile: %w", err)
+		}
+		if _, ok := tracked[id]; !ok {
+			c.reconcileCreate(ctx, dag, steps[id], &res)
+			continue
+		}
+		c.reconcileRefresh(dag, id, steps[id], &res)
+	}
+	for id := range tracked {
+		if _, ok := steps[id]; !ok {
+			c.applyRemoveNode(engine.GraphChange{Type: engine.ChangeRemoveNode, NodeID: id}, &res)
+		}
+	}
+
+	return c.finishChange(ctx, res), nil
+}
+
+// compileOrAdopt creates the task for one node, or adopts the task that
+// already carries its id and brings it current with the graph.
+//
+// Projection is at-least-once, so ErrTaskExists is a convergence signal, not a
+// failure: a Reconcile compensating a dropped event creates the task before
+// the event is delivered, and a restart meets tasks compiled outside the event
+// path. Adoption alone is NOT enough — a task compiled without the graph's
+// dependencies is READY and can run BEFORE its predecessors — so an adopted
+// task is refreshed from the graph, which is the source of truth.
+//
+// Args:
+//   - ctx: bounds the compile.
+//   - dag: the live graph the adopted task is refreshed against.
+//   - step: the node to project.
+//   - res: accumulates the updated ids and any refusal from the refresh.
+//
+// Returns:
+//   - id: the compiled task id, or "" when an existing task was adopted and
+//     refreshed instead of created.
+//   - error: only a real compile failure; ErrTaskExists never surfaces.
+func (c *CompileCoordinator) compileOrAdopt(
+	ctx context.Context, dag *engine.MutableDAG, step *engine.Step, res *ChangeResult,
+) (string, error) {
+	id, err := c.fabric.CompileNode(ctx, ProjectStep(step))
+	if err != nil {
+		if !errors.Is(err, taskfabric.ErrTaskExists) {
+			return "", err
+		}
+		c.addTracked(step.ID)
+		c.reconcileRefresh(dag, step.ID, step, res)
+		return "", nil
+	}
+	c.addTracked(id)
+	return id, nil
+}
+
+// reconcileCreate compiles one untracked node, adopting a pre-existing task
+// under the same id. A compile failure is reported as a skipped action rather
+// than aborting the pass: one unprojectable node must not strand the rest of
+// the graph.
+func (c *CompileCoordinator) reconcileCreate(
+	ctx context.Context, dag *engine.MutableDAG, step *engine.Step, res *ChangeResult,
+) {
+	id, err := c.compileOrAdopt(ctx, dag, step, res)
+	if err != nil {
+		res.Skipped = append(res.Skipped, SkippedOp{TaskID: step.ID, Op: opCreate, Err: err})
+		return
+	}
+	if id != "" {
+		res.Created = append(res.Created, id)
+	}
+}
+
+// reconcileRefresh brings one already-tracked task current with the DAG: deps
+// rewritten from the graph (the source of truth), payload re-projected.
+// Terminal tasks are history — their deps and payload are frozen by
+// completion, and rewriting them would only manufacture Skipped noise.
+func (c *CompileCoordinator) reconcileRefresh(dag *engine.MutableDAG, id string, step *engine.Step, res *ChangeResult) {
+	if tk, err := c.fabric.Task(id); err == nil &&
+		(tk.State == taskfabric.StateCompleted || tk.State == taskfabric.StateFailed) {
+		return
+	}
+	if err := c.fabric.SetDependencies(id, dag.ReadDeps(id)); err != nil {
+		res.Skipped = append(res.Skipped, SkippedOp{TaskID: id, Op: opSetDependencies, Err: err})
+	} else {
+		res.markUpdated(id)
+	}
+	if err := c.fabric.UpdatePayload(id, ProjectStep(step).Payload); err != nil {
+		res.Skipped = append(res.Skipped, SkippedOp{TaskID: id, Op: opUpdatePayload, Err: err})
+	} else {
+		res.markUpdated(id)
+	}
 }
 
 // LastChange returns the most recent incremental compile result. Zero-valued
@@ -328,7 +470,9 @@ func (c *CompileCoordinator) LastChange() ChangeResult {
 
 // applyAddNode creates exactly one task for the added node. Its
 // dependencies resolve against tasks already in the fabric, so a node grown
-// onto an already-COMPLETED predecessor is READY immediately.
+// onto an already-COMPLETED predecessor is READY immediately. A task that
+// already exists under the node's id is adopted and refreshed
+// (see compileOrAdopt), not treated as a failure.
 func (c *CompileCoordinator) applyAddNode(ctx context.Context, dag *engine.MutableDAG, ch engine.GraphChange, res *ChangeResult) error {
 	step := ch.Step
 	if step == nil {
@@ -337,12 +481,13 @@ func (c *CompileCoordinator) applyAddNode(ctx context.Context, dag *engine.Mutab
 	if step == nil {
 		return fmt.Errorf("add node %q: step not found in the live DAG", ch.NodeID)
 	}
-	id, err := c.fabric.CompileNode(ctx, ProjectStep(step))
+	createdID, err := c.compileOrAdopt(ctx, dag, step, res)
 	if err != nil {
 		return fmt.Errorf("add node %q: %w", ch.NodeID, err)
 	}
-	c.addTracked(id)
-	res.Created = append(res.Created, id)
+	if createdID != "" {
+		res.Created = append(res.Created, createdID)
+	}
 	return nil
 }
 
@@ -350,8 +495,20 @@ func (c *CompileCoordinator) applyAddNode(ctx context.Context, dag *engine.Mutab
 // already taken cannot be deleted — and must not be: dropping it mid-quantum
 // would strand the runner. It stays tracked so a later Delete (or the next
 // full compile) reclaims it, and the refusal is reported, not swallowed.
+//
+// An already-absent task is convergence, not refusal: a Reconcile that
+// compensated a dropped event deletes the task before the event is delivered.
+// Reporting that as Skipped would make the compensation path emit a permanent
+// stream of warnings and make ChangeResult.Complete report a failure that
+// never happened. The postcondition ("no task for this node") holds either
+// way, so the change is a no-op — the stale tracking entry is dropped and
+// nothing is recorded as removed, because this change removed nothing.
 func (c *CompileCoordinator) applyRemoveNode(ch engine.GraphChange, res *ChangeResult) {
 	if err := c.fabric.Delete(ch.NodeID); err != nil {
+		if errors.Is(err, taskfabric.ErrTaskNotFound) {
+			c.removeTracked(ch.NodeID)
+			return
+		}
 		res.Skipped = append(res.Skipped, SkippedOp{TaskID: ch.NodeID, Op: opDelete, Err: err})
 		return
 	}
@@ -411,6 +568,12 @@ func (c *CompileCoordinator) applyMetadataChange(dag *engine.MutableDAG, ch engi
 //
 // A same-ID replacement is an in-place rewrite, not a create/delete pair:
 // ReplaceNode keeps the node's identity, so the fabric must too.
+//
+// Both ends tolerate at-least-once delivery: the replacement task may already
+// exist because a Reconcile compensated a dropped event first (adopted via
+// compileOrAdopt), and the old task may already be gone (a no-op delete). The
+// successors are migrated either way — that is the part a lost event would
+// strand.
 func (c *CompileCoordinator) applyReplaceNode(ctx context.Context, dag *engine.MutableDAG, ch engine.GraphChange, res *ChangeResult) error {
 	newID, oldID := ch.NodeID, ch.OldNodeID
 	if newID == oldID {
@@ -433,12 +596,13 @@ func (c *CompileCoordinator) applyReplaceNode(ctx context.Context, dag *engine.M
 	if step == nil {
 		return fmt.Errorf("replace node %q with %q: step not found in the live DAG", oldID, newID)
 	}
-	id, err := c.fabric.CompileNode(ctx, ProjectStep(step))
+	createdID, err := c.compileOrAdopt(ctx, dag, step, res)
 	if err != nil {
 		return fmt.Errorf("replace node %q with %q: %w", oldID, newID, err)
 	}
-	c.addTracked(id)
-	res.Created = append(res.Created, id)
+	if createdID != "" {
+		res.Created = append(res.Created, createdID)
+	}
 
 	// Successors: ReplaceNode already migrated the edges in the DAG, so the
 	// DAG holds each successor's post-replacement dependency list — rewrite
@@ -470,6 +634,11 @@ func (c *CompileCoordinator) applyReplaceNode(ctx context.Context, dag *engine.M
 // returned function can be called to unsubscribe early (e.g. during
 // shutdown).
 //
+// Missed events are compensated, not tolerated: a sequence skip on
+// the next delivered event triggers a full Reconcile, and the hub drop
+// counter is polled (per event plus on a ticker, which catches drops at the
+// tail of a burst where no later event arrives to reveal the gap).
+//
 // This closes the "two graphs" gap: a GraphPatchExecutor mutation on the
 // live MutableDAG reaches the task set so the next scheduler drain sees the
 // updated topology.
@@ -482,6 +651,11 @@ func (c *CompileCoordinator) SubscribeGraphEvents(ctx context.Context, dag *engi
 
 	go func() {
 		defer close(done)
+		var lastSeq uint64
+		var haveSeq bool
+		lastDropped := dag.DroppedEvents(subID)
+		ticker := time.NewTicker(reconcilePollInterval)
+		defer ticker.Stop()
 		for {
 			select {
 			case <-ctx.Done():
@@ -491,6 +665,13 @@ func (c *CompileCoordinator) SubscribeGraphEvents(ctx context.Context, dag *engi
 				if !ok {
 					return
 				}
+				if haveSeq && evt.Seq != lastSeq+1 {
+					log.Warn("planprojection: graph event gap detected; reconciling",
+						"expected_seq", lastSeq+1, "got_seq", evt.Seq, "node", evt.Change.NodeID)
+					c.reconcileNow(ctx, dag, "sequence gap")
+				}
+				haveSeq = true
+				lastSeq = evt.Seq
 				compileCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
 				res, err := c.ApplyChange(compileCtx, dag, evt)
 				cancel()
@@ -506,6 +687,9 @@ func (c *CompileCoordinator) SubscribeGraphEvents(ctx context.Context, dag *engi
 					log.Warn("planprojection: incremental compile skipped action",
 						"op", s.Op, "task_id", s.TaskID, "compile_id", res.CompileID, "error", s.Err)
 				}
+				lastDropped = c.checkDrops(ctx, dag, subID, lastDropped)
+			case <-ticker.C:
+				lastDropped = c.checkDrops(ctx, dag, subID, lastDropped)
 			}
 		}
 	}()
@@ -514,6 +698,35 @@ func (c *CompileCoordinator) SubscribeGraphEvents(ctx context.Context, dag *engi
 		dag.Unsubscribe(subID)
 		<-done
 	}
+}
+
+// checkDrops polls the subscriber's hub drop counter and reconciles when it
+// moved. Returns the counter for the next comparison.
+func (c *CompileCoordinator) checkDrops(ctx context.Context, dag *engine.MutableDAG, subID string, last uint64) uint64 {
+	dropped := dag.DroppedEvents(subID)
+	if dropped != last {
+		log.Warn("planprojection: graph events dropped; reconciling",
+			"dropped_total", dropped, "dropped_since_last_check", dropped-last)
+		c.reconcileNow(ctx, dag, "dropped events")
+	}
+	return dropped
+}
+
+// reconcileNow runs a full Reconcile and logs the outcome with its counts, so
+// "the graph changed but the task set did not" stays attributable even on
+// the compensation path.
+func (c *CompileCoordinator) reconcileNow(ctx context.Context, dag *engine.MutableDAG, reason string) {
+	rctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+	res, err := c.Reconcile(rctx, dag)
+	if err != nil {
+		log.Error("planprojection: reconcile failed", "reason", reason, "error", err)
+		return
+	}
+	log.Warn("planprojection: reconcile complete",
+		"reason", reason, "compile_id", res.CompileID,
+		"created", len(res.Created), "removed", len(res.Removed),
+		"updated", len(res.Updated), "skipped", len(res.Skipped))
 }
 
 // stepFor returns the DAG's current step for id, or nil when the node is

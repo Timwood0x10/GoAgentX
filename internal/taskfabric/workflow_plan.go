@@ -136,9 +136,8 @@ func (f *Fabric) CompilePlan(ctx context.Context, steps []PlanStep) ([]string, e
 
 // CompileNode compiles a single PlanStep into exactly one task. It is the
 // entry point the incremental compiler uses when the live MutableDAG grows a
-// node at runtime (TOOL_DAG_MAINLINE_DESIGN §4.1): one graph change, one
-// task, and every other task of the graph is left untouched — including the
-// ones that are currently RUNNING.
+// node at runtime: one graph change, one task, and every other task of the
+// graph is left untouched — including the ones that are currently RUNNING.
 //
 // The dependency rules are CompilePlan's, so a node may depend on a task
 // compiled by an earlier batch (typically an already-COMPLETED plan node);

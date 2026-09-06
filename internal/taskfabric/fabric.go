@@ -891,10 +891,9 @@ func taskEventType(typ EventType) ares_events.EventType {
 }
 
 // SetDependencies replaces a task's dependency list in place. It is the
-// incremental-compile primitive behind runtime graph growth
-// (TOOL_DAG_MAINLINE_DESIGN §4.1): an AddEdge/RemoveEdge on the live
-// MutableDAG must move ONE task's scheduling shape, not rebuild the whole
-// compiled batch.
+// incremental-compile primitive behind runtime graph growth: an AddEdge or
+// RemoveEdge on the live MutableDAG must move ONE task's scheduling shape,
+// not rebuild the whole compiled batch.
 //
 // Only a READY task may be rewired. A LEASED/RUNNING/SUSPENDED task has an
 // owner whose quantum was admitted against the dependency posture it read at
@@ -987,8 +986,8 @@ func (f *Fabric) UpdatePayload(id string, payload map[string]any) error {
 
 // Dependents returns the ids of every task that lists id in its Dependencies
 // — the reverse-edge index the incremental compiler needs to migrate
-// successors onto a replacement node (TOOL_DAG_MAINLINE_DESIGN §4.1,
-// ChangeReplaceNode). Sorted for deterministic callers.
+// successors onto a replacement node (ChangeReplaceNode). Sorted for
+// deterministic callers.
 //
 // Args:
 //   - id: the dependency to look up (need not itself exist as a task).

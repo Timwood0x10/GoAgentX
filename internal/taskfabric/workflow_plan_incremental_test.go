@@ -11,9 +11,9 @@ import (
 	"github.com/Timwood0x10/ares/internal/ares_events"
 )
 
-// M0 (TOOL_DAG_MAINLINE_DESIGN §4.1) — the fabric-side contract the
-// incremental compiler depends on. The compiler's behaviour is tested in
-// internal/planprojection; these tests pin the primitives themselves.
+// These tests pin the fabric-side contract the incremental compiler depends
+// on. The compiler's own behaviour is tested in internal/planprojection; here
+// the primitives themselves are the subject.
 
 func TestCompileNode_DependencyResolvesAgainstExistingFabricTask(t *testing.T) {
 	f := NewFabric()

@@ -11,6 +11,7 @@ import (
 
 	"github.com/Timwood0x10/ares/internal/agentfabric"
 	"github.com/Timwood0x10/ares/internal/core/models"
+	"github.com/Timwood0x10/ares/internal/planprojection"
 	"github.com/Timwood0x10/ares/internal/taskfabric"
 	resources "github.com/Timwood0x10/ares/internal/tools/resources/core"
 )
@@ -36,13 +37,13 @@ func (b *echoBinder) IsToolIdempotent(string) bool { return true }
 
 func (b *echoBinder) GetToolSchemas() []resources.ToolSchema { return nil }
 
-// TestL2Graph_SchedulerExecutesThreeNodeChain is the M1 acceptance REVISED to
-// route through the REAL scheduler (design review ruling, §4.3): a hand-written
-// 3-node L2 plan (grep -> read -> answer) is compiled to fabric tasks (one per
-// node, same IDs), a single session agent declares the full capability set, and
-// the scheduler really runs the chain. Execution facts are read back from each
-// task's checkpoint envelope — the graph holds only topology + Metadata (Output
-// 落点 = fabric, decision C), never a node field.
+// TestL2Graph_SchedulerExecutesThreeNodeChain is the acceptance test, revised
+// to route through the REAL scheduler: a hand-written 3-node L2 plan
+// (grep -> read -> answer) is compiled to fabric tasks (one per node, same
+// IDs), a single session agent declares the full capability set, and the
+// scheduler really runs the chain. Execution facts are read back from each
+// task's checkpoint envelope — the graph holds only topology + Metadata,
+// never a node field.
 func TestL2Graph_SchedulerExecutesThreeNodeChain(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -89,14 +90,14 @@ func TestL2Graph_SchedulerExecutesThreeNodeChain(t *testing.T) {
 		"both tool nodes ran exactly once, in dependency order, through the real scheduler")
 }
 
-// TestL2Graph_RecompilesIdempotentAfterRestart pins the R.2 minimum bar for
-// decision C: the graph is the ONLY state needed to replay. First the chain
+// TestL2Graph_RecompilesIdempotentAfterRestart pins the recovery minimum bar
+// for rebuild: the graph is the ONLY state needed to replay. First the chain
 // runs to COMPLETED in one fabric/agent world; then a FRESH fabric is compiled
 // from the SAME plan and rerun to COMPLETED. No leftover task state leaks
 // between runs (a fresh compile never collides), so the graph alone
 // reconstructs the run. This is rebuild idempotency, NOT a crash simulation:
 // no task dies mid-RUNNING here and no envelope is reloaded — a true kill -9
-// variant (die mid-quantum, reload, resume) is an M2-gate item.
+// variant (die mid-quantum, reload, resume) is a follow-up wiring item.
 func TestL2Graph_RecompilesIdempotentAfterRestart(t *testing.T) {
 	plan, err := agentfabric.NewL2Graph("root", "find the answer", nil)
 	require.NoError(t, err)
@@ -144,10 +145,11 @@ func runChain(t *testing.T, plan *agentfabric.L2Graph, binder *echoBinder) *task
 }
 
 // spawnSessionAgent spawns one IDLE agent whose cognition routers by capability.
+// The set covers the session admission root plus every tool the tests grow.
 func spawnSessionAgent(ctx context.Context, agents *agentfabric.Fabric, binder *echoBinder) error {
 	_, err := agents.Spawn(ctx, agentfabric.SpawnSpec{
 		Identity:     "session-agent",
-		Capabilities: []string{"tool/grep", "tool/read", "ares/answer"},
+		Capabilities: []string{"ares/root", "tool/grep", "tool/read", "tool/echo", "ares/answer"},
 		CognitionFactory: func([]string) agentfabric.Cognition {
 			return agentfabric.NewRouterCognition(binder, slog.Default())
 		},
@@ -156,7 +158,7 @@ func spawnSessionAgent(ctx context.Context, agents *agentfabric.Fabric, binder *
 }
 
 // compilePlan projects a plan's non-root nodes onto PlanSteps and compiles
-// them as ONE batch (design App.S §S.5). Raw f.Create is deliberately NOT
+// them as ONE batch. Raw f.Create is deliberately NOT
 // used here: it bypasses dependency-closure validation, cycle detection and
 // all-or-nothing rollback — the entire M0 seam. Compiling through CompilePlan
 // keeps step ID = task ID (the graph↔envelope join key) while also pinning
@@ -224,7 +226,7 @@ func metadataPayload(md map[string]string) map[string]any {
 }
 
 // requireItemContent reads one task's COMPLETED envelope and asserts its first
-// RecommendItem content equals want — the Output 落点 is the fabric envelope.
+// RecommendItem content equals want — the output lives in the fabric envelope.
 func requireItemContent(t *testing.T, f *taskfabric.Fabric, id, want string) {
 	t.Helper()
 	tk, err := f.Task(id)
@@ -241,7 +243,7 @@ func requireItemContent(t *testing.T, f *taskfabric.Fabric, id, want string) {
 
 // itemContents extracts RecommendItem contents tolerantly. In-memory envelopes
 // carry []*models.RecommendItem, but after a JSON round-trip (persistence /
-// reload — exactly the R.2 restart path) the same field decodes as []any of
+// reload — exactly a restart) the same field decodes as []any of
 // maps. Asserting only the in-memory shape would fail precisely the restart
 // coverage this helper exists to serve.
 func itemContents(t *testing.T, sc map[string]any) []string {
@@ -282,4 +284,125 @@ func TestItemContents_ToleratesReloadedEnvelope(t *testing.T) {
 		},
 	}
 	require.Equal(t, []string{"echo(grep,x)"}, itemContents(t, sc))
+}
+
+// TestL2Graph_IncrementalEventsDriveSchedulerToCompletion is the event-path
+// acceptance: L2 growth → SubscribeGraphEvents → the REAL Scheduler.Run →
+// envelopes read back by ID join. Growth, incremental compile, and execution
+// overlap (the subscriber and the scheduler run while nodes are still being
+// added) — the M2 runtime shape, with -race watching for event/Step aliasing.
+func TestL2Graph_IncrementalEventsDriveSchedulerToCompletion(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	fabric := taskfabric.NewFabric()
+	coord := planprojection.NewCompileCoordinator(fabric, nil)
+
+	plan, err := agentfabric.NewL2Graph("root", "find the answer", nil)
+	require.NoError(t, err)
+	stop := coord.SubscribeGraphEvents(ctx, plan.DAG())
+	defer stop()
+
+	// Session admission: the root is constructed pre-subscription (its
+	// creation publishes no event), so it is compiled explicitly — the
+	// pattern M2 session wiring follows. The admission task completes in one
+	// zero-work quantum and carries the session prompt in its envelope.
+	admitSessionRoot(t, ctx, fabric, plan)
+
+	agents := agentfabric.NewFabric()
+	binder := &echoBinder{}
+	require.NoError(t, spawnSessionAgent(ctx, agents, binder))
+
+	sched := New(fabric, map[string]CapabilityExecutor{}, NewLoadTracker())
+	sched.WithAgentFabric(agents)
+	sched.PollInterval = 10 * time.Millisecond
+	go sched.Run(ctx)
+
+	require.NoError(t, plan.AddToolNode(ctx, "n1", "grep", map[string]any{"query": "x"}, "root"))
+	require.NoError(t, plan.AddToolNode(ctx, "n2", "read", map[string]any{"query": "y"}, "n1"))
+	require.NoError(t, plan.AddToolNode(ctx, "n3", "answer", nil, "n2"))
+
+	waitForTaskState(t, fabric, "n3", taskfabric.StateCompleted, 5*time.Second)
+
+	requireItemContent(t, fabric, "root", "find the answer")
+	requireItemContent(t, fabric, "n1", "echo(grep,x)")
+	requireItemContent(t, fabric, "n2", "echo(read,y)")
+	requireItemContent(t, fabric, "n3", "L2 session complete")
+	require.ElementsMatch(t, []string{"root", "n1", "n2", "n3"}, fabric.IDs(),
+		"every grown node — admission root included — has exactly one task")
+}
+
+// TestL2Graph_BurstGrowthConvergesThroughEvents pins the D2 acceptance on the
+// live seam: 70 nodes grown in a tight burst (past the 64-event hub buffer)
+// while the subscriber compiles and the scheduler executes. Whether delivery
+// or reconcile compensation materializes the tail, every node still ends
+// COMPLETED with its envelope — convergence is asserted, not the path.
+func TestL2Graph_BurstGrowthConvergesThroughEvents(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	const n = 70
+	fabric := taskfabric.NewFabric()
+	coord := planprojection.NewCompileCoordinator(fabric, nil)
+
+	plan, err := agentfabric.NewL2Graph("root", "burst", nil)
+	require.NoError(t, err)
+	stop := coord.SubscribeGraphEvents(ctx, plan.DAG())
+	defer stop()
+
+	admitSessionRoot(t, ctx, fabric, plan)
+
+	agents := agentfabric.NewFabric()
+	require.NoError(t, spawnSessionAgent(ctx, agents, &echoBinder{}))
+
+	sched := New(fabric, map[string]CapabilityExecutor{}, NewLoadTracker())
+	sched.WithAgentFabric(agents)
+	sched.PollInterval = 10 * time.Millisecond
+	go sched.Run(ctx)
+
+	ids := make([]string, 0, n+1)
+	ids = append(ids, "root")
+	prev := "root"
+	for i := 0; i < n; i++ {
+		id := fmt.Sprintf("b%d", i)
+		require.NoError(t, plan.AddToolNode(ctx, id, "echo", map[string]any{"query": fmt.Sprintf("q%d", i)}, prev))
+		ids = append(ids, id)
+		prev = id
+	}
+
+	waitForAllCompleted(t, fabric, ids, 20*time.Second)
+	requireItemContent(t, fabric, "b0", "echo(echo,q0)")
+	requireItemContent(t, fabric, fmt.Sprintf("b%d", n-1), fmt.Sprintf("echo(echo,q%d)", n-1))
+}
+
+// admitSessionRoot compiles the L2 session root (which predates any event
+// subscription) as the admission task. Its completion unblocks every tool
+// node that depends on the root.
+func admitSessionRoot(t *testing.T, ctx context.Context, fabric *taskfabric.Fabric, plan *agentfabric.L2Graph) {
+	t.Helper()
+	root := plan.DAG().StepIndex()[plan.Root()]
+	require.NotNil(t, root, "L2 plan carries its session root")
+	_, err := fabric.CompileNode(ctx, planprojection.ProjectStep(root))
+	require.NoError(t, err)
+}
+
+// waitForAllCompleted polls until every listed task reads COMPLETED.
+func waitForAllCompleted(t *testing.T, fabric *taskfabric.Fabric, ids []string, timeout time.Duration) {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		done := true
+		for _, id := range ids {
+			tk, err := fabric.Task(id)
+			if err != nil || tk.State != taskfabric.StateCompleted {
+				done = false
+				break
+			}
+		}
+		if done {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("not all %d tasks completed within %s", len(ids), timeout)
 }
