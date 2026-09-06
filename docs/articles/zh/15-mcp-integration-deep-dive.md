@@ -1,714 +1,637 @@
 # ares 架构拆解 (XV)：MCP 集成——教 Agent 用工具（0.3.x）
 
 > 最早给 Agent 加工具的时候，我是这么干的：写一个 Go struct，实现 `core.Tool` 接口，注册到 `Registry`，完事。
-> 每加一个工具，改一次代码，编译一次，部署一次。22 个内置工具写了我一礼拜。
+> 每加一个工具，改一次代码，编译一次，部署一次。
 > 直到有一天，产品经理跑过来说："用户想接他们自己的数据库查询工具，不用你写代码那种。"
 > 我愣住了。现有的架构根本没考虑过"工具从外面来"这件事。
 
+这篇文章和系列里其他篇目一样，只讲我在 `internal/ares_mcp/` 里**真正读到、能给你看源码**的东西。
+凡是代码里对不上号的，我都直接砍掉或者标注（待核实），不编故事。
+
 ## 一、工具注册的困境
 
-回头看，问题的根源在于工具和框架的耦合太紧了。每个工具都是编译时确定的：
+工具和框架的耦合太紧了。每个工具都是编译时确定的，拿 `internal/tools/resources/builtin/math/calculator.go` 里的 `Calculator` 举例——它是纯 Go 实现：
 
 ```go
 // internal/tools/resources/builtin/math/calculator.go
 type Calculator struct {
-    *base.BaseTool
+	*base.BaseTool
+	compiled map[string]*vm.Program
+	mu       sync.RWMutex // 保护 compiled 缓存
+}
+
+func NewCalculator() *Calculator {
+	params := &core.ParameterSchema{ /* ... */ }
+	return &Calculator{
+		BaseTool: base.NewBaseToolWithCapabilities("calculator", "Evaluate mathematical expressions...", 
+			core.CategoryCore, []core.Capability{core.CapabilityMath}, params),
+		compiled: make(map[string]*vm.Program),
+	}
 }
 
 func (t *Calculator) Execute(ctx context.Context, params map[string]interface{}) (core.Result, error) {
-    expression, ok := params["expression"].(string)
-    if !ok || expression == "" {
-        return core.NewErrorResult("invalid_expression"), nil
-    }
-    // ...
+	expression, ok := params["expression"].(string)
+	if !ok || expression == "" {
+		return core.NewErrorResult("expression is required"), nil
+	}
+	// expr 库求值 ...
+	return core.NewResult(true, map[string]interface{}{"result": result}), nil
 }
 ```
 
-工具的定义、实现、注册全部在 Go 代码里。想加一个新工具？写代码、编译、部署。想让用户自己定义工具？没门。
+注意几个关键类型，它们正是整个 MCP 集成对接的"插座"：
 
-我当时想了三条路：
+- `core.Tool` / `core.Result` / `core.ParameterSchema`（`internal/tools/resources/core/`）
+- `base.NewBaseToolWithCapabilities`（`internal/tools/resources/base/base_tool.go`）
+- `core.Registry` 的 `Register` / `Unregister` / `List` / `Get`
 
-1. **嵌入脚本引擎**（Lua/JS）—— 太重，安全问题一堆
-2. **HTTP 回调**—— 用户得自己起服务，协议得自己定，参数校验得自己写
-3. **标准化协议**—— 有没有现成的，让外部程序自己暴露工具的协议？
+工具的定义、实现、注册全部在 Go 代码里。想加一个新工具？写代码、编译、部署。想让外部程序自己暴露工具？当时没门。
 
-答案是 MCP——Model Context Protocol。
+换个思路就清晰了：与其在框架里造轮子，不如用一个**标准协议**让外部进程自己声明"我有什么工具"。这个协议就是 MCP（Model Context Protocol）。
 
 ---
 
 ## 二、MCP 协议：JSON-RPC 2.0 的一次实战
 
-MCP 是 Anthropic 在 2024 年底发布的开放协议，核心思想很简单：**外部进程自己声明它有什么工具，框架通过标准协议去发现和调用。**
+MCP 的核心思想很简单：**外部进程自己声明它有什么工具，框架通过标准协议去发现和调用。**
 
-协议本身基于 JSON-RPC 2.0，分三个阶段：
+协议本身基于 JSON-RPC 2.0，分三步：
 
 ```mermaid
 sequenceDiagram
     participant Client as MCP Client (ares)
     participant Server as MCP Server (外部进程)
-    
-    Note over Client,Server: 阶段一：握手
+
+    Note over Client,Server: 握手
     Client->>Server: initialize {protocolVersion, clientInfo, capabilities}
     Server-->>Client: {serverInfo, capabilities}
     Client->>Server: notifications/initialized
-    
-    Note over Client,Server: 阶段二：工具发现
+
+    Note over Client,Server: 工具发现
     Client->>Server: tools/list
     Server-->>Client: {tools: [{name, description, inputSchema}, ...]}
-    
-    Note over Client,Server: 阶段三：工具调用
-    Client->>Server: tools/call {name, arguments}
-    Server-->>Client: {content: [{type:"text", text:"..."}], isError: false}
-```
 
-为什么选 JSON-RPC 2.0 而不是 REST？我猜有几个原因：协议本身轻量（一个 `id` + `method` + `params` 就是一个请求），天然支持异步（通过 `id` 关联请求和响应），而且 notification 机制（无 `id` 的消息）很适合"服务器主动推送工具列表变更"这种场景。
+    Note over Client,Server: 工具调用
+    Client->>Server: tools/call {name, arguments}
+    Server-->>Client: {content: [{type:"text", text:"..."}], isError:false}
+```
 
 在 `internal/ares_mcp/jsonrpc.go` 里，消息模型长这样：
 
 ```go
 type JSONRPCMessage struct {
-    JSONRPC string          `json:"jsonrpc"`
-    ID      *int64          `json:"id,omitempty"`   // nil = notification
-    Method  string          `json:"method,omitempty"`
-    Params  json.RawMessage `json:"params,omitempty"`
-    Result  json.RawMessage `json:"result,omitempty"`
-    Error   *JSONRPCError   `json:"error,omitempty"`
+	JSONRPC string          `json:"jsonrpc"`
+	ID      *int64          `json:"id,omitempty"`   // nil = notification
+	Method  string          `json:"method,omitempty"`
+	Params  json.RawMessage `json:"params,omitempty"`
+	Result  json.RawMessage `json:"result,omitempty"`
+	Error   *JSONRPCError   `json:"error,omitempty"`
 }
 ```
 
-`ID` 的有无决定了消息类型：有 `ID` 是请求/响应，没 `ID` 是通知。这个设计让 `receiveLoop` 里的分发逻辑特别干净：
+`ID` 的有无决定了消息类型：有 `ID` 是请求/响应，没 `ID` 是通知。工具 `IsRequest` / `IsResponse` / `IsNotification` / `IsError` 这四个判定函数就是靠它工作的。
+
+`MCPClient.receiveLoop` 会把收到的消息按类型分发——响应派给对应 pending channel，通知异步处理：
 
 ```go
 // internal/ares_mcp/client.go
 func (c *MCPClient) receiveLoop() error {
-    for {
-        msg, err := c.transport.Receive(c.ctx)
-        // ...
-        switch {
-        case IsResponse(msg) || IsError(msg):
-            c.dispatchResponse(msg)
-        case IsNotification(msg):
-            c.handleNotification(msg)
-        }
-    }
+	for {
+		msg, err := c.transport.Receive(c.ctx)
+		// ...
+		switch {
+		case IsResponse(msg) || IsError(msg):
+			c.dispatchResponse(msg)
+		case IsNotification(msg):
+			// 每个通知在自己的 goroutine 里处理，用 notifySlots 限并发（上限 8）
+			select {
+			case c.notifySlots <- struct{}{}:
+				c.eg.Go(func() error {
+					defer func() { <-c.notifySlots }()
+					c.handleNotification(msg)
+					return nil
+				})
+			default:
+				// 槽满则丢弃该通知，防止恶意服务器用通知洪泛打爆内存
+			}
+		}
+	}
 }
 ```
+
+那句 "JSON-RPC 自带异步" 不吹牛：`call` 里用 `nextID`（`IDGenerator`，atomic 自增）生成 id，把响应的 pending channel 挂进 map，然后 `select` 等在超时 context 上。`callCtx` 的默认超时是 `defaultClientTimeout = 30 * time.Second`，可以在每个服务器的配置里覆盖。
+
+`dispatchResponse` 有个细节值得写：它在持锁状态下把响应塞给 pending channel，并靠 `delete(pending, id)` 防止和 `Close()` 竞态——这也是线程安全的核心难点。
 
 ---
 
 ## 三、Transport 层：两条路，一个接口
 
-MCP 协议不关心消息怎么传输——它只定义了 JSON-RPC 的格式。具体怎么把消息从 A 点送到 B 点，是 Transport 层的事。
+MCP 协议不管消息怎么传，只定义 JSON-RPC 格式。传消息是 Transport 层的事。`internal/ares_mcp/transport.go` 只定义了个 4 方法的接口：
 
-我们实现了两种 Transport：
+```go
+type Transport interface {
+	Start(ctx context.Context) error
+	Send(ctx context.Context, msg *JSONRPCMessage) error
+	Receive(ctx context.Context) (*JSONRPCMessage, error)
+	Close() error
+}
+```
 
 ```mermaid
 graph TB
     subgraph "Transport 接口"
         T[Transport]
-        T --> Start[Start 初始化连接]
+        T --> Start[Start 建立连接]
         T --> Send[Send 发送消息]
         T --> Receive[Receive 接收消息]
         T --> Close[Close 关闭连接]
     end
-    
+
     subgraph "StdioTransport"
         STD[子进程 stdin/stdout]
-        STD --> CMD[exec.Command]
-        STD --> SCAN[bufio.Scanner]
+        STD --> CMD[exec.CommandContext]
+        STD --> SCAN[bufio.Scanner 1MB buffer]
+        STD --> ERR[stderr 后台 drain 到 Debug 日志]
     end
-    
+
     subgraph "SSETransport"
         SSE[HTTP SSE]
-        SSE --> GET[GET /sse 接收事件流]
-        SSE --> POST[POST /message 发送消息]
+        SSE --> GET[GET /sse 收事件流]
+        SSE --> POST[POST /message 发消息]
+        SSE --> EP[endpoint 事件动态更新 POST 地址]
     end
-    
-    T -.-> STD
-    T -.-> SSE
+
+    T -.实现.-> STD
+    T -.实现.-> SSE
 ```
 
 ### 3.1 Stdio：本地进程的标准姿势
 
-Stdio 是最常用的 MCP 传输方式。外部工具以子进程启动，ares 通过 stdin 写入请求、stdout 读取响应。
+外部工具以子进程启动，ares 通过 stdin 写入请求、stdout 读取响应：
 
 ```go
 // internal/ares_mcp/transport_stdio.go
 type StdioConfig struct {
-    Command string            `yaml:"command" json:"command"`
-    Args    []string          `yaml:"args" json:"args"`
-    Env     map[string]string `yaml:"env" json:"env"`
-    WorkDir string            `yaml:"work_dir" json:"work_dir"`
+	Command string            `yaml:"command" json:"command"`
+	Args    []string          `yaml:"args" json:"args"`
+	Env     map[string]string `yaml:"env" json:"env"`
+	WorkDir string            `yaml:"work_dir" json:"work_dir"`
 }
 ```
 
-配置里写一个命令行，ares 负责 `exec.Command` 启动进程，然后用 newline-delimited JSON 通信。stderr 被单独 drain 走，打到 debug 日志里——这个设计救过我好几次，用户说"工具不工作"，看 stderr 日志就知道是权限问题还是依赖没装。
-
-Stdio 有一个我踩过的坑：`bufio.Scanner` 的默认 buffer 只有 64KB。如果 MCP 服务器返回一个大 schema（比如带了几十个工具的完整定义），scan 直接报 `token too long`。解法是在 `Start` 里手动设 buffer：
+`Start` 里用 `exec.CommandContext` 起进程，然后有个我踩过的坑：`bufio.Scanner` 默认 buffer 只有 64KB，MCP 服务器一旦返回大 schema 就报 `token too long`。解法是手动加 buffer：
 
 ```go
 t.stdout = bufio.NewScanner(stdoutPipe)
-t.stdout.Buffer(make([]byte, 0, stdoutBufferSize), stdoutBufferSize) // 1MB
+t.stdout.Buffer(make([]byte, 0, stdoutBufferSize), stdoutBufferSize) // stdoutBufferSize = 1MB
 ```
 
-### 3..2 SSE：远程服务器的 HTTP 方案
+`Send` 有一个写超时（`stdioWriteTimeout = 10s`）：子进程如果不读 stdin，一次写会被 `SetWriteDeadline` 打断，否则会一直占着 `t.mu`，连 `Close` 都被卡死。stderr 被单独起 goroutine drain 到 Debug 日志——这个设计救过我，用户说"工具不工作"，看 stderr 就知道是权限还是没装依赖。
 
-有些 MCP 服务器不是本地进程——它们跑在远程机器上，或者本身就是 Web 服务。这时候用 SSE（Server-Sent Events）。
+### 3.2 SSE：远程服务器的 HTTP 方案
+
+有些 MCP 服务器是远程 Web 服务，用 SSE（Server-Sent Events）：
 
 ```go
 // internal/ares_mcp/transport_sse.go
 type SSEConfig struct {
-    URL     string            `yaml:"url" json:"url"`
-    Headers map[string]string `yaml:"headers" json:"headers"`
-    Timeout time.Duration     `yaml:"timeout" json:"timeout"`
+	URL     string            `yaml:"url" json:"url"`
+	Headers map[string]string `yaml:"headers" json:"headers"`
+	Timeout time.Duration     `yaml:"timeout" json:"timeout"`
 }
 ```
 
-SSE Transport 的通信模型和 Stdio 不一样：接收走 HTTP GET 长连接（SSE 流），发送走 HTTP POST。协议里有一个巧妙的设计——服务器可以通过 `event: endpoint` 事件动态告诉客户端"以后 POST 到这个 URL"：
+接收走 HTTP GET 长连接（SSE 流），发送走 HTTP POST。服务器可以用 `event: endpoint` 事件动态告诉客户端"以后 POST 到这个 URL"。这里有一个**已经做好的安全边界**：`isSameHostEndpoint` 会校验 endpoint 和 SSE URL 同 host，防止恶意服务器把 POST 重定向到内网地址（SSRF）：
 
 ```go
 func (t *SSETransport) handleSSEEvent(ctx context.Context, eventType, data string) {
-    switch eventType {
-    case sseEventTypeEndpoint:
-        t.mu.Lock()
-        t.postURL = strings.TrimSpace(data)  // 动态更新 POST 目标
-        t.mu.Unlock()
-    case sseEventTypeMessage:
-        var msg JSONRPCMessage
-        json.Unmarshal([]byte(data), &msg)
-        t.msgCh <- &msg
-    }
+	switch eventType {
+	case sseEventTypeEndpoint:
+		endpoint := strings.TrimSpace(data)
+		if !t.isSameHostEndpoint(endpoint) {
+			log.Warn("mcp: rejecting endpoint URL with mismatched host (SSRF protection)", ...)
+			return
+		}
+		t.mu.Lock()
+		t.postURL = endpoint
+		t.mu.Unlock()
+	case sseEventTypeMessage:
+		var msg JSONRPCMessage
+		json.Unmarshal([]byte(data), &msg)
+		t.msgCh <- &msg
+	}
 }
 ```
 
-这让服务器可以灵活控制消息路由，比如在负载均衡场景下把不同客户端导向不同的后端。
+> 诚实说明：早年文章里我说过"SE 的 POST URL 没有相对路径处理"是技术债——**这个已经修掉了**。相对路径会基于 base URL 解析且总是放行，绝对 URL 必须同 host。
 
 ---
 
-## 四、服务发现：自动发现 MCP 服务器
+## 四、服务发现：可选的"帮忙找服务器"
 
-Transport 层负责通信，Manager 负责连接。但有一个问题它们都没有回答：**应该连哪些服务器？**
+**先说结论：Discovery 子系统存在，但它是独立的、可选的（opt-in），目前并没有接线到 MCP Manager 的自动连接上。** 你会在它上面看到我标注（待核实）的地方。
 
-在 Discovery 子系统出现之前，每个 MCP 服务器都得手动配在 YAML 里。用户装了一个新的 MCP 工具——比如一个用 Rust 写的代码分析服务器——就必须知道它的命令、参数、传输类型，才能让它出现在 ares 里。新工具接入，先配半天配置。
+Transport 管通信，`MCPManager` 管连接，但它们都不回答一个问题：**应该连哪些服务器？** 在 Discovery 出现之前，每个 MCP 服务器都得手动写在配置里。
 
-Discovery 子系统改变了这一点。它能从多个来源自动发现 MCP 服务器、标准化身份标识、做健康检查，然后把结果喂给框架——不需要写 YAML。
+Discovery 子系统（`internal/discovery/`）能从多个来源自动发现 MCP 服务器、按身份合并去重、做健康检查、发事件。分层如下：
 
-### 分层架构
-
-```
-api/discovery/              → 公共 API（类型别名 + 代理，无代码重复）
-internal/discovery/         → 引擎、身份、健康检查、事件、存储
-internal/discovery/providers/ → 文件系统扫描器、二进制探针
-```
-
-`api/discovery` 暴露类型别名和薄代理层——给外部调用者一个稳定的 API 契约，内部 `internal/discovery` 做真正的活儿。
+- `internal/discovery/`：引擎、身份归一化、健康检查、事件、存储
+- `internal/discovery/providers/`：文件系统扫描器、二进制探针
+- `api/discovery/`：给外部调用者的类型别名的薄代理（在代码里实际存在 `discovery.go`/`doc.go` 等）
 
 ### Provider 系统
 
-发现机制的背后是 Provider。每个 Provider 实现一个简单的接口：
+每个 Provider 实现一个接口：
 
 ```go
 type DiscoveryProvider interface {
-    Name() string
-    Confidence() int
-    Discover(ctx context.Context) ([]DiscoveryRecord, error)
+	Name() string
+	Confidence() Confidence
+	Discover(ctx context.Context) ([]DiscoveryRecord, error)
 }
 ```
 
-`Confidence`（置信度）告诉引擎每个来源的可信程度——显式配置文件比启发式扫描的信任度更高。
-
-**文件系统 Provider**（`internal/discovery/providers/filesystem.go`）扫描已知配置文件位置：
-
-- **Claude**：`.claude/settings.json`，`mcpServers` 键
-- **Cursor**：`.cursor/mcp.json`
-- **VS Code**：`.vscode/mcp.json`
-- **ARES**：`.codegraph/mcp-servers.json`
-
-每种配置格式的 schema 不同，但 Provider 会统一归一化为 `DiscoveryRecord`。`config_name` 等元数据会被保留，让框架能溯源每个工具的来源。
-
-**二进制探针 Provider**（`internal/discovery/providers/binary.go`）扫描系统 `PATH` 里的已知 MCP 二进制文件。对每个候选程序执行 `--help`，检查输出中是否有 MCP 关键词。匹配到的结果标记为 `ConfidenceMedium`——可能是 MCP 工具，但可信度不如显式配置文件。
-
-### 并发发现
-
-Providers 通过 `errgroup` 并行执行。一个失败了不影响其他的：
+置信度是 `Confidence` 类型，定义在 `discovery.go`：
 
 ```go
-g, gctx := errgroup.WithContext(ctx)
-for i, p := range providers {
-    idx, prov := i, p
-    g.Go(func() error {
-        records, err := prov.Discover(gctx)
-        if err != nil {
-            slog.Warn("discovery: provider failed",
-                "provider", prov.Name(), "error", err)
-            return nil
-        }
-        results[idx] = providerResult{records: records, name: prov.Name()}
-        return nil
-    })
-}
-_ = g.Wait()
+ConfidenceLow    = 60   // PATH 扫描、广播
+ConfidenceMedium = 80   // HTTP discovery、mDNS
+ConfidenceHigh   = 95   // Claude、Cursor、VSCode 配置
+ConfidenceMax    = 100  // ARES 自身 registry、已验证
 ```
 
-文件系统扫描不会被卡住的二进制扫描拖慢。所有 Provider 完成后，引擎才会合并结果。
+**文件系统 Provider**（`providers/filesystem.go`），实际扫描的路径是：
 
-### 身份归一化与合并
+- **ARES**：`~/.ares/mcp-registry.json`，格式 `{"servers": [...]}`
+- **Claude**：`~/.claude.json` 以及项目内 `.claude/settings.json`
+- **Cursor**：`~/.cursor/mcp.json`
+- **VS Code**：项目内 `.vscode/mcp.json`
 
-同一个 MCP 服务器可能被多个 Provider 发现——Claude 配了 `codegraph`，VS Code 也配了，二进制探针也在 PATH 里找到了。引擎通过置信度规则把这些合并成一个 `DiscoveredService`：
+> 校正：早期文章里写 ARES 扫描 `.codegraph/mcp-servers.json`，实码是 `~/.ares/mcp-registry.json`。这两种格式的 schema 不同，Provider 会统一归一化成 `DiscoveryRecord`。
 
-- 高置信度的记录优先采用
-- `bestEndpoint()` 从最高置信度的记录中选择连接细节
-- 已知启动器（`uvx`、`npx`、`bunx`、`pipx`）被保留为端点身份的一部分
-- 来自所有记录的标签和元数据被合并
+**二进制探针 Provider**（`providers/binary.go`）不扫整个 PATH，而是按一个 `knownMCPBinaries` 白名单（`mcp-server-filesystem`、`mcp-server-git`、`mcp-server-postgres` 等）命中的名称去 `--help`，检查输出里有没有 MCP 关键字。白名单之外的一律不碰。它用 `knownMCPBinariesSet`（`filepath.Base`）做 O(1) 匹配。
 
-`normalizeEndpoint` 负责从原始端点中提取规范身份：
+### 并发发现与合并
 
-```go
-var knownLaunchers = map[string]bool{
-    "uvx": true, "npx": true, "bunx": true, "pipx": true,
-}
+`Engine.DiscoverNow` 用 errgroup 并发跑所有 Provider，单个失败不打断整组（记 `log.Warn` 后返回 nil）。之后按 `mergeRecords` 合并、`diffServices` 比对 store，再对 added/updated/removed 分发 `EventServiceAdded/Updated/Removed`，最后发一个 `EventDiscoveryComplete`。
 
-func normalizeEndpoint(endpoint string) string {
-    // 从路径中提取二进制名
-    // 保留已知启动器前缀
-    // 去掉其他参数
-}
-```
-
-`hasChanged` 方法检测有意义的差异——端点变化、标签添加、配置名更新——这样引擎可以发出精确的事件，而不是全量刷新。
+被动注册也存在：`Engine.Register(ctx, RegisterRequest)` 会创建一个 `ConfidenceMax` 的 `DiscoveredService`（`Healthy: false`，健康检查是单独步骤），并发出 `EventServiceAdded`。
 
 ### 健康检查
 
-发现告诉你一个服务器"可能存在"。健康检查告诉你它"真的在运行"。`MCPHealthChecker` 连接到每个已发现的服务，调用 `list_tools`：
+`MCPHealthChecker`（`internal/discovery/health.go`）对每个服务做 `initialize → list_tools → close`：
 
-- **二进制端点**：通过 stdio 连接（`ConnectStdio`）
-- **URL 端点**：通过 SSE 连接（`ConnectSSE`）
+- **URL 端点**：`api_mcp.ConnectSSE`
+- **二进制端点**：`api_mcp.ConnectStdio`
 
-如果探针失败，服务被标记为 `Healthy: false`。服务可以随时重新检查——对仪表盘刷新周期或重连尝试非常有用。
+但注意：并不是任何 URL/二进制都可以探。URL 只放行 http/https（防 SSRF），二进制只放行 `allowedMCPBinaryDirs`（`/usr/local/bin`、`/usr/bin`、`/opt/homebrew/bin`）下的、且解析符号链接后仍落在白名单内的路径。
 
-### 事件系统
+### 事件系统与 Store
 
-发现生命周期会发出类型化事件，框架的其他部分可以订阅：
+事件通过 `EventHandler` / `EventHandlerFunc` 派发。Service 存进 `ServiceStore`（默认 `MemoryStore`）。引擎本身很干净，不关心谁在听。
 
-```go
-const (
-    EventServiceAdded      EventType = "service.added"
-    EventServiceRemoved    EventType = "service.removed"
-    EventServiceUpdated    EventType = "service.updated"
-    EventHealthChanged     EventType = "health.changed"
-    EventDiscoveryComplete EventType = "discovery.complete"
-)
-```
+### 但这里有个我必须在代码里确认到边界的地方（待核实）
 
-任何组件都可以通过 `EventHandler` 接口订阅：
+文章旧版写了一套 "Manager 监听 `EventServiceAdded` → 自动连接新发现的服务器 → 工具落进 Registry" 的完整流程。**我在代码里没找到这段接线。** 实码里 `ProvideDiscovery`（`internal/ares_bootstrap/provide_discovery.go`）做的事是：
 
-```go
-type EventHandler interface {
-    HandleDiscoveryEvent(event Event)
-}
-```
+- 配置里启用了 `discovery` 才构建引擎，否则返回 `ErrDiscoveryDisabled`
+- 添加 ARES/Claude/Cursor/VSCode/Binary 五个 provider
+- `eng.StartAutoDiscovery(ctx, interval)` 启动周期轮询（默认 5 分钟）
+- 把事件**转发到共享的 `ares_events.EventStore`**（`"discovery"` 流），仅此而已
 
-Dashboard 用这些事件来实时更新界面。MCP Manager 监听 `EventServiceAdded`，自动连接新发现的服务器。事件系统把发现和消费解耦——引擎不知道也不关心谁在听。
-
-### 被动注册与 ServiceStore
-
-不是所有服务器都来自自动发现。有些是明确的——用户知道 URL 或命令，想直接注册。`Register` 方法处理这种情况：
-
-```go
-func (e *Engine) Register(ctx context.Context, req RegisterRequest) error {
-    // 创建一个 ConfidenceMax 的 DiscoveredService
-    // 设置 Healthy: false（健康检查是单独的步骤）
-    // 发出 EventServiceAdded 事件
-}
-```
-
-所有已发现和已注册的服务都存储在 `ServiceStore` 中。默认的 `MemoryStore` 使用深拷贝来防止数据竞争。`ServiceStore` 接口被设计为可替换的——可以接入 SQLite、Bolt、JSON 文件等持久化后端，而不需要修改引擎。
-
-### 完整流程
-
-```mermaid
-graph LR
-    A[文件系统 Provider] --> D[按身份合并]
-    B[二进制探针 Provider] --> D
-    D --> E[归一化端点]
-    E --> F[健康检查所有服务]
-    F --> G[发出发现事件]
-    G --> H[存入 ServiceStore]
-    H --> I[MCP Manager 连接<br>健康的服务]
-    I --> J[工具出现在 Registry 中]
-```
-
-Discovery 并没有取代 MCP Manager。它给 Manager 喂数据。发现找到服务器；Manager 连接它们；Bridge 包装它们的工具；Registry 提供给 Agent 使用。每层都有单一职责，组合得很干净。
+也就是说：**发现到的服务目前不会自动变成连接中的 MCP 服务器 / 组件里的工具**。引擎找到了"可能存在"的服务，但到 MCP Manager 的桥尚未接通（待核实）。所以老文章的流程图最后那两行 `MCP Manager 连接健康的服务 → 工具出现在 Registry 中` 要划掉。
 
 ---
 
 ## 五、MCPManager：多服务器的生命线
 
-单个 `MCPClient` 只能连一个服务器。实际场景里，用户可能同时连着一个数据库查询工具、一个代码搜索工具、一个文件操作工具——三个不同的 MCP 服务器。`MCPManager` 就是管这堆连接的。
+单个 `MCPClient` 只连一个服务器。多个服务器的连接、工具注册/注销、热更新，全在 `MCPManager`（`internal/ares_mcp/manager.go`）：
 
 ```go
-// internal/ares_mcp/manager.go
 type MCPManager struct {
-    clients  map[string]*managedClient
-    registry *core.Registry       // 工具注册表
-    mu       sync.RWMutex
-    config   *MCPManagerConfig
+	clients  map[string]*managedClient
+	registry *core.Registry       // 工具注册表
+	mu       sync.RWMutex
+	config   *MCPManagerConfig
+	toolChangeHandler func()     // listChanged 后调用的回调（见下）
 }
 
 type managedClient struct {
-    client  *MCPClient
-    config  MCPServerConfig
-    connAt  time.Time
-    lastErr error
-    tools   []string  // 已注册的工具名列表
+	client  *MCPClient
+	config  MCPServerConfig
+	connAt  time.Time
+	lastErr error
+	tools   []string  // 已注册的工具名列表
 }
 ```
 
-核心流程是这样的：
+`NewMCPManager(config, registry)` 要求 `registry` 非空——MCP 工具的归宿就是这个 `core.Registry`。
+
+核心流程：
 
 ```mermaid
 graph TB
-    START[Manager.Start] --> CHECK{enabled && auto_start?}
-    CHECK -->|是| CONN[ConnectServer]
-    CHECK -->|否| SKIP[跳过]
-    CONN --> TRANSPORT[创建 Transport]
+    START[Manager.Start] --> LOOP{遍历 config.Servers}
+    LOOP -->|Enabled && AutoStart| CONN[ConnectServer]
+    LOOP -->|否则| SKIP[跳过]
+    CONN --> TRANSPORT[NewTransportFromConfig]
     TRANSPORT --> CLIENT[NewMCPClient + Connect]
     CLIENT --> HANDSHAKE[initialize 握手]
     HANDSHAKE --> LISTTOOLS[ListTools 发现工具]
-    LISTTOOLS --> REGISTER[registerTools 注册到 Registry]
-    REGISTER --> DONE[连接完成]
-    
+    LISTTOOLS --> REGISTER[registerTools]
     subgraph "工具注册"
-        REGISTER --> WRAP[NewMCPTool 包装]
+        REGISTER --> WRAP[NewMCPTool 包装成 core.Tool]
         WRAP --> SCHEMA[ConvertJSONSchema]
         SCHEMA --> REG[registry.Register]
     end
 ```
 
-### 5.1 Capability Fabric 懒连接（0.3.0 新增）
+### 5.1 连接——以及工具怎么进 Registry
 
-0.3.0 起 MCP 连接增加了一条由 Skill 驱动的懒连接路径（设计原则③：**Skill 是 MCP Server 的 lazy-loading boundary**）：`internal/ares_skills` 的 `Catalog` 在 serve 启动时经 `SetMCPConnector(mcpMgr)` 接入，`skill_activate` 工具调用 `Catalog.Activate(ctx, skillID)` 时才对其声明的 `mcp` 工具逐个执行 `ConnectServer(ctx, serverName)`。
+`ConnectServer` 是单个服务器的连接入口。它找到配置后建 transport，`connectWithTransport`（给测试注入 mock transport 的接缝）里做这些事：
 
-- 连接时机从"启动即连（AutoStart）"扩展为"**激活 Skill 才连**"——1000 个 MCP 工具永不进 context
-- `MCPManager.SetToolChangeHandler` 桥接 `tools/listChanged` 通知 → `Catalog.Refresh`（hash 增量重索引），新工具变更按需反映到 catalog
-- 与 AutoStart 并存：显式声明 `auto_start=true` 的服务器仍按老路径启动连接
+1. 构造 `MCPClient`（带 `OnChange` 回调）
+2. `Connect`：启动 transport → `initialize` 握手 → `ListTools` 发现工具
+3. `registerTools(mc)` 把服务器上每个工具注册进 `registry`
 
-`ConnectServer` 是单个服务器的连接入口。它做了一件很关键的事：连接成功后，自动把服务器上的所有工具注册到 `core.Registry`：
+痛点是 Context 作用域：`MCPClient.ConnectWithLifetime` 把**握手超时**和**子进程生命周期**分成两个 context——`Connect` 的 ctx 只在握手时有效，子进程得活到 `lifetimeCtx`，否则 `Connect` 一返回工具就死了。这直接解决工厂模式（第六节）里 `Create` 返回后工具立刻被 cancel 的问题。
+
+`Start` 里连接失败**不会中断启动**，log 一下继续连下一个——一个服务器挂了不该影响其他服务器和 Agent。
+
+### 5.2 tools/listChanged 通知（待核实：钩子存在，但 serve 里没人接）
+
+MCP 客户端声明了 `Tools: ListChanged: true` 能力。服务器发 `notifications/tools/listChanged` 时，`MCPClient.handleNotification` 会重新拉一次 `ListTools`，成功就触发 `OnChange`。在 manager 侧 `connectWithTransport` 的 `onChange` 会调 `RefreshTools`（重新发现+重注册），再调 `notifyToolChange()`——后者会调用 `SetToolChangeHandler` 设置的回调。
+
+**但 `SetToolChangeHandler` 在整个仓库里只有定义、没有任何调用点被接上。** 也就是说这个钩子目前是"悬空"的——老文章里写的"`MCPManager.SetToolChangeHandler` 桥接 listChanged → Skill Catalog.Refresh（hash 增量重索引）"在实码里**没有接通**（待核实）。真要接，下一个 caller 是在 `serve` 里把 catalog 的 `Refresh` 塞进来。
+
+### 5.3 Skill 懒连接（这个是真的接上了）
+
+`internal/ares_skills/catalog.go` 声明了 `MCPConnector` 接口（就一个 `ConnectServer`），`*ares_mcp.MCPManager` 恰好满足它：
 
 ```go
-// internal/ares_mcp/manager.go
-func (m *MCPManager) ConnectServer(ctx context.Context, name string) error {
-    // ... 创建 transport、client、connect ...
-    
-    // 注册工具
-    toolNames, err := m.registerTools(mc)
-    if err != nil {
-        _ = client.Close()
-        return fmt.Errorf("register tools: %w", err)
-    }
-    mc.tools = toolNames
-    
-    m.mu.Lock()
-    m.clients[name] = mc
-    m.mu.Unlock()
-    return nil
+type MCPConnector interface {
+	ConnectServer(ctx context.Context, name string) error
 }
 ```
 
-`registerTools` 遍历 `MCPClient` 发现的所有工具，为每个工具创建一个 `MCPTool` 包装器，然后调用 `registry.Register`。注册完之后，MCP 工具和内置工具在 Registry 里完全平级——调用方不需要知道这个工具到底是 Go 代码写的还是远程 MCP 服务器提供的。
+接线在 `internal/ares_bootstrap/skills_wiring.go` 的 `wireSkills(ctx, mem, mcp)`：只要 memory 管理器暴露了 `SetSkillsRegistry`，就会 `catalog.SetMCPConnector(mcp)`。然后 `Catalog.Activate(ctx, skillID)` 在激活时才逐个 `c.mcp.ConnectServer(ctx, t.Target)` 连接这个 skill 声明的 MCP 服务器——连接时机从"启动即连"变成"激活 Skill 才连"。这条懒连接路径是货真价实的。
 
-断开连接时，`unregisterTools` 会把对应工具从 Registry 里清理掉：
+### 5.4 断开与热更新
+
+- `DisconnectServer` / `Stop`：先把工具从 Registry 注销（`unregisterTools`），**在锁外**关 client（`MCPClient.Close` 会等通知 goroutine，这些 goroutine 可能又要进 `RefreshTools` 抢锁，锁内关会死锁）
+- `ApplyConfig`：diff 新旧配置，新建连、删的断、变的重连，返回变更列表
+- `RefreshTools`：先注销旧工具再重新发现；若 `ListTools` 失败，会用 client 仍缓存的定义**尽力恢复旧的注册**，避免热更新时一个瞬时抖动把服务器工具清零
+
+### 5.5 状态查询
+
+`ListServers()` 返回 `[]MCPServerStatus`：
 
 ```go
-func (m *MCPManager) unregisterTools(mc *managedClient) {
-    for _, name := range mc.tools {
-        if err := m.registry.Unregister(name); err != nil {
-            log.Warn("mcp: failed to unregister tool", "tool", name, "error", err)
-        }
-    }
-    mc.tools = nil
+type MCPServerStatus struct {
+	Name      string    `json:"name"`
+	Connected bool      `json:"connected"`
+	ToolCount int       `json:"tool_count"`
+	Version   string    `json:"version"`
+	Error     string    `json:"error,omitempty"`
+	ConnAt    time.Time `json:"connected_at,omitempty"`
 }
 ```
+
+注意 `Version` **永远是空的**——client 不暴露服务器版本字符串，代码选择留空而不是灌一个误导性的状态值。另外 `ListServers` 会把"已配置、启用但尚未连接"的服务器也算进去（`Connected: false, Error: "not connected"`），保证必连服务器挂了是可见的 `Degraded`，而不是凭空消失。
+
+> 关于 Dashboard：老文章里写的 `MCPStatusProvider`、`MCPServerStatusView`、`ArenaActionMCPDisconnect`、`FaultMCPDisconnect` **在仓库里都不存在**（`internal/dashboard/` 目录、这些符号我都没找到）。所以那一段我整段删掉了，不替它圆场。
 
 ---
 
 ## 六、MCPTool：让远程工具"假装"是本地的
 
-`MCPTool` 是整个集成的关键适配器。它实现了 `core.Tool` 接口，但实际执行时把调用转发给 MCP 服务器：
+`MCPTool` 是整个集成的关键适配器。它实现了 `core.Tool` 接口（文件末尾有编译期断言 `var _ core.Tool = (*MCPTool)(nil)`），实际执行时把调用转发给 MCP 服务器：
 
 ```go
 // internal/ares_mcp/mcp_tool.go
 type MCPTool struct {
-    *base.BaseTool
-    client     *MCPClient
-    serverName string
-    toolDef    *MCPToolDef
+	*base.BaseTool
+	client     *MCPClient
+	serverName string
+	toolDef    *MCPToolDef
 }
 
 func NewMCPTool(client *MCPClient, def *MCPToolDef) (*MCPTool, error) {
-    schema, err := ConvertJSONSchema(def.InputSchema)  // JSON Schema → core.ParameterSchema
-    // ...
-    name := fmt.Sprintf("mcp.%s.%s", client.ServerName(), def.Name)
-    // ...
+	schema, err := ConvertJSONSchema(def.InputSchema)         // JSON Schema → core.ParameterSchema
+	name := fmt.Sprintf("mcp.%s.%s", client.ServerName(), def.Name)
+	bt := base.NewBaseToolWithCapabilities(name, def.Description,
+		core.CategoryExternal, []core.Capability{core.CapabilityExternal}, schema)
+	return &MCPTool{BaseTool: bt, client: client, serverName: client.ServerName(), toolDef: def}, nil
 }
 
 func (t *MCPTool) Execute(ctx context.Context, params map[string]interface{}) (core.Result, error) {
-    result, err := t.client.CallTool(ctx, t.toolDef.Name, params)
-    if err != nil {
-        return core.NewErrorResult(err.Error()), nil
-    }
-    if result.IsError {
-        text := extractText(result.Content)
-        return core.NewErrorResult(text), nil
-    }
-    text := extractText(result.Content)
-    return core.NewResult(true, map[string]interface{}{
-        "content": text,
-        "blocks":  result.Content,
-    }), nil
+	result, err := t.client.CallTool(ctx, t.toolDef.Name, params)
+	if err != nil {
+		return core.NewErrorResult(err.Error()), nil
+	}
+	if result.IsError {
+		return core.NewErrorResult(extractText(result.Content)), nil
+	}
+	text := extractText(result.Content)
+	return core.NewResult(true, map[string]interface{}{"content": text, "blocks": result.Content}), nil
 }
 ```
 
-注意工具的命名规则：`mcp.{serverName}.{toolName}`。这个命名策略是刻意的——当用户配了多个 MCP 服务器时，不同服务器可能有同名工具（比如都叫 `search`），加前缀避免冲突。
+命名规则是 `mcp.{serverName}.{toolName}`。这是刻意的：多个 MCP 服务器可能有同名工具（比如都叫 `search`），加前缀避免冲突。
 
-### 6.1 Schema 转换：JSON Schema 到 ParameterSchema
+`Close()` 是 no-op——连接生命周期归 `MCPManager` 管，一个工具的 Close 不能把同一服务器的其他工具共享的连接切了（P0-4）。
 
-MCP 工具的输入定义用的是标准 JSON Schema，但 ares 内部有自己的 `core.ParameterSchema`。`ConvertJSONSchema` 负责这个转换：
+### 6.1 Schema 转换：JSON Schema → ParameterSchema
 
-```go
-// internal/ares_mcp/schema.go
-func ConvertJSONSchema(raw json.RawMessage) (*core.ParameterSchema, error) {
-    var schema jsonSchema
-    json.Unmarshal(raw, &schema)
-    
-    result := &core.ParameterSchema{
-        Type:       schema.Type,
-        Properties: make(map[string]*core.Parameter),
-        Required:   schema.Required,
-    }
-    for name, prop := range schema.Properties {
-        result.Properties[name] = convertProperty(prop)
-    }
-    return result, nil
-}
-```
+`ConvertJSONSchema`（`schema.go`）负责把 `inputSchema` 转成 ares 内部的 `core.ParameterSchema`。它处理 `type` / `properties` / `required` / `description` / `enum` / `minimum` / `maximum` / `default` / `items`，`type` 为空时默认 `object`（property 默认 `string`）。细节上它是**简化实现**：
 
-这个转换看起来简单，但它决定了 LLM 能不能正确理解工具的参数。如果 `inputSchema` 里写了 `"type": "integer", "minimum": 1, "maximum": 100`，转成 `ParameterSchema` 后 LLM 就知道这个参数是 1-100 的整数。**Schema 质量直接影响 LLM 的工具调用准确率。**
+- 递归只处理一层 `properties`，没有 `$ref` / `oneOf` / `anyOf` / `allOf`
+- `items` 解析了但没有映射到 `ParameterSchema` 的嵌套数组约束里
+- `convertProperty` 生成 `*core.Parameter`（`Type/Description/Default/Enum/Min/Max`）
+
+诚实讲，**常见 case 没问题，复杂的嵌套 schema 会丢信息**——这是给 LLM 用的，schema 质量直接影响工具调用准确率。这是个真实的薄弱点，不是渲染出来的焦虑。
 
 ---
 
 ## 七、错误处理：超时、断连、和"服务器突然不说话了"
 
-这是我在写这篇文章时最想吐槽自己的部分。
+### 7.1 超时
 
-### 7.1 超时机制
+`MCPClient.call` 里用 `context.WithTimeout(ctx, c.timeout)` 包装等待。默认 30s，可每个服务器在配置里改。超时返回明确的 error，不会挂着。
 
-每个 `MCPClient` 调用都有超时控制：
+### 7.2 坦诚：没有重试，也没有熔断
 
-```go
-// internal/ares_mcp/client.go
-func (c *MCPClient) call(ctx context.Context, method string, params interface{}, result interface{}) error {
-    // ... 发送请求 ...
-    
-    callCtx, callCancel := context.WithTimeout(ctx, c.timeout)
-    defer callCancel()
-    
-    select {
-    case <-callCtx.Done():
-        return fmt.Errorf("timeout waiting for response to %s: %w", method, callCtx.Err())
-    case resp, ok := <-ch:
-        // ... 处理响应 ...
-    }
-}
-```
+**目前的实现里没有自动重试，也没有熔断器。** `Start` 对失败的服务器只是 log 然后继续。如果服务器在运行中挂了，`receiveLoop` 返回 error，client 不再自动重连。意味着：配了 3 个服务器，挂掉一个，那台服务器上的工具会静默失败——不 panic、不崩溃、但也回不来。
 
-默认超时 30 秒。用户可以在配置里按服务器自定义。
+优先级当时是"先把协议跑通"，这些留到了后面：
 
-### 7.2 坦诚反思：重试和熔断在哪里？
+1. **自动重连**：`receiveLoop` 退出后由 `MCPManager` 探活并重连
+2. **指数退避**：重连别死循环
+3. **熔断器**：连续失败 N 次标 unhealthy，停止尝试，定期探活
+4. **工具级降级**：服务器不可用时，`MCPTool.Execute` 返回明确错误而不是卡超时
 
-说实话，**目前的实现里没有重试，也没有熔断器。**
-
-如果一个 MCP 服务器挂了，`ConnectServer` 会返回 error，`Start` 会 log 一下然后继续连下一个服务器。但如果服务器在运行中突然断开——比如进程被 kill——当前的处理是 `receiveLoop` 返回 error，`MCPClient` 标记为 disconnected，但不会自动重连。
-
-这意味着什么？如果用户配了 3 个 MCP 服务器，其中一个在运行中挂了，那个服务器上的工具会静默失败。不会 panic，不会崩溃，但也不会自动恢复。
-
-我知道这是个问题。当时做第一版的时候，我的优先级是"先把协议跑通"，重连和熔断留到了后面。现在回头看，至少应该加这几个东西：
-
-1. **自动重连**：`receiveLoop` 退出后，`MCPManager` 应该检测到断连并尝试重连
-2. **指数退避**：重连不要死循环，用 exponential backoff
-3. **熔断器**：连续失败 N 次后标记服务器为 unhealthy，停止尝试，定期探活
-4. **工具级降级**：当服务器不可用时，`MCPTool.Execute` 应该返回明确的错误而不是超时
-
-这些是下一个迭代要补的。写这篇文章的时候我特意把这些缺口列出来，因为**承认问题比假装没问题更重要**。
+这些是下一个迭代要补的技术债。我特意把缺口列出来，因为**承认问题比假装没问题更重要**。
 
 ### 7.3 连接状态追踪
 
-虽然没有自动重连，但至少有状态追踪。`MCPManager.ListServers()` 返回每个服务器的状态：
-
-```go
-// internal/ares_mcp/manager.go
-type MCPServerStatus struct {
-    Name      string    `json:"name"`
-    Connected bool      `json:"connected"`
-    ToolCount int       `json:"tool_count"`
-    Version   string    `json:"version"`
-    Error     string    `json:"error,omitempty"`
-    ConnAt    time.Time `json:"connected_at,omitempty"`
-}
-```
-
-Dashboard 用这个来展示 MCP 服务器的健康状态。至少用户能**看到**哪个服务器挂了，即使不能自动恢复。
+`ConnectServer` 里 `mc.lastErr` 会被记录，`ListServers()` 会把每个连通服务器的 `Connected` / `ToolCount` / `ConnAt` 暴露出去。至少用户**能看到**哪台挂了，即使不能自动恢复。
 
 ---
 
-## 八、Dashboard 集成：让用户看见
+## 八、MCP 工具如何真正进入运行时（这才是真正的接缝）
 
-Dashboard 是用户和 MCP 子系统交互的唯一窗口。在 `internal/dashboard/api.go` 里，`/mcp` 路径暴露了服务器状态：
-
-```go
-// internal/dashboard/api.go
-// /mcp — configure, inspect MCP servers
-```
-
-Dashboard 通过 `MCPStatusProvider` 接口获取 MCP 状态：
+前面说了工具注册进的是 `MCPManager` 自己持有的 `core.Registry`。但那个 registry 是 boostrap 内部新建的，Agent 用的 `sub.ToolBinder` 又是另一个喂法。**真正把 MCP 工具送进 agent 运行时的是 `cmd/ares/mcp.go` 的 `setupMCP`。**
 
 ```go
-// internal/dashboard/service.go
-type MCPStatusProvider interface {
-    ListServers() []MCPServerStatusView
-}
-
-type MCPServerStatusView struct {
-    Name      string        `json:"name"`
-    Connected bool          `json:"connected"`
-    ToolCount int           `json:"tool_count"`
-    Version   string        `json:"version"`
-    Error     string        `json:"error,omitempty"`
-    ConnAt    time.Time     `json:"connected_at,omitempty"`
-    Tools     []MCPToolView `json:"tools"`
+// cmd/ares/mcp.go
+func setupMCP(_ context.Context, mcpMgr *ares_mcp.MCPManager, registry *api_tools.Registry, deps builtintools.GeneralToolsDeps) (*core.Registry, error) {
+	internalReg := core.NewRegistry()
+	// 内置 general tools 注册进 internalReg ...
+	if mcpMgr != nil {
+		// 把 bootstrap 里 MCPManager 已注册的工具桥接进 internalReg
+		for _, tool := range mcpMgr.RegisteredTools() {
+			t := tool
+			if err := internalReg.Register(t); err != nil {
+				fmt.Printf("MCP bridge: failed to register tool %s: %v\n", t.Name(), err)
+			}
+		}
+	}
+	// 再桥接进 public api/tools registry（dashboard 之类能看到）...
+	return internalReg, nil
 }
 ```
 
-`MCPManager` 实现了这个接口。Dashboard 前端可以展示：哪些 MCP 服务器在线、每台服务器暴露了多少工具、连接时间、最后一次错误。
+`RegisteredTools()` 是 manager 上读侧的对接口——它调 `m.registry.List()` + `Get`，把 MCP 工具按 `core.Tool` 读出来。
 
-这里有一个设计决策值得注意：Dashboard 用的是 `MCPServerStatusView`（一个纯数据结构），而不是直接依赖 `MCPManager`。这是经典的**接口隔离**——Dashboard 不需要知道 MCP 的内部实现，只需要一个能返回状态的接口。
+然后 `serve.go` 把它装成 Agent 用的 ToolBinder：
 
-Arena（混沌工程模块）也参与了 MCP 的测试。在 `internal/dashboard/api.go` 里有一个 `ArenaActionMCPDisconnect`——可以在运行时模拟 MCP 服务器断连，测试系统的韧性。这个在 `api/core/arena.go` 里定义为 `FaultMCPDisconnect`。
+```go
+// cmd/ares/serve.go
+toolBinder := newToolBinder(internalReg)   // sub.NewToolBinder() + binder.BridgeFromRegistry(internalReg)
+```
+
+这个 `toolBinder` 最终作为 `sub.ToolBinder` 传进 `createAndServeAgents`，Agent 执行工具时就是走它。所以：
+
+```mermaid
+graph LR
+    A[MCP Server<br/>外部进程] --> B[MCPClient.ListTools]
+    B --> C[NewMCPTool 包装<br/>core.Tool 实现]
+    C --> D[MCPManager.registry<br/>Register]
+    D --> E[RegisteredTools 读出]
+    E --> F[internalReg<br/>core.Registry]
+    F --> G[newToolBinder<br/>BridgeFromRegistry]
+    G --> H[sub.ToolBinder<br/>Agent 执行工具]
+```
+
+**结论：MCP→运行时的绑定路径存在，而且是实打实被 serve 链路接通的**——MCP Server → `MCPClient` 发现 → `MCPTool`（`core.Tool`）注册进 manager 的 registry → `setupMCP` 用 `RegisteredTools()` 桥接进 `internalReg` → `newToolBinder` 的 `BridgeFromRegistry` → Agent tool binder。
+
+顺带澄清一个混淆点：`internal/agentsyscall` 里有个 `BindTools(binder, kernel)`，但它绑定的是 `spawn_agent` / `create_task` 这俩 syscall 工具，**跟 MCP 无关**。MCP 工具走的是上面这条 `core.Registry → sub.ToolBinder` 的路，不是 agentsyscall。
 
 ---
 
 ## 九、配置驱动：YAML 里的工具声明
 
-整个 MCP 集成是配置驱动的。用户在 YAML 里声明要连接哪些 MCP 服务器：
+整条集成是配置驱动的。用户在配置里声明要连哪些 MCP 服务器。`provide_mcp.go` 里 `mapMCPServerConfig` 把 `ares_config.MCPConfig` 转成 `ares_mcp.MCPManagerConfig`，schema 大致是这个形状：
 
 ```yaml
-# config.yaml
+# config（示意，字段以 ares_config 为准）
 mcp:
   servers:
     - name: "code-search"
       transport:
+        type: stdio
         stdio:
           command: "mcp-code-search"
           args: ["--repo", "/path/to/repo"]
-      timeout: 30s
+      timeout: 30
       enabled: true
       auto_start: true
     - name: "database"
       transport:
+        type: sse
         sse:
           url: "http://localhost:8080/sse"
-          headers:
-            Authorization: "Bearer xxx"
-      timeout: 60s
+      timeout: 60
       enabled: true
       auto_start: true
 ```
 
-`MCPServerConfig` 里的 `Enabled` 和 `AutoStart` 两个字段提供了灵活性：`Enabled` 控制这个服务器是否在配置里生效，`AutoStart` 控制是否在 `Manager.Start()` 时自动连接。用户可以在运行时通过 `ConnectServer` / `DisconnectServer` 动态管理连接。
-
-```go
-// internal/ares_mcp/manager.go
-func (m *MCPManager) Start(ctx context.Context) error {
-    for _, sc := range m.config.Servers {
-        if !sc.Enabled || !sc.AutoStart {
-            continue
-        }
-        if err := m.ConnectServer(ctx, sc.Name); err != nil {
-            log.Error("mcp: failed to connect to server", "server", sc.Name, "error", err)
-            // 不 return！继续连下一个
-        }
-    }
-    return nil
-}
-```
-
-注意 `Start` 里连接失败不会中断整个启动流程。这是一个有意的设计：一个 MCP 服务器挂了不应该影响其他服务器和 Agent 的正常运行。
+`MCPServerConfig` 的 `Enabled`（这个服务器是否生效）和 `AutoStart`（是否在 `Manager.Start()` 时自动连）组合出灵活性。`ProvideMCP` / 向后兼容别名 `SetupMCP` 在 bootstrap 阶段创建 `MCPManager` 并 `Start`。运行时还可以 `ConnectServer` / `DisconnectServer` 动态管理。没有配置服务器时 `ProvideMCP` 返回一个空 manager（也算合法的最小配置）。
 
 ---
 
 ## 十、工厂模式：MCPToolFactory
 
-除了通过 `MCPManager` 批量管理，MCP 工具还可以通过工厂模式动态创建：
+除了 `MCPManager` 批量管理，MCP 工具还能量产：
 
 ```go
 // internal/ares_mcp/factory.go
 type MCPToolFactory struct {
-    manager *MCPManager
+	manager *MCPManager
 }
 
 func (f *MCPToolFactory) Name() string { return "mcp" }
 
 func (f *MCPToolFactory) Create(config map[string]interface{}) (core.Tool, error) {
-    // 从 config map 构建 MCPServerConfig
-    // 创建临时 client，连接，发现工具
-    // 返回第一个工具
+	// 从 map 构建 MCPServerConfig
+	// 用 ConnectWithLifetime 只连初始握手
+	// 返回第一个工具
 }
 ```
 
-`MCPToolFactory` 实现了 `core.ToolFactory` 接口，这让 MCP 工具可以像内置工具一样通过工厂创建。用户传一个 `config` map 进来，工厂负责连服务器、发现工具、创建 `MCPTool`。
+它实现了 `core.ToolFactory`，文件末尾同样有编译期断言 `var _ core.ToolFactory = (*MCPToolFactory)(nil)`。有两个值得注意的点：
+
+1. **`Create` 只返回第一个工具**——服务器如果有 10 个工具只会给你一个。这是明摆着的简化/技术债，`ValidateConfig` 也是配套写的。
+2. `ConnectWithLifetime(connectCtx, context.Background(), transport)` 只把 `connectCtx` 绑到初始握手，client 的生命周期 context 独立（background），这样 `Create` 一返回工具不会立刻死掉。
 
 ---
 
 ## 十一、Server 端：ares 自己也能当 MCP 服务器
 
-到目前为止我们一直在说"ares 作为 MCP 客户端"。但 `internal/ares_mcp/server.go` 里还有另一面——ares 自己也能作为 MCP 服务器，把自己的能力暴露给其他 MCP 客户端。
+到目前为止都在说"ares 作为 MCP 客户端"。但 `internal/ares_mcp/server.go` 里还有另一面——ares 自己也能作为 MCP 服务器，把自己的能力暴露给其他 MCP 客户端：
 
 ```go
 // internal/ares_mcp/server.go
 type MCPServer struct {
-    info         Implementation
-    capabilities ServerCapabilities
-    tools        map[string]*registeredTool
-    resources    map[string]*registeredResource
-    prompts      map[string]*registeredPrompt
-    // ...
+	info              Implementation
+	capabilities      ServerCapabilities
+	tools             map[string]*registeredTool
+	resources         map[string]*registeredResource
+	resourceTemplates []*registeredResourceTemplate
+	prompts           map[string]*registeredPrompt
+	transport         ServerTransport
+	mu                sync.RWMutex
+	serveCtx          context.Context
+	handlerTimeout    time.Duration
 }
 ```
 
-`MCPServer` 支持注册三种能力：Tools（工具调用）、Resources（资源读取）、Prompts（提示词模板）。它同样使用 `ServerTransport` 接口（`StdioServerTransport` 或 SSE），支持被其他 MCP 客户端连接。
+它注册三种能力：Tools（`ToolHandler`）、Resources（`ResourceHandler`/`ResourceTemplate`）、Prompts（`PromptHandler`）。通过 `transport_server.go` 里的 `ServerTransport` 接客户端，支持 stdio 和 SSE 两种 server transport。
 
-这意味着 ares 既可以是 MCP 生态的消费者（调用别人的工具），也可以是生产者（暴露自己的能力）。双向打通。
+这意味着 ares 既可以是 MCP 生态的消费者（调用别人的工具），也可以是生产者（暴露自己的能力）。`internal/ares_skills/e2e_mcp_test.go` 里就有一个真实用例：起一个 serve `MCPServer` 的 stdio 子进程，再用 `MCPManager` 的 stdio transport 连它，验证"连接→注册→调用"整条链路。
 
 ---
 
 ## 坦诚反思：这条路走了多远，还差多远
 
-写到这里，我想诚实地说说 MCP 集成目前的状态。
-
 **做对了的事：**
 
-1. **Transport 抽象干净**：`Transport` 接口只有 4 个方法，Stdio 和 SSE 两种实现互不影响。加新的传输方式（比如 WebSocket）只需要实现这个接口
-2. **工具透明化**：MCP 工具在 Registry 里和内置工具平级，调用方完全不需要关心工具的来源
-3. **Schema 自动转换**：JSON Schema 到 ParameterSchema 的转换让 LLM 自动获得工具的参数信息，不需要人工翻译
-4. **配置驱动**：YAML 配置让用户不用写代码就能接入 MCP 工具
+1. **Transport 抽象干净**：`Transport` 只有 4 个方法，Stdio 和 SSE 互不影响。加新传输（比如 WebSocket）只实现接口即可
+2. **工具透明化**：`MCPTool` 实现 `core.Tool`，在 Registry 里和内置工具平级，调用方不需要关心来源
+3. **Schema 自动转换**：`ConvertJSONSchema` 让 LLM 拿到参数元信息，不用人工翻译
+4. **配置驱动**：YAML / bootstrap 一条链把外部工具接进来
+5. **挂了的服务器可见**：`ListServers()` 把配置了但没连上的服务器也标成 `Connected: false`
+6. **两处务实的安全边界**：SSE endpoint 同 host 校验（防 SSRF）、健康检查的二进制/URL 白名单
 
-**还没做好的事：**
+**还没做好 / 待核实：**
 
-1. **没有自动重连**：运行中服务器断开后，工具静默失败
-2. **没有重试机制**：一次调用失败就是失败，不会自动重试
-3. **没有熔断器**：对不健康的服务器没有自动降级
-4. **Factory 的 Create 返回第一个工具**：如果服务器有 10 个工具，只返回一个，这明显不合理
-5. **SSE 的 POST URL 没有相对路径处理**：如果服务器返回相对路径，客户端会挂
+1. **没有自动重连 / 重试 / 熔断**：运行中断开就静默失败
+2. **Discovery → MCP Manager 的桥未接通**：发现引擎找到服务但不会自动变成连接中的工具（待核实）
+3. **`SetToolChangeHandler` 悬空**：listChanged → catalog 增量重索引的钩子存在但 serve 没接（待核实）
+4. **`MCPToolFactory.Create` 只返回第一个工具**：10 个工具的服务器只能拿到 1 个
+5. **`ConvertJSONSchema` 是简化实现**：`$ref` / `oneOf` 等复杂 schema 会丢信息
+6. **`MCPServerStatus.Version` 恒为空**：客户端没暴露协议版本字符串
 
 这些都是真实的技术债，不是我编出来凑字数的。
 
@@ -716,37 +639,32 @@ type MCPServer struct {
 
 ## 尾声：协议的价值
 
-回头看整个 MCP 集成，我最大的感悟是：**协议的价值不在于它有多复杂，而在于它在多大程度上解耦了生产者和消费者。**
+回头看整个 MCP 集成，最大的感悟是：**协议的价值不在于它有多复杂，而在于它在多大程度上解耦了生产者和消费者。**
 
-在没有 MCP 之前，工具注册是编译时确定的——写代码、编译、部署。有了 MCP 之后，工具注册变成了运行时发现——启动子进程、握手、自动发现。
+没有 MCP 前，工具注册是编译时确定的——写代码、编译、部署。有了 MCP，工具注册变成运行时发现——启动子进程、握手、自动发现调用。MCP 工具以 `core.Tool` 的身份以完全平级的地位进入 `core.Registry`，再经 `setupMCP → newToolBinder` 送达 Agent。用户不用等我们写代码，他们自己写一个 MCP 服务器，ares 就能发现并使用。
 
-这个转变让 ares 从"一个有 22 个内置工具的 Agent 框架"变成了"一个可以接入任意工具的 Agent 平台"。用户不需要等我们写代码，他们自己写一个 MCP 服务器（几十行 Python/TypeScript 就能搞定），ares 就能自动发现并使用。
-
-协议是基础设施。MCP 之于 Agent 工具，就像 HTTP 之于 Web 服务——它不解决具体问题，它让解决问题的方式变得标准化。
+协议是基础设施。MCP 之于 Agent 工具，就像 HTTP 之于 Web 服务——它不解决具体问题，它让解决问题的方式标准化。
 
 核心文件一览：
 
 | 文件 | 职责 |
 |------|------|
-| `internal/ares_mcp/client.go` | MCP 客户端：连接、握手、工具发现、工具调用 |
-| `internal/ares_mcp/manager.go` | 多服务器管理：连接生命周期、工具注册/注销 |
-| `internal/ares_mcp/transport.go` | Transport 接口定义 |
+| `internal/ares_mcp/client.go` | MCP 客户端：传输接送、握手、工具发现、工具调用、通知处理 |
+| `internal/ares_mcp/manager.go` | 多服务器管理：连接生命周期、工具注册/注销、热更新、状态查询 |
+| `internal/ares_mcp/mcp_tool.go` | `MCPTool` 适配器：MCP 工具 → `core.Tool` |
+| `internal/ares_mcp/schema.go` | `ConvertJSONSchema`：JSON Schema → ParameterSchema |
+| `internal/ares_mcp/jsonrpc.go` | JSON-RPC 2.0 消息模型、编解码、消息分类 |
+| `internal/ares_mcp/transport.go` | `Transport` 接口（Start/Send/Receive/Close） |
 | `internal/ares_mcp/transport_stdio.go` | Stdio 传输：子进程 stdin/stdout 通信 |
-| `internal/ares_mcp/transport_sse.go` | SSE 传输：HTTP Server-Sent Events |
-| `api/discovery/discovery.go` | 公共 API 类型定义和代理 |
-| `internal/discovery/engine.go` | 发现引擎：编排 Providers 执行和结果合并 |
-| `internal/discovery/identity.go` | 身份归一化：normalizeEndpoint、knownLaunchers |
-| `internal/discovery/health.go` | 健康检查：MCPHealthChecker |
-| `internal/discovery/events.go` | 事件系统：EventHandler、EventType |
-| `internal/discovery/store.go` | 服务存储：ServiceStore、MemoryStore |
-| `internal/discovery/providers/filesystem.go` | 文件系统 Provider：扫描 Claude/Cursor/VSCode/ARES 配置 |
-| `internal/discovery/providers/binary.go` | 二进制探针 Provider：扫描 PATH |
-| `internal/ares_mcp/mcp_tool.go` | MCPTool 适配器：MCP 工具 → core.Tool |
-| `internal/ares_mcp/schema.go` | JSON Schema → ParameterSchema 转换 |
-| `internal/ares_mcp/jsonrpc.go` | JSON-RPC 2.0 消息模型和编解码 |
-| `internal/ares_mcp/types.go` | MCP 协议类型定义 |
-| `internal/ares_mcp/factory.go` | MCPToolFactory：工厂模式创建 MCP 工具 |
+| `internal/ares_mcp/transport_sse.go` | SSE 传输：HTTP Server-Sent Events + endpoint 同 host 校验 |
+| `internal/ares_mcp/factory.go` | `MCPToolFactory`：工厂模式创建 MCP 工具 |
 | `internal/ares_mcp/server.go` | MCP 服务端：ares 作为 MCP 服务器 |
-| `internal/tools/resources/core/registry.go` | 工具注册表：MCP 工具的最终归宿 |
-| `internal/dashboard/service.go` | Dashboard MCP 状态接口 |
-| `internal/dashboard/api.go` | Dashboard /mcp API 端点 |
+| `internal/ares_mcp/types.go` | MCP 协议类型定义 |
+| `internal/ares_bootstrap/provide_mcp.go` | `ProvideMCP`/`SetupMCP`：配置 → MCPManager |
+| `internal/ares_bootstrap/skills_wiring.go` | `wireSkills`：把 MCPManager 接成 Skill 的懒连接 |
+| `internal/ares_skills/catalog.go` | `Catalog`：`SetMCPConnector` / `Activate` 懒连接 |
+| `cmd/ares/mcp.go` | `setupMCP`：MCP 工具桥接进 internalReg + public registry |
+| `cmd/ares/tools.go` | `newToolBinder`：Registry → `sub.ToolBinder` |
+| `internal/discovery/` | 可选的发现引擎（未接到 Manager，见文中标注） |
+| `internal/discovery/providers/filesystem.go` | ARES/Claude/Cursor/VSCode 配置扫描 |
+| `internal/discovery/providers/binary.go` | 已知 MCP 二进制白名单探针 |

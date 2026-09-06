@@ -52,6 +52,14 @@ func createAndServeAgents(
 			log.Printf("serve: evolution strategy source wired into agents (GA deploy → runtime read)")
 		}
 	}
+
+	// M5: inject the L1 ToolClass capability graph into the evolution
+	// system BEFORE creating peer agents so the plannerCognition can
+	// read enabled/budget/prior at L2 growth time. The L1 graph is NOT
+	// compiled into taskfabric — it is a capability catalog, not an
+	// execution plan (§1: L1 ≠ L2).
+	injectToolClassDAG(comp, toolBinder)
+
 	subAgents, peerKernel, err := createPeerAgents(ctx, cfg, comp, llmAdapter, chatClient, toolBinder, comp.EventStore, strategySrc, comp.ExpRepo)
 	if err != nil {
 		return nil, nil, fmt.Errorf("create peer agents: %w", err)
@@ -316,4 +324,26 @@ func setupPeerRegistry(
 		kernel.peerRegistry = reg
 	}
 	return reg, nil
+}
+
+// injectToolClassDAG builds the L1 ToolClass capability graph from the tool
+// binder's schemas and injects it into the evolution system (M5). Called
+// BEFORE peer agents are created so the plannerCognition (constructed inside
+// createPeerAgents when the DAG gate is open) can read enabled/budget/prior
+// at L2 growth time. The L1 graph is NOT compiled into taskfabric — it is a
+// capability catalog, not an execution plan (§1: L1 ≠ L2).
+func injectToolClassDAG(comp *ares_bootstrap.Components, toolBinder sub.ToolBinder) {
+	if comp.NewEvolution == nil {
+		return
+	}
+	l1DAG, err := buildToolClassDAG(toolBinder.GetToolSchemas())
+	switch {
+	case err == nil:
+		comp.NewEvolution.SetToolClassDAG(l1DAG)
+		log.Printf("serve: L1 ToolClass DAG injected into evolution (%d nodes)", len(l1DAG.Steps()))
+	case errors.Is(err, errNoToolSchemas):
+		log.Printf("serve: no tool schemas; L1 ToolClass DAG skipped (constraints default to permissive)")
+	default:
+		log.Printf("serve: L1 ToolClass DAG build failed (constraints default to permissive): %v", err)
+	}
 }

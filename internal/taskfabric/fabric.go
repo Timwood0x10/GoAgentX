@@ -761,6 +761,11 @@ func (f *Fabric) recordLocked(t *Task, typ EventType) *pendingAppend {
 	if sid := strategyIDFromCheckpoint(t.Checkpoint); sid != "" {
 		payload[restoreKeyStrategyID] = sid
 	}
+	// M2: SessionID rides on every event too, same reasoning as StrategyID —
+	// the session scope must be visible without decoding checkpoints.
+	if sid := sessionIDFromCheckpoint(t.Checkpoint); sid != "" {
+		payload[restoreKeySessionID] = sid
+	}
 	if isMustPersistEvent(typ) {
 		payload[restoreKeyCapability] = t.Capability
 		payload[restoreKeyPriority] = t.Priority

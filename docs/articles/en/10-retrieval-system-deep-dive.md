@@ -1,662 +1,339 @@
-# ares Architecture Deep Dive (X): Retrieval System — Hybrid Search and Scoring Pipeline (0.3.x)
+# ares Architecture Deep Dive (X): Retrieval System — Vector / Keyword / FTS in Practice, and Its Honest Limits (0.3.x)
 
 > The agent says: "Based on your past experience, I suggest..." — but the suggestion is completely irrelevant.
 > Even worse: the agent solved this exact problem before, but now it's starting from scratch.
 > I realized back then: an agent's memory isn't about whether it has memory — it's about whether it can retrieve the right one.
 > An agent without retrieval is a goldfish: 7-second memory, forever reinventing the wheel.
 
+> Note: this article is based on real code (the full retrieval pipeline under `internal/storage/postgres/services`, the vector/keyword repository layer under `internal/storage/postgres/repositories`, the RAG recall in `internal/ares_memory/context/memory_retriever.go`, the experience ranking in `internal/ares_experience/ranking_service.go`, and FTS5/keyword search in `internal/ares_skills`). Every symbol and every flow below is something I actually read in this codebase. Anything that is "configured but not actually wired" or that I'm not sure about is marked （待核实） — I won't oversell it.
+
+---
+
 ## 1. First, Why Retrieval Determines Agent IQ
 
 There's a brutal truth about building agents: **No matter how powerful the model, if you feed it the wrong context, the output is garbage.**
 
-GPT-5 can score in the top 10%, but if I feed it the wrong documents, irrelevant experience, outdated knowledge... the output is something that sounds reasonable but is actually nonsense. That's worse than saying "I don't know" — because the user will trust it.
+No matter how capable the model is, if I feed it wrong documents, irrelevant experience, or outdated knowledge, the output is something that sounds reasonable but is actually nonsense. That's worse than saying "I don't know" — because the user will trust it.
 
-I made a classic mistake when I first worked with embeddings: dump everything into one vector store and take whatever comes back. The result?
+Retrieval has a plain goal: pull genuinely useful context into the LLM at the right time, from the right place, with the right weights. The hard part is defining and ordering what "relevant" means — semantically relevant, literally relevant, or "previously proven to solve this problem"? Different data calls for different answers. ares' approach is not "vector database for everything": it splits data by type and lets each use the retrieval it's good at. This article makes clear what is actually running and what isn't.
 
-- Searching for "Python dependency install error" returned a JavaScript tutorial snippet from three months ago — because it was all text embeddings, semantically mixed together
-- Searching for "user login timeout" returned "How to optimize PostgreSQL connection pools" — relevant but not precise
-- The agent took the irrelevant context and fabricated a plausible-looking solution, wasting 40 minutes of the user's time
+---
 
-So I concluded: **A retrieval system isn't something you build with a vector database and call it a day.** It needs multi-strategy search, weighted scoring, signal amplification, time decay... a full combination punch that guarantees what goes into the LLM is genuinely useful.
+## 2. Off the Bat: What Retrieval Path Actually Runs at Runtime? (An Honest Correction)
 
-## 2. Architecture Overview: Two Retrieval Systems + Shared Infrastructure
+The previous version of this article claimed that "the hybrid `RetrievalService` was written but never wired (the `advancedRetrieval` field is forever nil in the API layer), and only a pure-vector `SimpleRetrievalService` is in use." After actually reading the code, **that claim is backwards.** Correction:
 
-ares's retrieval system has two layers:
+- **There is no `api/retrieval/service.go`**. The whole `api/` tree has `api/embedding`, `api/experience`, `api/knowledge`, `api/discovery` etc. — **there is no retrieval package**. Both retrieval services live under `internal/storage/postgres/services/`.
+- **The service actually wired into production is `RetrievalService`, not `SimpleRetrievalService`**. `internal/ares_memory/production_manager.go` constructs it via `services.NewRetrievalService(...)`, and `internal/ares_memory/production_manager_tasks.go` calls `retrievalService.Search(...)` in `ProductionMemoryManager.SearchSimilarTasks(ctx, query, limit)` at real runtime.
+- **`SimpleRetrievalService` is the one that is defined but never called by any non-test code.** Grepping `NewSimpleRetrievalService` across the repo only finds its own definition file — no callers. （待核实: I found no production wiring for it.)
+- There is also a separate, genuinely wired **RAG vector-recall path**: `internal/ares_bootstrap/retriever_wiring.go`'s `wireRetrievers` injects a `MemoryRetriever` (vector search over distilled experiences) and a `KnowledgeRetriever` (hybrid search over AKG facts) into the MemoryManager, triggered through `manager_rag.go`'s `runRetrieval` when `EnableRAG=true`.
 
-```mermaid
-graph TB
-    subgraph "API Layer (api/retrieval/service.go)"
-        SRV[RetrievalServiceAPI]
-        SIMPLE[SimpleRetrievalService<br/>Pure Vector Search]
-        ADV[RetrievalService<br/>Hybrid Search + Scoring<br/>--- NOT WIRED ---]
-        SRV --> SIMPLE
-        SRV -.-> ADV
-    end
+So: **runtime vector retrieval does exist.** Here are the three real paths:
 
-    subgraph "Shared Infrastructure"
-        EP[EmbeddingPipeline<br/>Go+Python+Ollama]
-        QR[QueryRewriter<br/>Rule-based + LLM Rewrite]
-        RC[Redis + Memory Cache]
-    end
+| Path | Entry | Data | Method | Wired at runtime |
+|------|-------|------|--------|-----------------|
+| Hybrid retrieval | `RetrievalService.Search` (via `SearchSimilarTasks`) | mainly experiences | vector + keyword hybrid + score | ✅ yes |
+| RAG experience recall | `MemoryRetriever.Retrieve` (via `runRetrieval`) | distilled experiences | vector + minScore filter | ✅ yes |
+| RAG knowledge recall | `adapter.KnowledgeRetriever` (AKG) | AKG-distilled facts | hybrid search | ✅ yes |
+| Pure vector | `SimpleRetrievalService.Search` | knowledge | pure vector + precision mode | ❌ no callers |
 
-    SIMPLE --> EP
-    ADV --> EP
-    ADV --> QR
-    ADV --> RC
-```
+> Note `SearchSimilarTasks` only enables experience search: `SearchExperience=true, SearchKnowledge=false, SearchTools=false`, and production passes `toolRepo=nil`. So the wired hybrid path's **scope is effectively converged on experience** (vector + ILIKE keyword).
 
-**SimpleRetrievalService** is the retrieval solution actually wired into the current API layer — pure vector search, straightforward, suitable for scenarios where "don't mess up" is more important than extreme precision.
+---
 
-**RetrievalService** is the full hybrid search engine — 2069 lines of code covering vector search, BM25 keyword search, multi-layer weighted scoring, signal amplification, time decay, deduplication and merging... a complete production-grade retrieval pipeline.
+## 3. The Embedding Pipeline: Text → 1024-D Vector
 
-Guess what? **advancedRetrieval has always been nil in the API layer.** We'll unpack that in the "Honest Section."
+Whatever the retrieval path, the first step is turning text into a vector. ares is a three-layer chain: Go (`internal/storage/postgres/embedding`) → Python FastAPI (`services/embedding/app.py`) → Ollama (`qwen3-embedding:0.6b`).
 
-## 3. Data Classification Storage: Not Redundancy, But Division of Labor
-
-Before diving into the embedding and search details, we need to answer a fundamental question: **Why use both pgvector and plain PostgreSQL tables?**
-
-First-time observers of ares's storage design often react: "Isn't this just vector retrieval? Why not use a dedicated vector database?" — I know that reaction well, because that's exactly what I thought when I started.
-
-### 3.1 What Vector DBs Can and Can't Do
-
-Let's first demystify vector databases.
-
-**What vector DBs are good at:** At moderate scale (tens to hundreds of thousands of entries), they bring semantically similar things together. "Apples" and "oranges" can be found together, and "Python language" and "Golang language" can be associated — something traditional keyword search truly can't do.
-
-**What vector DBs are not good at:** As data volume grows, similarity in high-dimensional space gradually loses its discriminative power. This isn't a bug in any particular product — it's a mathematical property of high-dimensional geometry known as the **Curse of Dimensionality**, directly manifesting in retrieval.
-
-In a 1024-dimensional space (ares's embedding dimension), the cosine similarity between two random unrelated vectors is typically around 0.7-0.8. This means when you dump 100,000 entries into a single vector bucket and search for "Python dependency install error," your top-10 results might have five that look like:
-
-```
-Rank 1: "pip freeze best practices"                — cosine sim 0.91, precisely relevant
-Rank 2: "JavaScript EventLoop deep dive"            — cosine sim 0.87, completely irrelevant
-Rank 3: "pip install inside Docker containers"      — cosine sim 0.86, partially relevant
-Rank 4: "Vue3 reactivity explained"                 — cosine sim 0.84, completely irrelevant
-Rank 5: "Node.js package management common errors"   — cosine sim 0.83, seemingly relevant but not
-```
-
-Rank 2 and Rank 1 differ by only 0.04 in cosine similarity, but for an agent, one is a lifeline and the other is poison.
-
-This isn't a "failure" of vector search — it's the **boundary of what vector search can do**: it tells you "these texts are mathematically nearby," but mathematical proximity doesn't equal real relevance — especially when different data types are mixed in the same semantic space.
-
-### 3.2 For LLMs, More Is Worse
-
-Now go back to the example at the start of the article: searching "Python dependency install error" returns ten results, three of which are high-similarity JavaScript tutorials.
-
-What happens when the agent receives these ten results?
-
-It stuffs every single one into its context window. Then it sees Rank 2 — "JavaScript EventLoop deep dive" — does this have anything to do with "Python dependency error"? No. But the agent doesn't just ignore it. It **tries to rationalize this information**, because the LLM's training objective is to "generate the most coherent output given all available context."
-
-So it might produce: "Similar issues exist in Node.js. Consider checking whether the event loop is blocked..."
-
-This is the real path to hallucination: **the agent isn't making things up — it's doing its best to use every input it's given, including the inputs that should never have been in the search results.**
-
-At larger scale (millions, tens of millions of entries), this problem's consequences compound:
-- The absolute number of high-similarity false positives grows significantly
-- Every retrieval cycle floods the context window with a new batch of noise
-- Agent reasoning quality doesn't degrade linearly — it **falls off a cliff** once noise exceeds a certain fraction of the context window, and output reliability collapses
-
-### 3.3 Solution: Data Type Split Routing
-
-Once you understand vector DB boundaries and the damage false positives do to LLMs, the solution is clear: **don't let a single vector bucket bear the retrieval burden for all data.** Split data by type, route different types through different retrieval paths, so they don't interfere with each other.
-
-ares divides data into four domains:
-
-| Data Domain | Storage Location | Retrieval Strategy | Weight | Core Signal |
-|-------------|-----------------|-------------------|--------|-------------|
-| **Knowledge** | pgvector dedicated table | Pure vector search | 0.4 | Semantic similarity |
-| **Experience** | PostgreSQL + metadata columns | Vector search + signal weighting | 0.3 | Success/failure, speed, reuse rate |
-| **Tools** | PostgreSQL registry | Keyword primary, vector fallback | 0.2 | Exact match |
-| **TaskResults** | PostgreSQL archive table | Keyword + time decay | 0.1 | Recency |
-
-**Knowledge** is the "textbook" — curated and reviewed knowledge artifacts, highest quality. Its vector space contains only knowledge articles, unpolluted by other data types, so simple pure vector search is sufficiently reliable.
-
-**Experience** is the "lab notebook" — records of problems the agent has solved in the past. The core value of this data isn't semantic similarity, but **historical validation signals**. So it adds signal weighting on top of vector search: successful experiences ×1.2, failed experiences ×0.7, fast execution ×1.2.
-
-**Tools** are the "toolbox manuals" — short text, fixed format, limited semantic density. Pure vector search is mostly wasted on this kind of data — keyword exact matching + category filtering handles the vast majority of queries.
-
-**TaskResults** are the "scratch paper" — raw records of every task the agent executed. Highest volume, noisiest, lowest quality. Weight is only 0.1, and it's most heavily affected by time decay — task results from 30 days ago barely participate in ranking.
-
-### 3.4 How Classification Storage Reduces Hallucination
-
-Going back to the hallucination path, classification storage cuts it off at three levels:
-
-**1. Smaller vector space = higher discriminability**
-
-Each domain's data retrieves within its own independent vector space. The Knowledge domain contains only knowledge articles. Inside this restricted space, cosine similarity genuinely reflects semantic distance — there's no more "search Python dependency returns JavaScript" situations because the latter simply doesn't exist in the same vector space.
-
-**2. Different data types use different strategies, each playing to its strengths**
-
-Experience data doesn't need "the most similar" result — it needs "the most successful" one. So signal weighting is more effective than pure vector search. Tool descriptions don't need semantic search — they need exact matching. Every strategy operates in its optimal zone, without forcing one engine to solve all problems.
-
-**3. Context window protection mechanism**
-
-Through weight layering (Knowledge's weight is 4× that of TaskResults), time decay, and precision-mode priority strategies for key data types, the system ensures the LLM's context window is preferentially filled with high-quality, high-confidence content.
-
-### 3.5 Why Not Just Use Two Databases (Milvus / Pinecone)?
-
-A more radical question: pgvector plus PostgreSQL looks like "not using two databases but having four tables" — why not just use two dedicated databases?
-
-Two words: **transactional consistency and operational simplicity.**
-
-Dedicated vector databases (Milvus, Pinecone, Qdrant) are indeed stronger at vector search performance, but at the cost of:
-- **Eventual consistency** — writes aren't guaranteed to be immediately readable
-- **Cross-system JOIN impossible** — can't simultaneously do vector search and structured filtering in a single query
-- **Operational overhead** — every additional independent database means another cluster to monitor, back up, and tune
-
-ares's choice: **store vectors in the pgvector plugin, and structured metadata in related tables within the same PostgreSQL. One query completes vector + metadata combined filtering and sorting at the SQL level.**
-
-```sql
-SELECT e.content, e.metadata,
-       1 - (ke.embedding <=> $1) AS vector_score,
-       e.success_count, e.exec_time_ms
-FROM experience e
-JOIN knowledge_embeddings ke ON ke.content_id = e.id
-WHERE e.tenant_id = $2
-  AND e.success_count > 3
-ORDER BY (1 - (ke.embedding <=> $1)) * 1.1
-         * CASE WHEN e.exec_time_ms < 1000 THEN 1.2 ELSE 1.0 END
-         DESC
-LIMIT 10
-```
-
-In short: **This isn't redundancy between pgvector and PostgreSQL, nor is it a replacement for vector databases — it's a data classification system where "data type determines retrieval strategy, retrieval strategy determines storage location" fully realized within the PostgreSQL ecosystem.**
-
-## 4. Embedding Pipeline
-
-Let's start with the infrastructure — no matter which retrieval strategy you use, embedding is the unavoidable first step.
+Model & dimensions (`services/embedding/app.py`):
+- `OLLAMA_MODEL = "qwen3-embedding:0.6b"` (overridable via env)
+- `EMBEDDING_DIM = 1024`
+- `MAX_LENGTH = 512` (truncated after prefixing)
+- `CACHE_TTL = 86400` (24 hours)
 
 ```mermaid
 sequenceDiagram
     participant G as Go EmbeddingClient
-    participant C as Cache (Redis+Memory)
+    participant R as Redis Cache
     participant P as Python FastAPI
-    participant O as Ollama (qwen3-embedding)
+    participant O as Ollama (qwen3-embedding:0.6b)
 
-    G->>G: normalizeText<br/>(lowercase+trim+collapse)
-    G->>G: BLAKE2b-128 cacheKey
-    G->>C: Lookup cache
+    G->>G: normalizeText (lowercase + trim + collapse whitespace)
+    G->>G: cacheKey = BLAKE2b-256 truncated to 128bit<br/>format "embed:<hex>"
+    G->>R: GET cacheKey
     alt Cache Hit
-        C-->>G: Return cached vector
+        R-->>G: return vector
     else Cache Miss
-        G->>P: POST /embed (10s timeout)
-        P->>P: normalize_text (NFKC)
-        P->>O: /api/embed (qwen3-embedding)
-        O-->>P: 1024d vector
-        P->>P: normalize_vector (L2)
-        P-->>G: Return vector
-        G->>C: Store in Redis (24h TTL) + Memory LRU (1000)
+        G->>P: POST /embed (prefix=query:/passage:)
+        P->>P: normalize_text (NFKC + lowercase + strip control chars)
+        P->>O: POST /api/embeddings
+        O-->>P: 1024-d vector
+        P->>P: normalize_vector (L2 normalize)
+        P-->>G: return vector
+        G->>R: SET cacheKey (TTL 24h)
     end
 ```
 
-### 4.1 Text Normalization
+Key points, all verified:
 
-Go side entry point:
+**1. Two-layer text normalization.** The Go side `EmbeddingClient.normalizeText` does lower + trim + collapses runs of whitespace to a single space; the Python side `normalize_text` first does `unicodedata.normalize('NFKC')`, then lowercase, strip, `re.sub(r'\s+',' ')`, and drops control chars. Why two layers? Because `strings.ToLower` (Go) and `str.lower()` (Python) differ on some Unicode characters, and dual-layer normalization cuts cache-miss explosions (`client.go` comment: "avoid cache miss explosion").
 
-```go
-// internal/storage/postgres/embedding/client.go
-func normalizeText(input string) string {
-    input = strings.ToLower(input)
-    input = strings.TrimSpace(input)
-    // Collapse multiple whitespace characters into a single space
-    return regexp.MustCompile(`\s+`).ReplaceAllString(input, " ")
-}
-```
+**2. The cache key.** Go's `getCacheKey` uses `blake2b.Sum256` truncated to the first 16 bytes (128 bits), prefixed `embed:`, built from `normalizedText|model|prefix`. Note: it is **not** a "BLAKE2b-128" algorithm — it is BLAKE2b-256 with the first 16 bytes kept. The Python side does not share this key scheme (it uses `sha256`), so the Go and Python caches are independent.
 
-Python side goes further:
+**3. Prefix.** Search queries use the `query:` prefix, document/experience storage uses `passage:` (`client.go`: `Embed` defaults to `query:`; `EmbedWithPrefix` passes explicitly). This is the common e5-style trick that keeps queries and passages in the same direction. （待核实: which exact prefix the `experiences_1024` write path uses is decided by the distillation chain; I did not trace every hop to the app side.)
 
-```python
-# services/embedding/app.py
-import unicodedata
+**4. L2 normalization.** The Python side `normalize_vector` divides by `np.linalg.norm` to make the vector unit-length — the comment notes "Ollama does not guarantee returned vectors are unit vectors". This makes cosine distance meaningful downstream.
 
-def normalize_text(text: str) -> str:
-    text = unicodedata.normalize('NFKC', text)
-    # Remove control characters
-    text = ''.join(ch for ch in text if unicodedata.category(ch) != 'Cc')
-    text = text.lower().strip()
-    return re.sub(r'\s+', ' ', text)
-```
-
-Why two-stage normalization? Go's `strings.ToLower` and Python's `str.lower()` behave differently on certain Unicode characters (like İ, ı). Double normalization ensures that even if one side changes its logic, the other side catches it.
-
-### 4.2 Cache Strategy
-
-Embedding calls are expensive — every request hits an external model. So cache is the first optimization:
-
-- **Redis**: 24-hour TTL, shared across processes
-- **Memory LRU**: 1000 entry limit, in-process hot cache
-
-```go
-// internal/storage/postgres/embedding/cache.go
-func (c *Cache) getCacheKey(input string) string {
-    hash := blake2b.Sum128([]byte(input))
-    return fmt.Sprintf("embed:%x", hash)
-}
-```
-
-BLAKE2b-128 is faster than MD5 and shorter than SHA-256 — a 16-byte digest is just right for a cache key.
-
-### 4.3 Model and Vector Normalization
-
-The embedding model is **qwen3-embedding:0.6b**, outputting 1024-dimensional vectors. L2 normalization is applied before returning:
-
-```python
-# services/embedding/app.py
-vectors = np.array(vectors)
-norms = np.linalg.norm(vectors, axis=1, keepdims=True)
-vectors = vectors / norms
-```
-
-Normalization is critical — it turns the vector inner product into a proxy for cosine similarity. This way, the result from the `<=>` operator is naturally a similarity value in the range [-1, 1].
-
-### 4.4 Degradation Strategy
-
-Embedding calls have three possible outcomes, each mapped to a degradation path:
-
-```go
-// internal/storage/postgres/embedding/fallback.go
-const (
-    FallbackToCache   // Cache has old vector, return without updating
-    FallbackToKeyword // Fallback to pure keyword search
-    FallbackToError   // Return error, let upper layer handle
-)
-```
-
-This prevents the vicious dependency where "embedding is down, so retrieval can't work." In production, the most common case is Ollama timing out occasionally. Degrading to keyword search loses precision, but at least it still works.
-
-## 5. SimpleRetrievalService: Pure Vector Search
-
-This is the service actually wired into the current API layer. Its logic is extremely straightforward:
-
-```go
-// internal/storage/postgres/services/simple_retrieval_service.go
-func (s *SimpleRetrievalService) Search(ctx context.Context, 
-    query string, limit int, tenantID string) ([]*RetrievalResult, error) {
-    
-    queryVec, err := s.embedding.GenerateEmbedding(ctx, query)
-    if err != nil {
-        return nil, fmt.Errorf("generate embedding: %w", err)
-    }
-
-    rows, err := s.db.Query(ctx, `
-        SELECT content, metadata, 
-               1 - (embedding <=> $1) AS similarity
-        FROM knowledge_embeddings
-        WHERE tenant_id = $2
-        ORDER BY embedding <=> $1
-        LIMIT $3
-    `, queryVec, tenantID, limit)
-    // ...
-}
-```
-
-Just three steps: generate vector → `<=>` cosine distance sort → return Top-K. No rewriting, no weighting, no deduplication. It's almost comically simple — but sufficient, as long as your knowledge base is high quality and queries are unambiguous.
-
-The downside is equally obvious: it's defenseless against short queries, ambiguous queries, and queries with typos. In these cases, the vector itself simply can't find anything relevant.
-
-## 6. RetrievalService: The Hybrid Search Engine
-
-This is the real heavyweight — 2069 lines of code covering the **full retrieval pipeline**.
-
-### 6.1 Hybrid Search Strategy
-
-```mermaid
-graph LR
-    subgraph "Query Rewriting"
-        Q1[Original Query]
-        Q2[Rule-based Rewrite]
-        Q3[LLM Rewrite]
-    end
-    subgraph "Dual Search"
-        V[Vector Search<br/>pgvector <=>]
-        K[Keyword Search<br/>BM25]
-    end
-    subgraph "Fusion"
-        S[Score Fusion]
-        D[Deduplication & Merge]
-    end
-    Q1 --> V
-    Q1 --> K
-    Q2 --> V
-    Q2 --> K
-    Q3 --> V
-    Q3 --> K
-    V --> S
-    K --> S
-    S --> D
-```
-
-During a search, for **each query variant** (original + rewritten versions), it simultaneously runs both vector search and BM25 keyword search. All results flow into the scoring pipeline.
-
-### 6.2 Query Rewriting
-
-Query rewriting has two approaches:
-
-**Rule-based** — reads synonym mappings from config:
-
-```yaml
-# configs/synonyms.yaml
-synonyms:
-  "memory": ["memory", "experience", "distillation", "memories"]
-  "tool": ["tool", "function", "capability", "skill"]
-  "error": ["error", "bug", "failure", "exception", "crash"]
-```
-
-**LLM-based** — calls the model for text rewriting, but with strict constraints:
-
-```go
-// internal/storage/postgres/services/query_rewriter.go
-const (
-    maxRewrites      = 2          // Generate at most 2 rewrites
-    llmTimeout       = 30 * time.Second
-    llmTemperature   = 0.3        // Low temperature for stability
-    jaccardThreshold = 0.6        // Minimum similarity to original query
-    rewriteCacheTTL  = 10 * time.Minute
-)
-```
-
-The core logic:
-
-1. Check cache first — the same query within 10 minutes won't re-call the LLM
-2. After the LLM call, compute Jaccard similarity (character-level overlap)
-3. Rewrites below 0.6 similarity are discarded — prevents the LLM from drifting off
-4. Keep at most 2 rewrites
-
-Why 0.6? Empirically determined. Below 0.6, the rewrite no longer carries the same meaning as the original; above 0.6, most of the original semantic information is preserved.
-
-### 6.3 Query Weights
-
-Different query variants carry different weights in scoring:
-
-| Query Source | Weight | Rationale |
-|-------------|--------|-----------|
-| Original query | 1.0 | What the user said is most important |
-| Rule-based rewrite | 0.7 | Synonym expansion, reliable but doesn't overstep |
-| LLM rewrite | 0.5 | Trust half, because LLMs have too many uncontrollable factors |
-
-This weight distribution sends a clear signal: **No matter how smart the machine guesses, it's not as important as the user's original query.**
-
-### 6.4 Source Weights
-
-When multiple sources are active simultaneously (e.g., searching Knowledge + Experience + Tools), results need cross-source ranking. Source weights adjust the priority of different domains:
-
-| Source | Weight | Rationale |
-|--------|--------|-----------|
-| Knowledge | 0.4 | Knowledge base is structured and high-quality |
-| Experience | 0.3 | Experience is historically validated |
-| Tools | 0.2 | Tool descriptions are usually short, limited semantic richness |
-| TaskResults | 0.1 | Task results have huge volume and lots of noise |
-
-Note: **When only one source is active, source weights don't apply** (value is 1.0). This is by design because single-source scenarios don't need cross-domain ranking — internal scores are sufficient.
-
-### 6.5 Sub-Source Weights
-
-Within each source, the scores from vector search and keyword search also need to be reconciled:
-
-| Sub-source | Weight |
-|-----------|--------|
-| Vector | 1.0 |
-| Keyword | 0.8 |
-
-Semantic matching takes priority over literal matching — but keyword search plays an irreplaceable role in scenarios like entity names and error messages. The 0.8 ratio strikes a balance between the two.
-
-### 6.6 Signal Weighting
-
-Beyond static weights, the system introduces a set of **dynamic signals** that adjust scores based on the metadata of retrieved results:
-
-**Experience signals:**
-
-| Signal | Condition | Multiplier |
-|--------|-----------|------------|
-| Successful experience | `SuccessCount > 0` | 1.2 |
-| Failed experience | `FailureCount > 0` | 0.7 |
-| Fast execution | `ExecTime < 1s` | 1.2 |
-| Slow execution | `ExecTime > 5s` | 0.8 |
-| Frequently reused | `ReuseCount > 3` | 1.1 |
-| Has documentation | `Documented == true` | 1.05 |
-
-**Tool signals:**
-
-| Signal | Condition | Multiplier |
-|--------|-----------|------------|
-| Auth required | `AuthRequired == true` | 0.9 |
-| High success rate | `SuccessRate > 0.9` | 1.1 |
-| Low success rate | `SuccessRate < 0.5` | 0.8 |
-
-The logic behind these signals is intuitive: **Results with good historical performance, fast execution, and frequent reuse should rank higher.** Conversely, results that keep failing or are slow to execute should be demoted.
-
-### 6.7 Time Decay
-
-Information has a shelf life. An experience from three months ago may already be outdated. A tool version from six months ago may have been deprecated.
-
-```go
-func (s *RetrievalService) applyTimeDecay(score float64, 
-    createdAt time.Time) float64 {
-    
-    ageHours := time.Since(createdAt).Hours()
-    decay := math.Exp(-0.01 * ageHours)
-    if decay < 0.1 {
-        decay = 0.1
-    }
-    return score * decay
-}
-```
-
-Time decay formula: `e^(-0.01 × age_hours)`
-
-| Age | Decay Coefficient |
-|-----|------------------|
-| 1 hour | 0.990 |
-| 24 hours | 0.787 |
-| 7 days | 0.185 |
-| 30 days | 0.011 → floor at 0.1 |
-| Older | 0.1 (floor) |
-
-`math.Exp(-0.01 * age_hours)` means: 78% after 1 day, 18% after 7 days, and after a month it's essentially at the 0.1 floor. The system naturally favors recent content.
-
-The 0.1 floor ensures that even ancient content can still be retrieved if other signals are strong enough — it won't completely vanish just because of age.
-
-### 6.8 The Complete Scoring Formula
-
-Putting all the factors together, the final scoring formula is:
-
-```
-FinalScore = BaseScore × QueryWeight × SourceWeight × SubSourceWeight 
-             × SourceSignals × TimeDecay
-```
-
-A concrete example: suppose a user searches for a problem about "Python dependency install error," and the LLM finds a relevant memory fragment based on historical experience:
-
-- BaseScore = 0.85 (raw vector similarity)
-- QueryWeight = 1.0 (using the original query, no rewrite)
-- SourceWeight = 1.0 (single source, no cross-domain)
-- SubSourceWeight = 1.0 (from vector search)
-- SourceSignals = 1.2 × 1.1 × 1.05 (successful experience + frequently reused + has documentation)
-- TimeDecay = 0.787 (created 24 hours ago)
-
-```
-FinalScore = 0.85 × 1.0 × 1.0 × 1.0 × (1.2 × 1.1 × 1.05) × 0.787
-           = 0.85 × 1.386 × 0.787
-           ≈ 0.927
-```
-
-Note: **SourceSignals are multiplicative.** This means multiple positive signals compound significantly — 1.2 × 1.1 × 1.05 ≈ 1.386, directly boosting the final score by 38.6%. Conversely, a single negative signal (like a failed experience at 0.7) can drag the score down by 30%.
-
-This is intentional: let "good evidence chains" and "bad indicators" both have a significant impact on the score, rather than getting averaged out.
-
-### 6.9 Deduplication and Merging
-
-Different search paths may return the same content. For example, both vector search and keyword search might hit the same piece of code. In this case, the system doesn't simply deduplicate — it **accumulates the score**:
-
-```go
-func (s *RetrievalService) deduplicate(results []*ScoredResult) []*ScoredResult {
-    seen := make(map[string]*ScoredResult)
-    for _, r := range results {
-        if existing, ok := seen[r.ID]; ok {
-            // Same content hit by multiple search paths — bonus points
-            existing.Score += r.Score * 0.3
-        } else {
-            seen[r.ID] = r
-        }
-    }
-    // ...
-}
-```
-
-This is the "multi-path hit signal": when the same content is hit by both vector search and keyword search, it's genuinely relevant. The 30% bonus is an empirically tuned value — too high and one item dominates the rankings, too low and the multi-path hit signal doesn't carry its weight.
-
-### 6.10 Precision Mode
-
-For certain special queries, the system switches to exact-match mode:
-
-```go
-func isPrecisionMode(query string) bool {
-    if len([]rune(query)) <= 10 {
-        return true
-    }
-    specialChars := "=+-*/:"
-    for _, c := range query {
-        if strings.ContainsRune(specialChars, c) {
-            return true
-        }
-    }
-    return false
-}
-```
-
-The retrieval path in precision mode: **Exact match → Keyword search → Vector search** (fallback).
-
-When does it trigger?
-
-- Very short queries (<= 10 characters) — short queries like "err 500" or "timeout" are problematic for vector search because too few words make the semantics ambiguous
-- Queries with special characters — queries like "status=error" or "CPU>90%" have inherent structure, and running semantic search directly would lose critical information
-
-## 7. Concurrency Model and Gate System
-
-### 7.1 Concurrency Control
-
-The retrieval system involves multiple independent operations (multiple query variants × multiple search strategies), using `errgroup` for concurrency control:
-
-```go
-g, ctx := errgroup.WithContext(ctx)
-g.SetLimit(2) // At most 2 concurrent goroutines
-
-for _, variant := range queryVariants {
-    variant := variant
-    g.Go(func() error {
-        ctx, cancel := context.WithTimeout(ctx, 2*time.Second)
-        defer cancel()
-        return s.searchSingleVariant(ctx, variant, results)
-    })
-}
-```
-
-`SetLimit(2)` limits concurrency to 2, preventing a flood of search requests hitting the database simultaneously. Each sub-search has a 2-second context timeout — any search path taking longer gets dropped without affecting the overall result.
-
-### 7.2 Gate System
-
-The system integrates a three-layer gate:
-
-```go
-type Gate struct {
-    rateLimiter      *RateLimiter   // 100 req/s
-    circuitBreaker   *CircuitBreaker // Opens after 5 failures
-    dbTimeout        time.Duration  // 30s
-}
-```
-
-- **RateLimiter**: At most 100 retrieval requests per second. Excess requests return 429 directly, without hitting the database.
-- **CircuitBreaker**: After 5 consecutive retrieval failures, enters open (熔断) state. Attempts half-open recovery after 30 seconds. During the open state, errors are returned directly, wasting no resources.
-- **DB Timeout**: Each database query waits at most 30 seconds.
-
-```mermaid
-stateDiagram-v2
-    [*] --> Closed
-    Closed --> Open: 5 failures
-    Open --> HalfOpen: 30s timeout
-    HalfOpen --> Closed: 1 success
-    HalfOpen --> Open: 1 failure
-    Closed --> Closed: success (reset counter)
-```
-
-This gate system is designed to be quite conservative — the retrieval system is the knowledge lifeline of the entire agent. If it goes down, the agent becomes brain-dead. Better to return empty results than to make the agent wait 60 seconds for a timeout.
-
-## 8. Debugging and Observability
-
-Every retrieval request can generate detailed debug information:
-
-```go
-type DebugInfo struct {
-    Query           string
-    Rewrites        []string
-    TotalResults    int
-    QueryTime       time.Duration
-    ScoreBreakdown  []ScoreDebug
-}
-
-type ScoreDebug struct {
-    ID              string
-    Content         string
-    BaseScore       float64
-    QueryWeight     float64
-    SourceWeight    float64
-    SubSourceWeight float64
-    SourceSignals   map[string]float64
-    TimeDecay       float64
-    FinalScore      float64
-}
-```
-
-`GenerateDebugInfo()` provides full scoring chain traceability — every weight factor for every result is recorded. This is invaluable when tuning scoring parameters or debugging "why is this bad result ranked first?"
-
-## 9. Honest Section
-
-Now, time to address the elephant in the room.
-
-**The RetrievalService (this 2069-line hybrid search engine) has never been wired into the API layer.**
-
-```go
-// api/retrieval/service.go
-func NewRetrievalService(cfg *Config) (*Service, error) {
-    simpleRetrieval, err := NewSimpleRetrievalService(...)
-    // advancedRetrieval, err := NewAdvancedRetrievalService(...) // This line is commented out
-    
-    return &Service{
-        simpleRetrieval:   simpleRetrieval,
-        // advancedRetrieval: advancedRetrieval, // always nil
-    }, nil
-}
-```
-
-Haha, feel like you just got clickbaited?
-
-I was incredibly excited when I wrote this thing — "Now THIS is a real retrieval system." Then I finished it and realized: SimpleRetrievalService was already running stable. Replacing it with this complex system requires extensive integration testing, A/B testing, and performance benchmarking. And so it keeps getting postponed.
-
-There's some logic to the decision: SimpleRetrievalService is good enough for 80% of scenarios. Complex scoring, signal weighting, time decay — the benefits aren't dramatic at small data volumes (< 100k entries).
-
-But I also know: **as user data and experience accumulate, this hybrid search engine will need to go live sooner or later.** The code is already written. It just needs a spark.
-
-So this article isn't documentation for a feature you're already using — it's a blueprint for "the future you should know about." If you're truly hitting the ceiling of pure vector search (low short-query recall, poor cross-domain ranking, low experience reuse rates), this hybrid search pipeline is the answer.
-
-Anyway, the code is already written. We'll talk about it when someone actually comes knocking.
-
-## 10. Summary
-
-ares's retrieval system in one sentence: **The foundation is a simple pure-vector solution, the nuclear option is hybrid search + multi-layer scoring pipeline, but the launch button for the nuclear option hasn't been pressed yet.**
-
-Key design points:
-
-1. **Embedding pipeline** — Go-Python-Ollama three-layer architecture, dual normalization + three-tier cache (Redis + LRU + Fallback)
-2. **Query rewriting** — rule-based synonyms + LLM rewrites, Jaccard threshold filtering, 10-minute cache
-3. **Multi-layer scoring** — static weights (query/source/sub-source) × dynamic signals (success/failure/speed/reuse) × time decay
-4. **Deduplication and merging** — 30% score bonus for multi-path hits, identifying genuinely relevant content
-5. **Precision mode** — short queries and structural queries go exact match + keyword + vector fallback
-6. **Gate system** — RateLimit + CircuitBreaker + DB Timeout, preventing the retrieval system from being overwhelmed
-
-An agent's intelligence ≈ the quality of context fed into it. And context quality depends on whether the retrieval system can pull the right content, from the right place, with the right weight, at the right time.
+**5. Redis-first caching.** `EmbeddingClient.redis` is optional (nil means skip the cache and call the service directly). There is also an `EmbeddingCache`/`MemoryCache` (`cache.go`) with in-process memory fallback and a periodic cleanup goroutine, **but the production wiring uses `NewEmbeddingClient` talking to Redis directly** （待核实: I did not see `EmbeddingCache` injected in `production_manager`; it may or may not be attached in some boot).
 
 ---
 
-> Information isn't power. Retrieval is. — My realization (still collecting dust) after building an entire retrieval pipeline.
+## 4. Vector Retrieval (the one that actually runs): pgvector + IVFFlat Cosine
 
-**Next up:** No more articles planned for this series — this concludes the series for now. But if there's a module you're particularly curious about, just let me know.
+Vector retrieval does not query a standalone vector DB — it uses the **pgvector extension with tables in the same PostgreSQL**.
+
+Tables (`migrate_storage.go`):
+- `knowledge_chunks_1024` — knowledge chunks
+- `experiences_1024` — distilled experiences (the `embedding` column is **nullable**, backfilled by an async worker)
+
+Indexes are IVFFlat (`vector_cosine_ops`): `idx_knowledge_1024_embedding`, `idx_experiences_1024_embedding`. These are approximate, bucket-based (`lists`) cosine indexes.
+
+The actual query (`repositories/experience_repository.go` `SearchByVector`):
+
+```sql
+SELECT id, tenant_id, type, input, output,
+       1 - (embedding <=> $1::vector) as similarity
+FROM experiences_1024
+WHERE tenant_id = $2
+  AND (decay_at IS NULL OR decay_at > NOW())
+  AND embedding IS NOT NULL
+ORDER BY embedding <=> $1::vector
+LIMIT $3
+```
+
+- `embedding <=> $1::vector` is **cosine distance**, in [0,2]; `1 - distance` yields **similarity ∈ [-1,1]** (per the code comment). The default `Score` is just a passthrough of this similarity.
+- Explicit `embedding IS NOT NULL`: the column is nullable and IVFFlat does not index NULL, so this filters out not-yet-backfilled rows before the scan.
+- Expired `decay_at` rows never appear.
+- **In RAG, each snippet's `Score` comes from distillation confidence** (`MemoryRetriever.toSnippets`: `scoreutil.ClampUnit(exp.Confidence)` clamped to [0,1]) — not the SQL similarity above. These are two different score semantics.
+
+`knowledge_repository.go`'s `SearchByVector` likewise uses `1 - (embedding <=> $1::vector)`, and only searches rows with `embedding_status='completed'`.
+
+---
+
+## 5. Keyword Retrieval: PostgreSQL FTS, Not BM25
+
+The old article hyped the keyword side as "BM25". **In the code there is no BM25.** On the knowledge side, keyword search is PostgreSQL full-text search using `ts_rank + plainto_tsquery('simple', ...)` (`knowledge_repository.go` `SearchByKeyword`), over the `tsv` column maintained by the `tsvector_update_knowledge_1024` trigger:
+
+```sql
+SELECT ..., ts_rank(tsv, plainto_tsquery('simple', $1)) as score
+FROM knowledge_chunks_1024
+WHERE tsv @@ plainto_tsquery('simple', $1)
+  AND tenant_id = $2 AND embedding_status = 'completed'
+ORDER BY ts_rank(...) DESC
+LIMIT $3
+```
+
+On the experience side it is even simpler — `experiences_1024`'s `SearchByKeyword` uses **ILIKE substring matching** (with escaping), ordered by `score DESC, created_at DESC`. So experience keyword search is really "substring hit + sort by existing score", not BM25.
+
+> Bottom line: **the keyword layer = PostgreSQL FTS (knowledge) + ILIKE substring (experience)**. Wherever the old text says BM25, that was stale comment language, not the current implementation. I'll phrase it as "keyword / full-text" from here on.
+
+---
+
+## 6. The Hybrid Retrieval `RetrievalService`: the One Wired into Production
+
+Entry `RetrievalService.Search(ctx, *SearchRequest) -> []*SearchResult`. Overall flow:
+
+```mermaid
+graph TB
+    Q[Query] --> P{isPrecisionMode?}
+    P -- yes (<=10 runes or contains =/math expr) --> PREC[searchPrecision<br/>Exact -> Keyword -> Vector]
+    P -- no --> RW
+    RW[buildQueries<br/>original 1.0 + rule 0.7 + LLM 0.5<br/>cap MaxQueries=3] --> GATE{retrievalGuard.AllowRateLimit}
+    GATE -- denied --> ERR[return ErrRateLimitExceeded]
+    GATE -- allowed --> PAR[parallel: eg.SetLimit2<br/>per query 2s + dbTimeout]
+    PAR --> SVEC[searchAllVectorSources]
+    PAR --> SKW[searchAllKeywordSources]
+    SVEC --> MRK[deduplicateResults<br/>same ID accum +0.3*its score]
+    SKW --> MRK
+    MRK --> RERANK[rerankResults<br/>queryWeight*sourceWeight*subSourceWeight*signals*timeDecay]
+    RERANK --> FILTER[filterByScore >= MinScore]
+    FILTER --> TOP[truncate to TopK]
+```
+
+### 6.1 Query rewriting (buildQueries)
+`buildQueries` builds a weighted query group (`retrieval_rewrite.go`):
+- original weight `OriginalWeight=1.0`
+- rule-based (synonym) rewrite `RuleRewriteWeight=0.7`
+- LLM rewrite `LLMRewriteWeight=0.5`
+- total capped by `MaxQueries=3`
+
+Rewrite gating (`shouldRewriteQuery`): skip when `len(query)<10`; only rewrite on complex semantic patterns ("如何/怎么/什么/why/what/how/explain/描述" etc.); also skip when `queryCache` (TTL 10min, cap 500) hits.
+
+LLM rewrite (`llmBasedRewrite`, skipped if `llmClient` nil/disabled):
+- 30s timeout; `parseLLMResponse` splits lines and takes **at most the first 3 lines**
+- `validateRewrites` uses `calculateSimilarity` (actually a **Jaccard word-overlap**) to drop rewrites with similarity < **0.6**, longer than **2×** the original, or empty
+- `uniqueRewrites` dedupes, then caps at `maxLLMRewrites=2`
+
+Rule rewrite (`ruleBasedRewrite`): goes through `loadSynonymRules` reading `configs/synonyms.yaml` (env `SYNONYM_CONFIG_PATH` can redirect; built-in defaults cover), using `replaceCaseInsensitive` to swap matched synonym keys.
+
+### 6.2 Precision mode (isPrecisionMode)
+Trigger conditions (`retrieval_service.go`):
+- `utf8.RuneCountInString(query) <= 10` (rune count, Unicode-safe)
+- contains `=` or `:`, or a **digit-adjacent math expression** like `\d+\s*[+*/]\s*\d+` (`-` is deliberately excluded to avoid `go-agent`; `+*/` need digit adjacency to avoid `C++`, `*args`)
+
+In precision mode, `searchPrecision` runs the strict order: **Exact (`SearchBySubstring`, fixed score 1.0) → Keyword (FTS) → Vector (fallback)**.
+
+### 6.3 Parallelism & timeouts (searchSingleQuery)
+Each weighted query runs via `errgroup.SetLimit(2)` (vector + keyword in parallel), wrapped in `context.WithTimeout(ctx, 2s)`, then layered with `retrievalGuard.WithDBTimeout`. The vector branch first checks `embeddingClient.IsEnabled()` and the embedding circuit breaker; if the breaker is open it degrades to keyword-only.
+
+### 6.4 Merge & rerank (mergeAndRerank → rerankResults)
+`rerankResults` is the single scoring entry point; the formula is **multiplicative**:
+
+```
+Score = baseScore · QueryWeight · [SourceWeight, only when multi-source] · SubSourceWeight · Signals · TimeDecay
+```
+
+- **QueryWeight**: original 1.0 / rule 0.7 / LLM 0.5
+- **SourceWeight** (`sourceWeight`): knowledge 0.4 / experience 0.3 / tool 0.2 / task_result 0.1; **applied only when `activeSources>1`** — skipped for single-source
+- **SubSourceWeight** (`subSourceWeight`): vector 1.0 / keyword 0.8
+- **Signals** (`applySourceSignals`, experience-focused): success=1.2, failure=0.7, execTime<1s=1.2, execTime>5s=0.8, reuse_count>3=1.1, has lessons=1.05; tool-side requires_auth=0.9, successRate>0.8=1.1, successRate<0.5=0.8
+- **TimeDecay** (`calculateTimeDecay`): `e^(−0.01 × ageHours)`, with a floor of **0.1**
+
+Dedup `deduplicateResults`: merge by `ID`, and on repeat hit `existing.Score += result.Score * 0.3` — the "multi-route hit" signal, so content hit by multiple queries/paths scores higher.
+
+> Note: `SearchSimilarTasks` sets the plan to experience-only. In that case `ExperienceRankingEnabled` routes through `applyExperienceRanking` (experience rerank, next section); the generic multi-source rerank above serves full-source searches.
+
+---
+
+## 7. Experience Recall & Ranking: RankingService and MemoryRetriever
+
+For "find related memory", there are two code paths:
+
+### 7.1 RankingService (`internal/ares_experience/ranking_service.go`)
+`Rank` takes a batch of `*Experience` plus matching `baseScores` (semantic scores) and returns them sorted by FinalScore descending:
+
+```
+FinalScore = SemanticScore + UsageBoost + RecencyBoost + exp.Score
+```
+
+Note this is **additive**, unlike the retrieval service's multiplicative formula:
+- `SemanticScore` = the similarity from vector search (default 0.5 when missing)
+- `UsageBoost = min(log1p(UsageCount) × 0.05, 0.2)`
+- `RecencyBoost = exp(−ageDays/30) × 0.05` (30-day half-life)
+- `exp.Score` = the persisted reinforcement signal (bandit feedback, written by `RecordFailure` etc.)
+
+Configured weights: `UsageWeight=0.05`, `RecencyWeight=0.05`, `RecencyDays=30` (`DefaultRankingWeights`, tunable via `Configure`).
+
+Inside `RetrievalService.Search`, `applyExperienceRanking` (`retrieval_search.go`) calls `rankingService.Rank`, then uses `conflictResolver.Resolve` for conflict groups, then writes `FinalScore` back onto `exp.Score` so the ranked score propagates to results — the code comment explicitly warns: without writing it back, rerank would re-sort on near-zero raw scores and `filterByScore` would drop experience results whenever `MinScore>0`, so the ranking feature would never surface its scores.
+
+### 7.2 MemoryRetriever (RAG, `internal/ares_memory/context/memory_retriever.go`)
+This is the context-augmentation path: `Retrieve(input, topK)`:
+1. Empty input short-circuits to empty
+2. `topK<=0` → `DefaultTopK=5`
+3. embed the query (via `EmbeddingPipeline`, `KindMemoryQuery`)
+4. `expRepo.SearchByVector` (the experience repo's pgvector)
+5. `toSnippets` builds `ContextSnippet`; `Score = ClampUnit(exp.Confidence)`
+6. `filterByMinScore`: keep only **`Score >= minScore`**; `minScore<=0` → `DefaultMinScore=0.4`
+7. `SortSnippetsByScore` descending, then truncate to topK
+
+Embeds that fail do **not** silently fall back to keyword (code comment: `does not silently fall back to keyword search`) — it returns an error. This is a deliberately different trade-off from `RetrievalService` (which degrades to keyword on breaker-open).
+
+`manager_rag.go`: `retrieveContextString` / `retrieveForPrompt` → `runRetrieval` (reads `EnableRAG`, `RAGTopK`, `RAGMinScore`, wakes the retrievers) → `memctx.RunRetrieval` (applies the canonical `DefaultTopK`/`DefaultMinScore` normalization). Retrieval is best-effort: on failure it only `log.Warn`s and never interrupts the chat loop.
+
+```mermaid
+sequenceDiagram
+    participant U as User message
+    participant M as memoryManager
+    participant R as MemoryRetriever
+    participant E as EmbeddingPipeline
+    participant P as ExperienceRepository(pgvector)
+    U->>M: BuildContext / BuildPromptMessages
+    M->>M: EnableRAG? retrievers non-empty?
+    M->>R: Retrieve(input, topK=5)
+    R->>E: BuildSpec(KindMemoryQuery)+Embed
+    E-->>R: query vector
+    R->>P: SearchByVector(vector, topK)
+    P-->>R: experiences (similarity)
+    R->>R: toSnippets + filter Score>=0.4 + sort
+    R-->>M: ContextSnippet[]
+    M->>U: prepend to system prompt
+```
+
+---
+
+## 8. Skills Retrieval: Discovery Keyword + FTS5 (Another "Find Something" Chain)
+
+Retrieval isn't only vectors. Skill/capability discovery is a pure-text affair (see the Capability Fabric in article 28 of this series); here I align only the two real retrieval primitives (`internal/ares_skills`):
+
+**1. Keyword scoring (`discovery.go` `keywordSearch` + `matchScore`)**
+- `splitTerms` lower-cases, whitespace-splits, strips punctuation, dedupes
+- `matchScore` counts how many query terms hit an entry's ID/Name/Keywords/Capabilities/Description, +1 per hit
+- Sort: score desc, then ID asc for determinism
+- Only entries with score>0 are returned; `limit<=0` returns all
+
+**2. FTS5 (`fts5.go` + `discovery.go` `SetFTS5`)**
+- `FTS5Index` is an **in-memory SQLite FTS5** index (`sql.Open("sqlite", ":memory:")` with the modernc driver), with a `skills_fts` virtual table over id/name/description/keywords
+- `Search(query, limit)` runs `WHERE skills_fts MATCH ? ORDER BY rank LIMIT ?`
+- `Discovery.Search` prefers FTS5 when attached and query non-empty; **on FTS5 error or no match it falls back to `keywordSearch`** (`types.go` comment: FTS5 augments, not replaces)
+
+**3. Experience priors `Experience.BestMatch` (`experience.go`)**
+`Experience` remembers `{skill, task_pattern, success_rate}` priors (a Learning source — it only biases ranking, **never auto-executes skills**). `BestMatch(taskPattern)` returns the highest-success-rate match:
+- short patterns (<4 tokens, e.g. the fallback `agent_top`) use **substring containment**, scoring 1.0 on hit
+- long patterns are scored by **token-overlap ratio**; below `matchScoreThreshold=0.5` it's not a match (so two verbose descriptions sharing one incidental word don't spuriously match)
+- `maxPatternLength=256` (runes) truncates patterns to keep `experience.json` compact
+
+`ExperienceConfidenceSource` bridges these priors into a `taskfabric.ConfidenceSource` for the Kernel Scheduler (covered in detail in article 28).
+
+---
+
+## 9. Gating & Degradation
+
+`RetrievalGuard` (`internal/storage/postgres/retrieval_guard.go`) wraps retrieval in three protections, constructed in `production_manager.go` as `NewRetrievalGuard(100, 5, 30s, 30s)`:
+
+| Protection | Implementation | Behavior |
+|------------|----------------|----------|
+| Rate limit | `golang.org/x/time/rate`, `100 req/s` | `AllowRateLimit` returns `ErrRateLimitExceeded` when exceeded |
+| Circuit breaker | `CircuitBreaker`, failure threshold 5, 30s to half-open | targets embedding; `CheckEmbeddingCircuitBreaker`; open → degrade to keyword-only |
+| DB timeout | `WithDBTimeout` (30s) | queries past 30s are abandoned |
+
+On the embedding side there is also a `FallbackClient` (`embedding/fallback.go`) with three `FallbackStrategy` values: `FallbackToCache` / `FallbackToKeyword` (returns `ErrEmbeddingFailed` to trigger keyword) / `FallbackToError`. （待核实: whether `FallbackClient` is actually mounted in some production path; production retrieval uses `NewEmbeddingClient` + `EmbeddingPipeline` directly, and I did not see the fallback injected — I lean toward "direct call, fail on error".)
+
+---
+
+## 10. Honest Reckoning: What Was Cut, What Remains
+
+Comparing against the old article, the corrections land on three axes:
+
+1. **"Advanced retrieval unwired, pure-vector in production" is wrong**: in reality `RetrievalService` is wired through `SearchSimilarTasks` (scope converged on experience), and `SimpleRetrievalService` has no callers.
+2. **There is no `api/retrieval/service.go`**: both services live under `internal/storage/postgres/services/`.
+3. **The keyword layer is not BM25**: knowledge is PostgreSQL `ts_rank` full-text; experience is ILIKE substring.
+
+The old "four-domain split (Knowledge/Experience/Tools/TaskResults at 0.4/0.3/0.2/0.1) + pure-vector-DB comparison + 1024-D cosine 0.7–0.8 examples + recall@k / similarity thresholds" — **except the numbers with real sources that I kept** (sourceWeight 0.4/0.3/0.2/0.1, minScore 0.4, TopK 5/10, Jaccard 0.6, timeDecay 0.01/0.1, etc.) — **has no corresponding code and is dropped.** In particular: **there is no `recall@k` / normalized-embedding similarity threshold (like 0.7–0.8) population metric anywhere in the code**, so I give no pure-vector recall numbers and no "decays to 78% at 1 day / 18% at 7 days / 0.1 floor" table derived from assumption. The real artifact is `e^{-0.01·ageHours}` with a 0.1 floor.
+
+**Does runtime vector retrieval exist? Yes.** It's not "keyword only" — both `RetrievalService` (hybrid) and `MemoryRetriever` (RAG) are real, wired pgvector vector paths, plus the AKG knowledge hybrid retrieval; all are running.
+
+The only genuinely unwired pieces left are `SimpleRetrievalService` (no callers) and `FallbackClient` (待核实 whether it's mounted).
+
+---
+
+## 11. Summary
+
+ares' retrieval system in one line: **a real hybrid retrieval pipeline (vector + FTS + keyword) runs directly in production, plus a separate RAG vector recall feeds experience into the LLM, skill discovery runs on keyword + SQLite FTS5 — while the pure-vector service sits idle in its box.**
+
+Key design points (all with real code sources):
+
+1. **Embedding pipeline** — Go→Python→Ollama, `qwen3-embedding:0.6b`, 1024-d, L2-normalized; Go BLAKE2b-256 truncated to 128-bit cache key, Redis 24h TTL
+2. **Vector retrieval** — pgvector `<=>` cosine + IVFFlat, `1 − distance` → similarity ∈ [-1,1], tables `knowledge_chunks_1024` / `experiences_1024`
+3. **Keyword retrieval** — actually PostgreSQL `ts_rank` (knowledge) + ILIKE substring (experience), not BM25
+4. **Hybrid retrieval** — `RetrievalService.Search`; Query/source/subsource weights × signals × time decay (`e^{−0.01h}`, floor 0.1), multi-route dedup +0.3, precision mode (≤10 runes / contains `=` or digit-adjacent math op)
+5. **Experience ranking** — `RankingService` additive `Semantic + min(log1p·0.05,0.2) + e^{−days/30}·0.05 + rawScore`, `ConflictResolver` merges conflict groups
+6. **RAG recall** — `MemoryRetriever`, `DefaultTopK=5`, `DefaultMinScore=0.4`, no silent keyword fallback on embed failure
+7. **Gating** — RateLimiter 100/s + circuit breaker + 30s DB timeout
+
+Agent IQ ≈ the quality of its context. And ares' premise is plain: get retrieval running and running correctly before tuning the fancy stuff.
+
+---
+
+> Information is not power. Retrieval is. — this line now has real code behind it.
+
+**Next post:** no definite next one (the series is spread by module; article 28 covers Skills/FTS5 in depth). If there's a module you'd like to go deep on, just say so.

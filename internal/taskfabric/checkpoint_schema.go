@@ -15,7 +15,11 @@ import (
 // no migration code is needed in the forward direction. The reverse is NOT
 // compatible: v1 code rejects a v2 envelope (ErrCheckpointSchemaVersion), so
 // rolling back a deployment requires draining in-flight tasks first.
-const CurrentCheckpointSchemaVersion = 2
+//
+// v2 → v3 (M2 SessionID): SessionID added as an OPTIONAL field. A v2
+// envelope decodes under v3 code with SessionID == "" (reads as
+// "session-less"), so no migration code is needed in the forward direction.
+const CurrentCheckpointSchemaVersion = 3
 
 // CheckpointEnvelope is the durable, versioned checkpoint schema (W3). It
 // wraps the submission-time metadata (UserProfile, Payload, UsedExperienceID)
@@ -59,6 +63,13 @@ type CheckpointEnvelope struct {
 	// granularity (a task spans multiple quanta; re-reading the active
 	// strategy per quantum would split one task's samples across strategies).
 	StrategyID string `json:"strategy_id,omitempty"`
+	// SessionID scopes this task to a conversational session (M2: SessionID
+	// 贯通). It is stamped once at Create time and rides the envelope through
+	// yield→resume cycles so the executor (plannerCognition) can read it to
+	// look up the per-session L2 graph registry. Empty means "session-less"
+	// (pre-v3 envelope or a non-session task): consumers treat the task as
+	// belonging to no session.
+	SessionID string `json:"session_id,omitempty"`
 }
 
 // DecodedCheckpoint is the result of DecodeCheckpoint: the envelope's fields
@@ -78,6 +89,9 @@ type DecodedCheckpoint struct {
 	// StrategyID is the submission-time strategy attribution ("" when absent
 	// or when the envelope predates schema v2).
 	StrategyID string
+	// SessionID is the session scope of this task ("" when absent or when the
+	// envelope predates schema v3).
+	SessionID string
 	// SchemaVersion is the envelope's version (0 when no checkpoint).
 	SchemaVersion int
 }
@@ -114,6 +128,7 @@ func DecodeCheckpoint(cp any) (DecodedCheckpoint, error) {
 			UsedExperienceID: env.UsedExperienceID,
 			StepCheckpoint:   env.StepCheckpoint,
 			StrategyID:       env.StrategyID,
+			SessionID:        env.SessionID,
 			SchemaVersion:    env.SchemaVersion,
 		}, nil
 	}
@@ -150,6 +165,9 @@ func DecodeCheckpoint(cp any) (DecodedCheckpoint, error) {
 			if sid, ok := m[restoreKeyStrategyID].(string); ok {
 				dc.StrategyID = sid
 			}
+			if sid, ok := m[restoreKeySessionID].(string); ok {
+				dc.SessionID = sid
+			}
 			return dc, nil
 		}
 		// A plain map without schema_version: treat as a raw step checkpoint.
@@ -183,6 +201,7 @@ func EncodeCheckpoint(dc DecodedCheckpoint) *CheckpointEnvelope {
 		UsedExperienceID: dc.UsedExperienceID,
 		StepCheckpoint:   dc.StepCheckpoint,
 		StrategyID:       dc.StrategyID,
+		SessionID:        dc.SessionID,
 	}
 }
 
@@ -198,6 +217,18 @@ func strategyIDFromCheckpoint(cp any) string {
 		return ""
 	}
 	return dc.StrategyID
+}
+
+// sessionIDFromCheckpoint extracts the session scope from a checkpoint value
+// through the single shared decode path. A decode failure or a session-less
+// checkpoint returns "". Best-effort like strategyIDFromCheckpoint: a missing
+// SessionID degrades to "" and never breaks the state machine.
+func sessionIDFromCheckpoint(cp any) string {
+	dc, err := DecodeCheckpoint(cp)
+	if err != nil {
+		return ""
+	}
+	return dc.SessionID
 }
 
 // MarshalCheckpoint JSON-encodes a checkpoint value. When the value is a

@@ -1,6 +1,9 @@
 package core
 
 import (
+	"sort"
+	"strings"
+
 	llmcore "github.com/Timwood0x10/ares/api/core"
 )
 
@@ -56,4 +59,33 @@ func ParameterSchemaToMap(schema *ParameterSchema) map[string]interface{} {
 		result["required"] = schema.Required
 	}
 	return result
+}
+
+// ToolArgShape is the normalized argument shape of a tool's declared
+// parameters: the sorted set of top-level parameter names joined by ",".
+// It is the shape half of the ToolClass identity (toolName + "#" + shape).
+//
+// It lives here, next to ToolSchema, because BOTH ends of the ToolClass
+// identity must agree byte-for-byte: the L1 capability-graph builder that
+// writes the node IDs, and the planner that looks nodes up before growing an
+// L2 tool node. Deriving the shape from the SCHEMA (not from one call's
+// arguments) is what makes the two sides match — a call that omits an
+// optional parameter must still resolve to the same ToolClass.
+func ToolArgShape(s ToolSchema) string {
+	if s.Parameters == nil || len(s.Parameters.Properties) == 0 {
+		return ""
+	}
+	keys := make([]string, 0, len(s.Parameters.Properties))
+	for k := range s.Parameters.Properties {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	return strings.Join(keys, ",")
+}
+
+// ToolClassID builds the ToolClass node identity from a tool name and its
+// declared argument shape: "toolName#shape". Shared by the L1 graph builder
+// and the L2 planner so the write and read sides cannot drift.
+func ToolClassID(toolName, argShape string) string {
+	return toolName + "#" + argShape
 }

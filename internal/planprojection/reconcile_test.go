@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/require"
 
@@ -212,4 +213,63 @@ func TestM15_ReconcileDeletesStaleTrackedTasks(t *testing.T) {
 	require.Equal(t, []string{"n1"}, res.Removed)
 	_, err = fabric.Task("n1")
 	require.ErrorIs(t, err, taskfabric.ErrTaskNotFound)
+}
+
+// TestM15_IdleSubscriptionDoesNoWork pins that the tail drop check is armed by
+// delivery, not standing: a subscription with no graph activity must not
+// compile, reconcile, or otherwise touch the fabric — observed for well past
+// the poll interval, which a standing ticker would have fired several times.
+func TestM15_IdleSubscriptionDoesNoWork(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	fabric := taskfabric.NewFabric()
+	coord := NewCompileCoordinator(fabric, nil)
+	dag, err := engine.NewMutableDAG([]*engine.Step{{ID: "root", AgentType: "ares/root"}})
+	require.NoError(t, err)
+
+	stop := coord.SubscribeGraphEvents(ctx, dag)
+	defer stop()
+
+	require.Never(t, func() bool { return coord.LastChange().CompileID != "" },
+		4*reconcilePollInterval, reconcilePollInterval/10,
+		"an idle subscription must not run a compile of any kind")
+	require.Empty(t, fabric.IDs(), "and must not create tasks behind the caller's back")
+}
+
+// TestM15_BurstBeyondEventBufferConverges pins tail-drop compensation on the
+// projection seam: a burst far past the hub's event buffer is grown while the
+// subscription is live. Whether each node arrives by delivery or by the
+// reconcile the drop counter triggers, EVERY node must end up with a task
+// carrying its graph dependency — convergence is the contract, not the path.
+func TestM15_BurstBeyondEventBufferConverges(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	const burst = 200
+	fabric := taskfabric.NewFabric()
+	coord := NewCompileCoordinator(fabric, nil)
+	dag, err := engine.NewMutableDAG([]*engine.Step{{ID: "root", AgentType: "ares/root"}})
+	require.NoError(t, err)
+
+	stop := coord.SubscribeGraphEvents(ctx, dag)
+	defer stop()
+
+	prev := "root"
+	for i := 0; i < burst; i++ {
+		id := fmt.Sprintf("b%d", i)
+		require.NoError(t, dag.AddNode(ctx, &engine.Step{
+			ID: id, AgentType: "tool/echo", DependsOn: []string{prev},
+		}))
+		prev = id
+	}
+
+	require.Eventually(t, func() bool { return len(fabric.IDs()) == burst+1 },
+		10*time.Second, 20*time.Millisecond,
+		"every grown node must reach the fabric, delivered or reconciled")
+
+	last, err := fabric.Task(fmt.Sprintf("b%d", burst-1))
+	require.NoError(t, err)
+	require.Equal(t, []string{fmt.Sprintf("b%d", burst-2)}, last.Dependencies,
+		"a node materialized by reconcile still carries its graph dependency")
 }

@@ -1,11 +1,11 @@
-# ares 架构深度解析（七）：运行时与生命周期 — 出生、死亡与复活（0.3.x）
+# ares 架构深度解析（七）：运行时与生命周期 — 出生、死亡与新出生（0.3.x）
 
 > 别的 Agent 框架比谁的功能多、比谁的花哨。我只有一个执念：**菜能接受，坏是绝对不能接受的。**
-> 有一天我突然在想，如果现在随便 `kill -9` 一个正在跑的 Agent，怎么把它拉起来？
+> 有一天我突然在想，如果现在随便 `kill -9` 一个正在跑的 Agent，怎么把它的活救回来？
 > 手动拉？先定位是哪个进程，再翻日志分析原因，打补丁，然后 `go run main.go --args`……看着就烦。
-> 那有没有一种机制，能让 Agent 死后带着记忆自己爬起来？我管这个叫 **秽土转生**。
+> 那有没有一种机制，能让 Agent 死后，它的任务还能带着认知自己续上？我管这个叫 **Tag 转移——Agent 亡，Task 不亡**。
 >
-> 0.3.x 更新：Runtime Manager 演进为 **Agent Fabric**。核心理念从"Agent 复活"升级为 **"Agent 死亡 ≠ Task 死亡"**——Agent 是一次性的，Task Fabric 持有检查点。Agent 死了不是"复活旧 Agent"，而是"spawn 新 Agent + 从检查点恢复 Task 进度"。Execution Quantum 边界 yield 保证检查点已落盘。Agent 生命周期：spawn → suspend → resume → retire → kill → recover。
+> 0.3.x 更新：运行时演进为 **Agent Fabric + Task Fabric + Recovery/Chaos**。核心理念从"Agent 复活"升级为 **"Agent 死亡 ≠ Task 死亡"**——Agent 是一次性的、可丢弃的执行体，Task 才持有检查点。Agent 死了不是"复活旧 Agent"，而是"spawn 新 Agent + 用旧 Agent 的认知检查点喂给它"。Agent 生命周期：`spawn → suspend → resume → retire → kill → recover`。每一次执行都是一次 **quantum**（`ExecuteStep`），在 quantum 边界 yield 保证检查点已落盘。
 
 ## 一、纠结的坑
 
@@ -19,710 +19,370 @@
 
 用户让 Agent 写一个文件，写到一半系统崩了。系统重启后 Agent 自动复活了，然后告诉用户：**"亲，系统刚凉了，我知道你很急，先喝杯茶，咱们从上次断掉的地方继续哦。"**
 
-哪怕用户想问候开发者先人，我觉得都合理。更重要的是——那花掉的 token 呢？从头再来，再花一遍？那可是真金白银的刀乐。
+哪怕用户想问候开发者先人，我都觉得合理。更重要的是——那花掉的 token 呢？从头再来，再花一遍？那可是真金白银的刀乐。
 
-所以整个 Runtime 的设计出发点，不是"怎么让 Agent 不死"，而是三个更现实的问题：
+所以整个设计出发点，不是"怎么让 Agent 不死"，而是三个更现实的问题：
 
-1. **Agent 死了怎么自己爬起来？**（自动复活）
-2. **爬起来后怎么记得之前干到哪了？**（状态恢复）
-3. **中断的任务怎么续上，不浪费 token？**（续传）
+1. **Agent 死了，它的任务怎么继续？**（Task 续命）
+2. **新 Agent 怎么接上旧 Agent 的认知？**（认知传递）
+3. **中断的任务怎么续上，不浪费 token？**（checkpoint 续传）
 
 这三个问题回答了，才敢说"坏不了"。
 
 ---
 
-## 二、整体架构：Agent 的生死由 Runtime 管
+## 二、Agent 的生死状态机：Fabric + AgentState
+
+在 0.3.x 里，Agent 是一个普通的可丢弃结构体，由 **Agent Fabric** 管理。它不负责调度（那是 Task Fabric 的 job），不负责通信（那是 IPC 的 job），只干一件事——**管生管死**。
+
+```go
+type Agent struct {
+    // Identity 是稳定标识符
+    Identity string
+    // Capabilities 是声明的能力（capability-aware 调度器用）
+    Capabilities []string
+    // State 是当前生命周期状态
+    State AgentState
+    // Load / Confidence / Priority 是调度提示
+    Load       float64
+    Confidence float64
+    Priority   float64
+    // Parent 是"谁 spawn 了我"——纯溯源，不构成权限层级
+    Parent string
+    // SpawnedAt 是创建时间
+    SpawnedAt time.Time
+
+    // 私有：cognitive（认知状态）、cognition（执行体）、governance（预算）……
+}
+```
+
+状态只有四个，个顶个的直白：
+
+```go
+StateIdle      AgentState = "IDLE"      // 活着，可被分配任务
+StateRunning   AgentState = "RUNNING"   // 正在执行一个任务
+StateSuspended AgentState = "SUSPENDED" // 暂停（Lifecycle 层面，非 Task）
+StateRetired   AgentState = "RETIRED"   // 永久退役，不可恢复
+```
 
 ```mermaid
-graph TB
-    subgraph 生命周期全景
-        B[启动] --> RS[Runtime.Start]
-        RS --> HC[健康检查 每10秒]
-        RS --> LAUNCH[启动所有注册 Agent]
-        LAUNCH --> AG[launchAgentGoroutine]
-        AG --> AE[agent.Start 开始干活]
-        AE --> GE[挂了 正常退出或panic]
-        GE --> NAD[NotifyAgentDead 报告死亡]
-        NAD --> RA[RestoreAgent 复活]
-        RA --> S3[两阶段状态恢复]
-        S3 --> AG
-        HC --> HB{还活着吗}
-        HB -->|挂了| NAD
-    end
-
-    subgraph 两阶段恢复
-        S3 --> S3S[快照优先恢复<br/>RecoverSnapshotOrEvents]
-        S3S -->|有快照| S3SS[秒级加载 Session 快照]
-        S3SS --> S3E
-        S3S -->|无快照| S3A[阶段一: 事件回放<br/>EventStore 重建操作状态]
-        S3A -->|失败? 跳过| S3B
-        S3B --> LAUNCH
-    end
-
-    subgraph 认知恢复
-        S3E[阶段二: 认知恢复<br/>MemoryManager 恢复对话历史] --> S3B[RestoreState 加载]
-        S3B --> RP[ReplayEvents 回放]
-    end
+stateDiagram-v2
+    direction LR
+    [*] --> IDLE : Spawn()
+    IDLE --> RUNNING : scheduler SetRunning()
+    RUNNING --> IDLE : SetIdle() (quantum yield / 完成)
+    IDLE --> SUSPENDED : Suspend()
+    RUNNING --> SUSPENDED : Suspend() (Lifecycle 暂停)
+    SUSPENDED --> IDLE : Resume() / Recover()
+    IDLE --> RETIRED : Retire() (终态·清快照)
+    SUSPENDED --> RETIRED : Retire()
+    IDLE --> [*] : Kill() (崩溃·捕获快照后从注册表移除)
+    RUNNING --> [*] : Kill()
+    SUSPENDED --> [*] : Kill()
 ```
 
-核心哲学就一行代码：
-
-```go
-// Agents are disposable executors; the Runtime owns their birth, death, and resurrection.
-```
-
-翻译：Agent 是可以随时扔掉的一次性执行器——但它们的出生、死亡、复活，归 Runtime 统一管。
+注意 `Kill` 是引向 `[*]` 的——它不是"再一变"，而是**从注册表里删掉**。这是个关键语义：`RETIRED` 还在 registry 里（只是锁死了），而 `Kill` 后这个 Agent 就**不存在了**，只能通过恢复机制"再造一个"出来。
 
 ---
 
-## 三、复活守卫模式：为什么 stopped 必须先于 cancel？
+## 三、执行能力注入：CognitionFactory（A1）
 
-这是整个系统里最重要的并发安全细节。先说结论：
+Agent 结构体贴着执行的位置在 `cognition` 字段上。它默认是 `nil`——也就是说，一个刚 spawn 的 Agent **默认没有任何执行能力**，它只是"可被管理"（能 spawn/kill/recover），但**不能跑一个 quantum**。能不能跑，由 `SpawnSpec.CognitionFactory` 说了算：
 
 ```go
-func (m *Manager) StopAgent(ctx context.Context, agentID string) error {
-    m.mu.Lock()
-    // 步骤一：先标记"自愿停止"
-    ma.stopped = true
-    cancel := ma.cancel
-    m.mu.Unlock()
-
-    // 步骤二：再取消 context
-    if cancel != nil { cancel() }  // 触发 goroutine 退出
+type SpawnSpec struct {
+    Identity   string      // 请求的 id；"" 则由 Fabric 分配
+    Capabilities []string  // 声明的能力
+    ParentID   string      // 谁 spawn 了你（溯源，非层级）
+    TaskContext map[string]any
+    Resources  map[string]any
+    Governance Governance // P3 认知执行预算（token/tool/deadline）
+    Priority   float64
+    // CognitionFactory 根据能力清单产出执行体（Cognition）。
+    // nil → Agent 无执行能力，可管理但不可调度。
+    CognitionFactory CognitionFactory
+    // ExperiencePrior 是蒸馏先验，spawn 时写入 CognitiveState.Context (G1)。
+    ExperiencePrior any
 }
 ```
 
-为什么 `stopped = true` 必须在 `cancel()` 之前？考虑这个竞态：
-
-1. 线程 A 调用 `ma.cancel()`，Agent goroutine 检测到 context 取消
-2. goroutine 退出时调用 `NotifyAgentDead`
-3. 此时如果 `ma.stopped` 还没被设置为 true，`NotifyAgentDead` 会以为 Agent 是意外死亡，**错误触发复活流程**
-
-先标记、再取消，就是**复活守卫模式**。
-
-完整守卫逻辑有四个条件，任意满足就跳过复活：
-
 ```go
-if m.isStopped ||                     // 运行时自己都停了
-   ma.stopped ||                       // Agent 是被主动关闭的
-   ma.resurrecting ||                  // 复活已在路上
-   (m.config.MaxRestartsPerAgent > 0 &&
-    ma.restarts >= m.config.MaxRestartsPerAgent) // 超限
-{
-    return  // 不复活
+// Cognition 是"一个 quantum 认知工作"的执行契约。
+// 每次调用 ExecuteStep 跑一个 quantum：
+// 要么完成（Done）、要么产出进度供续传（Checkpoint）、要么失败。
+type Cognition interface {
+    ExecuteStep(ctx context.Context, task *models.Task) (*StepOutcome, error)
 }
+
+// StepOutcome 是单个 quantum 的结果。
+type StepOutcome struct {
+    Done       bool              // 任务完成时 true（Result 有效）
+    Checkpoint any               // 持久化进度（yield）
+    Result     *models.TaskResult // 最终结果，仅 Done 时有值
+}
+
+// CognitionFactory：Capabilities → Cognition。
+type CognitionFactory func(capabilities []string) Cognition
 ```
 
-复活次数不是硬编码 10，而是通过 `Config.MaxRestartsPerAgent` 配置（默认值见 `DefaultConfig()`），且使用**指数退避**逐步降低频率：
-
-```go
-func (m *Manager) scheduleResurrection(agentID string, factory AgentFactory) {
-    m.g.Go(func() error {
-        backoff := time.Second
-        const maxBackoff = 30 * time.Second
-        const maxAttempts = 5
-        for attempt := 1; attempt <= maxAttempts; attempt++ {
-            restoreCtx, restoreCancel := context.WithTimeout(
-                m.gctx, m.config.RestoreTimeout)
-            err := m.RestoreAgent(restoreCtx, agentID, factory)
-            restoreCancel()
-            if err == nil { return nil }
-            // 退避：1s → 2s → 4s → 8s → 30s(capped)
-            backoff *= 2
-            if backoff > maxBackoff { backoff = maxBackoff }
-            // 等待退避
-        }
-    })
-}
-```
-
-最关键的细节：`attempt` 计数和退避等待都跑在 `errgroup` goroutine 里，不影响主线程。`m.gctx.Done()` 的 `select` 保证了运行时关闭时退避循环能被及时打断，不会傻等完整的退避时间。
-
----
-
-## 四、两阶段状态恢复：挂了不可怕，失忆才可怕
-
-Agent 复活的核心是 `recoverAgentState`。但这里要纠正一个常见的错误认知——Agent 恢复**不是只靠事件回放**，而是**快照优先、事件补全**的双路径策略。
-
-### 快照优先：最快、最可靠的恢复路径
-
-`RecoverSnapshotOrEvents` 是整个恢复系统的入口：
-
-```go
-// RecoverSnapshotOrEvents 实施"快照优先"恢复策略
-func RecoverSnapshotOrEvents(ctx context.Context, store base.SnapshotStore,
-    agentID string, eventFn func() map[string]any) map[string]any {
-    if store != nil {
-        snap, err := store.Load(ctx, agentID)
-        if err != nil {
-            return eventFn()  // 快照加载失败 -> 回退到事件回放
-        }
-        if snap != nil {
-            return snap  // 快照成功 -> 直接使用快照
-        }
-    }
-    return eventFn()  // 没有快照存储 -> 直接事件回放
-}
-```
-
-三种路径，优先使用最可靠的：
-
-| 优先级 | 路径 | 条件 | 恢复精度 |
-|--------|------|------|---------|
-| 1 | 从 `SnapshotStore.Load()` 加载快照 | 实现了 SnapshotAgent 且有持久化快照 | 最高 |
-| 2 | 从 `EventStore` 事件回放重建状态 | 实现了 StatefulAgent 且有事件流 | 中 |
-| 3 | `MemoryManager` 认知恢复 | 有 MemoryManager 且能查到历史会话 | 低 |
-
-### 完整恢复流程
+spawn 时的注入链路是闭环的：
 
 ```mermaid
 graph LR
-    subgraph 死亡现场
-        A[Agent 挂了] --> F[Factory 创建新实例]
-    end
-    subgraph 快照优先
-        F --> SS{有 SnapshotStore?}
-        SS -->|是| SNAP[Load 快照]
-        SNAP -->|成功| ST[重建全量状态]
-        SNAP -->|失败或不存在| ES[查询 EventStore<br/>回放事件]
-    end
-    subgraph 事件回放
-        ES --> EV[buildStateFromEvents<br/>提取 session_id 等]
-        EV --> ST
-    end
-    subgraph 认知恢复
-        ST --> MM[buildCognitiveState<br/>从 MemoryManager 恢复对话历史]
-        MM --> RE[RestoreState 加载状态]
-        RE --> RP[ReplayEvents 回放增量事件]
-    end
-    RP --> OK[新的 Agent 启动<br/>继续干活]
+    S[SpawnSpec] -->|Capabilities| F[CognitionFactory(capabilities)]
+    F --> C[Cognition 填入 Agent.cognition<br/>A1 执行体注入]
+    C -->|Agent.ExecuteStep 跑一个 quantum| O{StepOutcome}
+    O -->|Done| R[TaskResult]
+    O -->|Checkpoint| Y[yield · 检查点落盘]
+    O -->|error| E[可恢复→编码进 StepOutcome<br/>不可恢复→error]
 ```
 
-**最关键的容错设计**：三个阶段互相独立，任何一个失败都**不阻断**整个复活流程。
+三个边界细节值得记下来：
+
+1. **nil 工厂是合法的**：spawn 出来的 Agent 就是"空壳"，只能被管理。`Executable()` 检查它有没有执行体，调度器据此决定**不要把不可执行的 Agent 当候选**。
+2. **非 nil 工厂产出 nil 是编程错误**：那会悄悄 spawn 一个永远不可执行的 Agent（代码里叫 "nil cognition was swallowed"），所以直接把整个 spawn **reject 掉**（`ErrInvalidSpawnSpec`）。
+3. **实力不够调没资格**：对没有注入执行体的 Agent 调 `ExecuteStep`，直接返回 `ErrAgentNotExecutable`。
+
+另外，`ExperiencePrior` 就是 aresos-agentos-plan G1 的"记忆蒸馏钩子"——把蒸馏出来的先验经验作为新 Agent 的第一个 `CognitiveState.Context`，让它一出生就不是白纸：
 
 ```go
-func (m *Manager) recoverAgentState(ctx context.Context, agentID string,
-    factory AgentFactory) (base.Agent, error) {
-    newAgent := factory()  // 全新实例
-
-    evts := m.replayEvents(ctx, agentID)
-    // replayEvents 失败只会 warn 日志，返回空列表
-
-    if sa, ok := newAgent.(base.StatefulAgent); ok {
-        // 快照优先恢复
-        state := RecoverSnapshotOrEvents(ctx, m.snapshotStore, agentID,
-            func() map[string]any {
-                state := buildStateFromEvents(evts)
-                if m.memManager != nil {
-                    cognitiveState := m.buildCognitiveState(ctx, agentID, state)
-                    for k, v := range cognitiveState {
-                        state[k] = v
-                    }
-                }
-                return state
-            })
-
-        if len(state) > 0 {
-            sa.RestoreState(state)   // 阶段一
-        }
-        if len(evts) > 0 {
-            sa.ReplayEvents(evts)    // 阶段二
-        }
-    }
-    return newAgent, nil  // 不管有没有恢复成功，Agent 都会启动
-}
-```
-
-### 快照的两层设计：Snapshot 接口
-
-```go
-type StatefulAgent interface {
-    Agent
-    RestoreState(state map[string]any) error
-    ReplayEvents(events []*ares_events.Event) error
-    Snapshot() (map[string]any, error)  // 关键新增
-}
-
-type SnapshotStore interface {
-    Save(ctx context.Context, agentID string, state map[string]any) error
-    Load(ctx context.Context, agentID string) (map[string]any, error)
-    Delete(ctx context.Context, agentID string) error
-}
-```
-
-`Snapshot()` 和 `RestoreState()` 配对使用。`Manager.Stop()` 时会对所有 stateful agent 捕获最终快照，确保下次冷启动时能快速恢复。
-
-### 认知恢复细节
-
-```go
-func (m *Manager) buildCognitiveState(ctx context.Context, agentID string,
-    operationalState map[string]any) map[string]any {
-    state := make(map[string]any)
-
-    sessionID, _ := operationalState["session_id"].(string)
-    if sessionID == "" {
-        sid, err := m.memManager.GetLatestSessionForLeader(ctx, agentID)
-        sessionID = sid
-    }
-    if sessionID == "" { return state }
-
-    messages, _ := m.memManager.GetMessages(ctx, sessionID)
-    state["session_id"] = sessionID
-    state["conversation_history"] = messages
-    return state
-}
-```
-
-### 事件流完整性校验
-
-事件回放不是盲目读取。Manager 在 `replayEvents` 中做了三层校验：
-
-1. **流完整性检查**：`VerifyStreamIntegrity(evts)` -- 验证事件间的哈希链
-2. **截断检测**：对比最后一个回放事件的版本号和 `StreamVersion()`，不等则记录告警
-3. **限制回放数量**：通过 `Config.MaxReplayEvents`（默认 10000）防止 OOM
-
-```go
-if len(evts) > 1 {
-    if err := ares_events.VerifyStreamIntegrity(evts); err != nil {
-        log.Error("runtime: event stream integrity check failed",
-            "event_count", len(evts), "error", err)
-    }
-    if streamVersion, _ := m.eventStore.StreamVersion(ctx, streamID); ... {
-        log.Error("runtime: event stream truncated",
-            "last_replayed", lastVersion,
-            "stream_version", streamVersion,
-            "missing_events", streamVersion-lastVersion)
+if spec.ExperiencePrior != nil {
+    a.cognitive = CognitiveState{
+        SchemaVersion: CognitiveStateSchemaVersion,
+        Context:       spec.ExperiencePrior,
     }
 }
 ```
-
-### ExperienceCheckpoint：工作流级别的 step 续传
-
-除了 Agent 级别的快照恢复，系统还有独立的**工作流 checkpoint 系统** —— `ExperienceCheckpoint`。这是给 `Workflow/(MutableDAG)` 用的，不是给 agent 用的：
-
-```
-LeaderCheckpoint (PostgreSQL)          ExperienceCheckpoint (CheckpointStore)
-    |                                        |
-    v                                        v
-Leader 级别的 agent 恢复              工作流级别的 step 续传
-Session 级的状态                        Step 级的运行状态
-```
-
-`ExperienceCheckpoint` 的结构非常丰富（30+ 字段）：
-
-```go
-type ExperienceCheckpoint struct {
-    SchemaVersion    int                    // 数据版本，用于向前兼容
-    ExecutionID      string                 // 执行 ID
-    WorkflowID       string                 // 工作流 ID
-    StateVersion     int64                  // 状态版本号
-    Status           string                 // 当前状态
-    CurrentRound     int                    // 进化循环轮次
-    StepStates       []StepStateSnapshot    // 每个 step 的快照
-    Variables        map[string]interface{} // 变量快照
-    OutputStore      map[string]string      // 输出存储
-    DAGNodes         []string               // DAG 节点拓扑
-    DAGEdges         []DAGEdge              // DAG 边拓扑
-    RouteHistory     []RouteEntry           // 路由决策历史
-    ToolHistory      []ToolEntry            // 工具调用历史
-    MemoryHits       []MemoryEntry          // 记忆检索记录
-    InterruptHistory []InterruptEntry       // HITL 中断历史
-    LoopHistory      []LoopEntry            // 循环迭代历史
-    ErrorHistory     []ErrorEntry           // 错误历史
-    ScoringSignals   []ScoringSignal        // 质量评分信号
-}
-```
-
-`CheckpointPlugin` 在 `BeforeStep` 和 `AfterStep` 两个钩子点自动保存检查点。`DynamicExecutor.ExecuteDynamicFromCheckpoint` 利用 checkpoint 从断点续传工作流：
-
-```go
-func (e *DynamicExecutor) ExecuteDynamicFromCheckpoint(
-    ctx context.Context, workflow *Workflow,
-    initialInput string, mutableDAG *MutableDAG,
-    executionID string,
-) (*WorkflowResult, error) {
-    // 从 checkpoint store 加载
-    data, _ := e.checkpointStore.Load(ctx, CheckpointKey(executionID))
-    var ckpt ExperienceCheckpoint
-    json.Unmarshal(data, &ckpt)
-
-    // 重建 completed/processed maps
-    for _, ss := range ckpt.StepStates {
-        processed[ss.StepID] = true
-        if ss.Status == StepStatusCompleted {
-            completed[ss.StepID] = true
-        }
-    }
-
-    // checkpoint 变量优先于 workflow 默认值
-    for k, v := range ckpt.Variables {
-        execution.Variables[k] = v
-    }
-
-    // 调用共享 execLoop -- 跳过已完成 step
-    return e.execLoop(ctx, workflow, initialInput,
-        mutableDAG, execution, completed, processed, initialStepResults)
-}
-```
-
-`execLoop` 是两种执行路径的共享核心——不管是新执行还是从 checkpoint 恢复，最终都落同一个循环。
-
-**反思**：快照优先恢复看起来很美，但它依赖 agent 正确实现 `Snapshot()`。如果 agent 在 `Snapshot()` 中漏掉了某个关键字段，恢复出来的状态可能比纯事件回放更不准确。"快照是选最佳路径，不是绝对可靠路径"——这个认知应该被系统化地记录在每个 agent 的 `Snapshot()` 实现文档中。
-
-`ExperienceCheckpoint` 的数据量也值得关注：一次复杂的工作流执行可能产生上百条 RouteHistory、ToolHistory 记录，反序列化 + 重建的代价不可忽略。目前缺少一个自动的 TTL 清理或大 checkpoint 分片机制。
 
 ---
 
-## 五、Leader Agent 的编排管道：stopCh 无处不在
+## 四、六大生命周期原语
 
-Leader Agent 的 `Process` 方法是四阶段管线：
+Fabric 对外暴露 `spawn / suspend / resume / retire / kill / recover`。全部并发安全（`Fabric.mu` 串行化），并且每个原语都会通过可选的 EventSink 发一条生命周期事件（`agent.spawned / suspended / resumed / retired / killed / recovered`）。
 
-```mermaid
-graph LR
-    Input --> MEM[initMemoryContext<br/>恢复或创建会话]
-    MEM --> P[Parse 解析画像]
-    P --> PLAN[Plan 规划子任务]
-    PLAN --> DISPATCH[Dispatch 并行分发<br/>信号量控制并发]
-    DISPATCH --> AGG[Aggregate 聚合结果]
-    AGG --> FINAL[finalizeMemory<br/>记录回复 + 后台蒸馏]
-```
-
-每个步骤之间都会检查是否收到停止信号：
+### Spawn：只生，不管
 
 ```go
-select {
-case <-a.stopCh:
-    return nil, ErrAgentNotRunning
-default:
-}
+func (f *Fabric) Spawn(ctx context.Context, spec SpawnSpec) (*Agent, error)
 ```
 
-这保证了：就算用户在第 2 步按了 Ctrl+C，Agent 不会傻傻跑完整个管线再停。
+- 新 Agent 一律以 `StateIdle` 出生。
+- 校验：id 不能重（`ErrAgentExists`）；id 里不能有空格（`ErrInvalidSpawnSpec`）；资源 claim 超配额 → `ErrResourceQuotaExceeded`（**先校验后变更**，失败时 Fabric 状态零改动）。
+- 注入执行体 + 记下 `parent_id` 溯源 + 从出生就挂上治理预算。
+- **Spawn 不调度**——把 Agent 放进候选池是 Scheduler 的事。
 
-### 蒸馏的 Context 脱离：最容易被忽略的坑
-
-`finalizeMemory` 里的蒸馏逻辑藏着一个经典的并发问题：
+### Suspend / Resume：Lifecycle 层面的暂停，不是任务暂停
 
 ```go
-func (a *leaderAgent) finalizeMemory(...) {
-    a.distillMu.Lock()
-    select {
-    case <-a.stopCh:
-        a.distillMu.Unlock()
-        return  // 正在停止，跳过蒸馏
-    default:
-    }
-    a.distillWg.Add(1)         // 必须在锁里 Add
-    a.distillMu.Unlock()
-
-    a.distillEg.Go(func() error {
-        defer a.distillWg.Done()
-
-        // 关键：用 context.Background() 脱离父 context
-        // 即使客户端断开，蒸馏仍在后台继续
-        distillCtx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
-        defer cancel()
-
-        distilled, _ := a.memoryManager.DistillTask(gCtx, taskID)
-        return a.memoryManager.StoreDistilledTask(gCtx, taskID, distilled)
-    })
-}
+func (f *Fabric) Suspend(ctx context.Context, agentID string) error // IDLE/RUNNING → SUSPENDED
+func (f *Fabric) Resume(ctx context.Context, agentID string) error  // SUSPENDED → IDLE
 ```
 
-三个要点：
+- `Suspend` 保留 Agent 的内存认知状态，`Resume` 让**同一个实例**重启（不是新 spawn）。已 SUSPENDED 再 Suspend 是幂等的。
+- RETIRED 不能再 Suspend/Resume（`ErrAgentRetired`）；Resume 非 SUSPENDED 状态 → `ErrAgentNotSuspended`。
 
-1. **`distillMu` 保护 `stopCh` 检查和 `Wg.Add(1)` 的原子性**：不加锁的话，可能出现 `Wait` 先跑完，`Add` 后调用 → `panic: Add after Wait`
-2. **`context.Background()`**：蒸馏不受客户端断开影响，后台默默跑完
-3. **Stop 顺序**：`close(stopCh)` → `distillWg.Wait()` → `distillEg.Wait()`，确保后台蒸馏先完成
+### Retire：体面的终态
 
-**反思**：`context.Background()` 脱离了父 context 的取消传播，但也失去了超时控制——如果蒸馏真跑 2 小时怎么办？虽然设了 `2*time.Minute` 的超时，但这个超时是拍脑袋的。文档里也没告诉用户"蒸馏可能持续 2 分钟，RAM 占用约 X MB"，这是运维层面的缺失。
+```go
+func (f *Fabric) Retire(ctx context.Context, agentID string) error
+```
+
+- **要求 Agent 不在 RUNNING**——要退役，先 Suspend 再 Retire（`ErrAgentRunning`）。
+- 释放资源 claim（P5 配额回到池子）。
+- **必须清掉死亡快照**——这是终态，"前面某次 kill/revive 的旧快照绝不能事后被翻出来复活"。
+- 退役父 Agent **不会**连带子 Agent（你们是平级认知体，不是权限树）。
+
+### Kill：崩溃路径，非优雅
+
+```go
+func (f *Fabric) Kill(ctx context.Context, agentID string) error
+```
+
+- 任何状态都能 Kill，这就是 crash 语义。
+- **顺序很要命**：先把 Agent 的复活证据（认知 + 能力 + 父 id，`AgentSnapshot`）捕获下来，**再**从注册表删除、释放资源。因为删完这个 Agent 就再也读不到了，恢复子系统靠这个快照决定能不能"原地复活"。
+- 子 Agent 照旧活着，`Parent` 字段不清——那是溯源，死了也得留痕。
+
+### Recover：让新 Agent 接上旧 Agent 的认知
+
+```go
+func (f *Fabric) Recover(ctx context.Context, agentID string, cognitive CognitiveState) error
+```
+
+- 目标 Agent 必须在 IDLE 或 SUSPENDED。把 `cognitive` **整个替换**进这个 Agent。
+- 如果它是 SUSPENDED，顺便切回 IDLE。
+- 这就是"一个死亡 Agent 的认知由另一个/新的 Agent 捡起来"的落地动作（§13 不变式：**Agent 可丢，Task 耐操**）。
 
 ---
 
-## 六、健康检查与心跳：最薄的保障层
+## 五、Fabric 本身：注册表、进程树、配额与事件
 
 ```mermaid
 graph TB
-    subgraph 健康检查循环 每10秒
-        CHECK[遍历所有 Agent] --> HEART{实现 Heartbeater?}
-        HEART -->|是| ALIVE{IsAlive?}
-        ALIVE -->|false| NAD[NotifyAgentDead]
-        ALIVE -->|true| NEXT
-        HEART -->|否| STATUS{Status 检查}
-        STATUS -->|Offline 或 Stopping| NAD
-        STATUS -->|Running| NEXT
+    subgraph Fabric（生命周期支柱）
+        REG[agents 注册表]
+        TREE[children 进程树<br/>parent→childIDs]
+        QUOTA[resourceBudget / allocated<br/>P5 配额]
+        SNAP[snapshots 死亡快照库<br/>last-per-identity]
+        SINK[EventSink 生命周期事件]
     end
+    REG -->|Idle?| SCHED[Task Fabric 调度器<br/>只把 IDLE 且可执行当候选]
+    TREE -->|纯溯源·非权限| PROV
+    QUOTA -->|spawn 校验 / kill·retire 释放| ALLOC
+    SNAP -->|Kill 前捕获| SAVE
+    SINK -->|best-effort| LOG[事件日志<br/>跨重启重建]
 ```
 
-```go
-func (m *Manager) healthCheck() {
-    for _, c := range checks {
-        if h, ok := c.agent.(base.Heartbeater); ok {
-            if !h.IsAlive() {
-                m.NotifyAgentDead(c.id, "heartbeat failed")
-            }
-            continue
-        }
-        // 回退到状态轮询
-        status := c.agent.Status()
-        if status == models.AgentStatusOffline {
-            m.NotifyAgentDead(c.id, "status=offline")
-        }
-    }
-}
-```
+几个要点：
 
-这里有个很微妙的问题：**`NotifyAgentDead` 是在健康检查 goroutine 里被调用的**，而 `NotifyAgentDead` 内部是异步复活（`m.g.Go(func()...)`）。这意味着健康检查发现 Agent 挂了 -> 触发复活 -> 但健康检查不知道复活成功了没有、花了多久、是否又挂了。
-
-**反思**：健康检查的反馈回路是单向的。它只负责"发现问题 -> 丢给复活流程"，不负责"确认问题已解决"。理想的设计应该是健康检查能感知到复活状态——比如复活成功后更新某个标记，健康检查看到标记后重置计数器。这样还能检测到"反复复活反复失败"的循环，及时告警而不是闷头按 `MaxRestartsPerAgent` 配置的重试。
+- **进程树（Process Tree）是 Pure Provenance**：`children[parentID]` 只回答"谁 spawn 了谁"，绝不构成权限层级（§13 不变式 #1：A ≡ B ≡ C，平级认知体）。
+- **资源配额（P5）是准入控制**：spawn 时一次性 claim，kill/retire 时释放。`resourceBudget` 为空/关闭则不做准入控制。
+- **事件是 best-effort**：`sink.Emit` 失败**永远不破坏状态机**——内存注册表才是权威。反过来说，跨进程重启想重建状态，就得靠事件日志了（Evidence-Driven）。
+- **死亡快照库**：每个身份只留**最近一次**死亡快照。`Retire` 时清掉（terminal）；成功原地复活后会 `ClearSnapshot` 消费掉，防止长跑进程里堆满过期快照。多个死亡 Agent 共享同一能力时，恢复优先取 `DiedAt` **最新的那个**——最新鲜的认知是最安全的复活种子。
 
 ---
 
-## 七、Supervisor 故障转移：冷重启的策略
+## 六、L2 执行图与 DAGExecution 门：先把丑话说清楚
 
-**注意**：`LeaderSupervisor` 已在最新代码中被**复活插件 (Resurrection Plugin)** 替代，后者与 Runtime Manager 共享相同的快照优先恢复机制。`LeaderSupervisor` 仅保留用于测试兼容，新代码应直接使用 `Manager.RestoreAgent()`。
+这一节我特别想把丑话说在前面，因为它**不是**已经上线的能力。
 
-### LeaderCheckpoint：PostgreSQL 持久化的 Session 状态
-
-`LeaderCheckpoint` 是用于 Agent 级 failover 的数据库 checkpoint。它不是给工作流 step 用的（那是 `ExperienceCheckpoint` 的职责），而是保存 Leader Agent 的**会话级别**状态：
+Agent Fabric 里有一个 `L2Graph`：每次 session 一个 `engine.MutableDAG`，节点是实际工具实例，配一个 router 认知按任务的 capability 分发到 `toolCognition / answerCognition / rootCognition / （可选的）planCognition`。看起来很完整对不对？但它有一个门：
 
 ```go
-type LeaderCheckpoint struct {
-    LeaderID     string    `db:"leader_id,primary"`  // 主键
-    SessionID    string    `db:"session_id"`
-    EntryID      string    `db:"entry_id"`
-    RootMsgID    string    `db:"root_msg_id"`
-    StatusPayload []byte   `db:"checkpoint_payload"` // JSON 序列化的完整状态
-    CreatedAt    time.Time `db:"created_at"`
-    UpdatedAt    time.Time `db:"updated_at"`
+// DAGExecution 是 L2 session 图执行路径的门。
+// 零值 = 传统 ReAct 行为：peer 的认知工厂返回 chat（tool-loop）认知，
+// L2 图机制保持 test-only。
+type DAGExecution struct {
+    Enabled bool
+}
+
+func (g DAGExecution) Select(chat, router Cognition) Cognition {
+    if g.Enabled {
+        return router // 门开了，走 session 图执行
+    }
+    return chat       // 默认：老 ReAct 循环
 }
 ```
 
-数据库操作使用 UPSERT 语义（`INSERT ... ON CONFLICT (leader_id) DO UPDATE`），通过 `db:"leader_id,primary"` 主键保证每个 agent 只有一个 checkpoint 行。接口定义为：
+**诚实地说**：`Enabled` 默认是 `false`。所以**生产环境的 peer 走的还是那条默认的 chat / ReAct tool-loop 认知**，`L2Graph` 和 router 认知目前**没有接进生产 serve 路径**，只是 test-only 的前瞻种子。代码注释里原话是：*"it is not yet wired into the production serve path — until it is, peers keep their default ReAct chatCognition and this graph stays test-only."*
 
-```go
-type LeaderCheckpointer interface {
-    Save(ctx context.Context, ckpt *LeaderCheckpoint) error
-    GetLatest(ctx context.Context, leaderID string) (*LeaderCheckpoint, error)
-    Delete(ctx context.Context, leaderID string) error
-}
-```
+这不代表它没用——router 的分发键（`Task.AgentType` → 候选重叠 → 执行体）**恰好就是调度器已经在解析的那把钥匙**，所以哪天门开了也不需要新增分发机制。`toolCognition` 干净地满足"状态即任务"（严格 schema 工具只收到 `arg.` 前缀的键，envelope 管道字段永远到不了工具）；`answerCognition` 有个 TODO：**还没接 summarizer**——它只输出自己节点带的内容，没内容就老实说 "no answer content supplied" 并记一条 warning，绝不装成功。
 
-### 故障转移流程
+**反思**：这是我最想强调的自我克制——文档把 L2 图讲得再漂亮，只要 `Enabled=false`，它就没在跑。把它当"已上线的能力"写，就是骗人。好东西应该允许它还没被默认打开。
+
+---
+
+## 七、死亡、复活与混沌验证：Recovery + Chaos
+
+真正把"Agent 亡而 Task 不亡"撑起来的是 `internal/aresrecovery`。它把两个 Fabric 焊在一起：**Task Fabric（耐操的任务 + 租约过期 + 检查点）+ Agent Fabric（可丢的 Agent + 认知状态）**，实现"Agent 死亡 → 任务 requeue → 检查点续传 → 顶替者上岗"。
 
 ```mermaid
 graph TB
-    TIMEOUT[心跳超时] --> EMIT[发送 EventFailoverTriggered]
-    EMIT --> STOP[停止旧 Leader<br/>使用 detached context<br/>避免取消传播]
-    STOP --> CP{数据库 Checkpoint?}
-    CP -->|有| SNAP[Snapshot 恢复<br/>直接从 Checkpoint 加载]
-    CP -->|无 snapshot| ER[EventRecovery 事件回放<br/>重建 RecoveryState]
-    SNAP --> RETRY[重试循环 最多3次]
-    ER --> RETRY
-    RETRY --> COLD[ColdRestartStrategy<br/>factory 创建新 Agent]
-    COLD --> START[启动新 Leader]
-    START --> CLEAN[清理孤儿任务]
-    CLEAN --> DONE[注册新 Leader<br/>发 EventFailoverCompleted]
+    K[Agent 死亡<br/>Kill 或租约失效] --> S[Kill 先捕获 AgentSnapshot<br/>认知+能力+父id]
+    S --> R2{恢复预算<br/>restarts[id] < MaxRestarts?}
+    R2 -->|否| EX[ErrRecoveryExhausted<br/>不再复活]
+    R2 -->|是| A2{存在 LastSnapshot?}
+    A2 -->|是| IP[RestartAgent 原地复活<br/>保留同一 identity·溯源连续]
+    A2 -->|否| FW[新 identity<br/>纯 W1 替换]
+    IP --> REC[agents.Recover 装入认知检查点]
+    FW --> REC
+    REC --> CLEAR[ClearSnapshot·消费快照]
+    CLEAR --> LE[租约过期→任务 READY<br/>新 Agent 从检查点续跑]
 ```
 
+### 重启用到的真实细节
+
+**恢复预算是"终生累计"的，而不是"连续失败累计"。** 这一条值得单独拿出来说：
+
 ```go
-type RecoveryState struct {
-    SessionID     string
-    PendingTasks  []string    // 还没干完的活
-    LastVersion   int64       // 事件版本号
-    LastFailover  time.Time   // 上次故障转移时间
+// restarts 按 identity 终生累计，且**故意不在成功复活后清零**：
+// 预算的存在是为了阻止一个坏 Agent 无限循环，所以是"死亡总数"在消耗它，
+// 而不是"连续死亡数"。（A2 评审澄清 2026-08-22）
+if attempts >= r.policy.MaxRestarts {
+    return nil, ErrRecoveryExhausted
 }
 ```
 
-**两条路径**：有 Checkpoint 走快照恢复（秒级），没有则回退到事件回放（可能数十秒）。
+默认策略 `DefaultRestartPolicy()`：`MaxRestarts=5`，初始退避 `1s`，封顶 `30s`。一个老暴毙的 Agent，哪怕这次救回来了也照样扣预算——**成功救活不清零**。这跟"存活累计"的心智是反直觉的，但它是对的：你不想让一个病秧子靠着"每次都恰好救回来"永远刷下去。
 
-### DAG 状态转换链与谱系追踪
-
-复活过程中，Manager 通过 `DAGRuntimeManager` 跟踪 agent 的状态转换：
-
-```
-StatusRunning -> StatusDead -> StatusResurrecting -> StatusRunning
-```
-
-每次状态转换都会通过 `ares_events` 系统发出对应事件。Manager 订阅这些事件并维护**谱系追踪 (Genealogy)**：
+**原地复活 vs 完全替换（A2 仲裁）。** 如果死掉的身份 `LastSnapshot` 还在，`RestartAgent` 会**原地复活**——保留同一个 `Identity`，溯源和审计链条不断（"有状态认知复活"）；如果没有快照，就退化为**新 identity 的纯 W1 替换**：
 
 ```go
-m.eventBus.Subscribe(ares_events.TypeAgentDead, func(evt *ares_events.Event) {
-    m.recordDeath(evt)     // 记录死亡原因、时间戳
-})
-m.eventBus.Subscribe(ares_events.TypeAgentResurrected, func(evt *ares_events.Event) {
-    m.recordResurrection(evt)  // 记录复活后的新实例 ID
-})
+if _, ok := r.agents.LastSnapshot(deadAgentID); ok {
+    spec.Identity = deadAgentID // 有快照 → 原地复活保持同一 id
+}
 ```
 
-谱系数据存储在 `RuntimeManager.deathRecords` 中，可通过 `GetAgentGenealogy()` 查询，帮助排查一个 agent 的死亡-复活历史。
+**复活 spawn 永远走恢复通道。** 顶替 spawn 一律用 `SpawnForRecovery`：它**绕过人口上限配额**（一个被自我修复 spawn 拒掉的 Agent 会把任务永远晾在那），但**不绕过 Enabled 闸**。同时 `WithCognitionFactory` 会注入 A1 执行体工厂，确保顶替者是一个**真实可执行**的认知进程，而不是一个空壳（消灭 phantom）。
 
-**反思**：`EventRecovery.RecoverFromEvents()` 的事件回放用的是降级策略——如果事件损坏了某个字段，它会跳过而不是报错。这保证了"尽可能恢复"，但也可能恢复出"看起来正常但逻辑错误"的状态。比如 `PendingTasks` 里有一个任务，实际事件流里已经完成了，但因为某个事件写坏了字段，恢复出来还是待处理。Agent 会重新执行一次，可能导致重复结果。
+### 两条恢复路径，必须分清楚（重要的诚实点）
 
-目前的做法是：**宁可重复执行，不可遗漏任务**。这符合"稳健优先"的原则，但对幂等性要求高——不是所有工具都幂等。后续需要给工具加幂等标记，让恢复系统知道哪些可以安全重试、哪些必须跳过。
+| 入口 | 用途 | 说明 |
+|------|------|------|
+| `RequeueExpiredLeases()` | 租约过期 → 任务 requeue 到 READY | 第一个恢复路径：死者租约会过期，任务重新可被认领 |
+| `RecoverTaskCheckpoint()` | 顶替 agent + acquire 任务 + 装检查点 | **TEST/CHAOS-ONLY** |
+| `RecoverFromAgentDeath()` | 完整链路：requeue → 逐任务续检查点 | **TEST/CHAOS-ONLY** |
+
+代码里对后两个注释得很重：它们经由 `agents.SetCognitiveState` 装检查点、自己 acquire 任务，是**独立于生产调度器路径**（`scheduler.executeWithCandidates → taskfabric.DecodeCheckpoint → ToModelTask`）的另一套机制。**生产恢复走的是 `cmd/ares` 里的 `runKernelRecoveryLoop`**，这三兄弟只给 chaos 模拟、sandbox 测试、恢复测试用——文档里明确警告不能把它们接进生产 serve 路径。
+
+### Chaos：先砸，再验
+
+```go
+// Chaos 是故障注入 + 恢复验证 harness。
+// Recovery 证明运行时能在故障下活下来。
+// 注意：故障注入 ≠ 触发恢复——先断言"任务被晾死"，再 VerifyRecovery 断言活过来。
+func (c *Chaos) InjectFailure(ctx, agentID, failure) error     // "kill" 或 "suspend"
+func (c *Chaos) VerifyRecovery(ctx) int                        // 返回恢复的任务数
+```
+
+两种可注入的故障：`FailureKill="kill"`（硬杀，立刻移除）和 `FailureSuspend="suspend"`（软暂停，模拟挂起/卡死而非崩溃）。`InjectFailure` **不触发恢复**，`VerifyRecovery` 才触发——把"注入后任务孤立"和"验证后任务恢复"拆成两段，测试才断得干净。
 
 ---
 
-## 八、Sub Agent：简化版生命周期
+## 八、已知问题和设计缺陷
 
-Sub Agent 的设计比 Leader 简单得多：
+**1. 事件流最佳努力，内存注册表才是权威 → 跨重启重建依赖事件日志**
 
-```go
-type subAgent struct {
-    stopCh   chan struct{}   // 通知所有 goroutine 停
-    streamWg sync.WaitGroup  // 追踪活跃的流处理
-}
-```
+`Fabric.record` 失败不会破坏状态机，这是正确的取舍；但它意味着"本次进程内"看内存、"跨进程重启"必须靠事件日志（Evidence-Driven）重放。两套真相源并存，排查时要补一层对账。
 
-Executor 的重试降级逻辑是 Sub 层最值得看的部分：
+**2. 恢复预算"终生累计"的反直觉**
 
-```mermaid
-graph TB
-    LLMCALL[executeWithLLM] --> RETRY{重试循环 maxRetries=3}
-    RETRY -->|成功| VALIDATE[验证结果]
-    VALIDATE -->|通过| OK[返回结果]
-    VALIDATE -->|失败且 retryOnFail| RETRY
-    RETRY -->|全部失败| DEGRADE{是否 strictMode?}
-    DEGRADE -->|是| ERROR[返回错误]
-    DEGRADE -->|否| FALLBACK[executeByType 降级]
-    FALLBACK --> OK
-```
+成功复活不给病人清零预算（见第七节），能挡住病秧子无限刷，但代价是：一个偶发暴毙、本可养好的 Agent，会在几次"成功救活"之后照样被 `ErrRecoveryExhausted` 掐死。归零/衰减策略目前没有——是个有待开放的问题。
 
-心跳发送器用 `sync.Once` 防止重复关闭：
+**3. 原地复活的依赖链脆**
 
-```go
-func (s *heartbeatSender) Stop() {
-    s.stopOnce.Do(func() { close(s.stopCh) })
-}
-```
+`LastSnapshot` 有 → 原地复活；而快照只在 `Kill` 时捕获。如果一个 Agent 是"瞬间消失"（进程都没了，连 Kill 都没来得及跑），就没有快照，只能走新 identity 替换。这套机制目前依赖 `Kill` 先手捕获，对无法预知的硬崩溃覆盖有限。
 
-**反思**：Sub Agent 的 `executeByType` 降级是一个很粗糙的 fallback——当 LLM 调用全部失败时，根据任务类型走不同的硬编码处理逻辑。比如"分析类"任务返回空结果，"生成类"任务返回缓存版本。这个降级的质量完全取决于 task type 的枚举覆盖了多少场景。目前只覆盖了 4 种类型，很多场景的降级就是直接报错——跟没降级一样。
+**4. DAGExecution 默认关**
+
+L2 执行图是漂亮的远景，但 `Enabled=false` 意味着它现在没在生产跑。把它当已上线能力用会踩空。它是前瞻种子，不是现役主力。
+
+**5. RecoverTaskCheckpoint / RecoverFromAgentDeath 是 test/chaos-only**
+
+生产恢复是 `runKernelRecoveryLoop`。这两条路径用 `SetCognitiveState` + 自 acquire，是与生产调度器**独立**的机制，绝不能误接进生产 serve 路径，否则就跟真实调度器打架。
+
+**6. 恢复是"宁可重做，不可遗漏"**
+
+`findByCapability` 取最新死亡快照、`RecoverFromAgentDeath` 逐个续上过期任务。对着**非幂等工具**（下单、发邮件），重跑是灾难性的。恢复系统目前没有工具级幂等标记来区分"可安全重试"与"必须跳过"。
 
 ---
 
-## 九、优雅关闭：四阶段管道
+## 九、架构总结
 
-```mermaid
-graph LR
-    SIG[收到 SIGINT/SIGTERM] --> PHASES
-    subgraph PHASES[四阶段关闭]
-        P1[PhasePreShutdown<br/>资源释放<br/>关闭数据库连接]
-        P2[PhaseGraceful<br/>通知 Agent 逐步停止<br/>等待蒸馏完成]
-        P3[PhaseForce<br/>超时回退<br/>强制取消 context]
-        P4[PhaseDone<br/>清理临时文件<br/>标记关闭完成]
-    end
-    P1 -->|10秒超时| P2
-    P2 -->|超时或全部完成| P3
-    P3 -->|完成| P4
-```
+| 模式 | 解决的问题 | 不足 |
+|------|-----------|------|
+| 状态机 IDLE/RUNNING/SUSPENDED/RETIRED | 生命周期可观测、可仲裁 | SUSPENDED/Retired 边界需谨慎（Retire 不能直接对 RUNNING） |
+| Kill 先捕获快照再删注册表 | 死亡证据不丢，可原地复活 | 无法预知的硬崩溃连 Kill 都轮不到跑 |
+| Retire 清快照（终态） | 阻止旧快照被事后翻出来复活 | — |
+| 进程树纯溯源（A ≡ B ≡ C） | 父子平级，父死子不死 | 排查因果要自己看树 |
+| Spawn 发现即注执行体（CognitionFactory） | 离散的命=能力绑定 | nil 工厂产出空壳 Agent，需 `Executable()` 挡 |
+| ExperiencePrior 蒸馏先验注入 | 新 Agent 非白纸 | 先验质量决定了孵化效果 |
+| Factory 注入 + Recover 装认知 | Agent 亡，认知续 | 依赖 Kill 先手捕获快照 |
+| Recovery 终生累计预算 | 阻止坏 Agent 无限循环 | 成功救活不清零，可能误杀偶发事故 |
+| 原地复活（LastSnapshot 命中） | 溯源与审计链条连续 | 快照缺失即退化为 W1 新 id |
+| Chaos 注入 + Verify 分离 | 先证孤立、后证恢复，测试断得干净 | 仅 kill/suspend 两类故障 |
+| DAGExecution 门（默认关） | 前瞻 L2 图不冲击现役 ReAct | 未上生产，接错会踩空 |
 
-```go
-// PhaseExecutor 支持重试和指数退避
-func (e *PhaseExecutor) Execute(ctx context.Context, fn func(ctx context.Context) error) error {
-    for attempt := 0; attempt <= e.maxRetries; attempt++ {
-        if err := fn(ctx); err != nil {
-            backoff := time.Duration(1<<uint(attempt)) * time.Second
-            if e.onFailure != nil { e.onFailure(err) }
-            continue
-        }
-        break
-    }
-    if e.onComplete != nil { return e.onComplete() }
-}
-```
-
-回调注册表支持按优先级排序关闭：
-
-```go
-type RegisteredCallback struct {
-    ID       string
-    Priority int       // 数字越大越先执行
-    Fn       Callback
-    Timeout  time.Duration
-    OnError  func(error)
-}
-```
-
----
-
-## 十、Callbacks 生命周期钩子
-
-轻量级的事件钩子系统，每个 handler 独立 panic 恢复：
-
-```go
-func (r *Registry) Emit(ctx *Context) {
-    handlers := r.handlers[ctx.Event]
-    for _, h := range handlers {
-        func() {
-            defer func() {
-                if r := recover(); r != nil {
-                    log.Error("handler panicked", "event", ctx.Event)
-                }
-            }()
-            h(ctx)
-        }()
-    }
-}
-```
-
-注意这里的 `log` 不是 `slog`——它是通过 `logger.Module("runtime")` 创建的模块级 logger。Runtime 的每条日志自动带 `module=runtime`。听起来微不足道，直到凌晨三点出了问题，Runtime、Workflow、Memory、Evolution 四个子系统的日志混在一起，你盯着四行一模一样的 `slog.Info("started")`，完全不知道该看哪行。
-
-事件系统本身也有同样的问题。回放事件流时，你看到 `step.started` 和 `tool.call.completed`——但哪个模块发的？工作流引擎？运行时？插件总线？payload 里没说。所以 `Event` 现在带了 `ModuleName` 字段，`Emit()` 强制你在调用点声明身份：
-
-```go
-Emit(ctx, store, streamID, eventType, "runtime", payload)
-```
-
-在调用点强制声明来源，意味着你不可能在不表明身份的情况下发出事件。这是编译期保证，不是运行时约定。
-
-**反思**：这个系统存活得很尴尬。早期设计，用于 LLM/Agent/Tool 生命周期的事件通知。后来有了 `events.EventStore` 事件溯源系统，功能上是重叠的。之所以还没删，是因为有些地方还在用 callbacks（比如日志、指标上报），迁移成本比收益高。这就是典型的"新系统兼容旧系统"的过渡态——两个都能发出事件，但消费方不一样，排查时需要看两个地方。
-
----
-
-## 十一、已知问题和设计缺陷
-
-**1. 健康检查没有反馈回路**
-
-只负责"发现问题说一声"，不关心"问题解决了没有"。反复复活反复失败的循环无法被检测到。虽然指数退避已经实现（见第三节），降低了刷爆日志的频率，但并不能从根本上解决"反复复活反复失败"的检测问题——需要一个死亡计数器阈值 + 告警机制。
-
-**2. 事件回放完整度验证不完善**
-
-事件流有 `VerifyStreamIntegrity()` 做哈希链 + 截断检测，但仍无法保证恢复后的语义完整性。如果事件流中某个中间事件损坏了关键字段，Agent 可能带着"部分失忆"的状态复活，自己以为完成任务了，实际上没有。需要 WAL 级别的字段级完整性校验。
-
-**3. Context 脱离（蒸馏）的用户认知成本**
-
-`context.Background()` 脱离父 context 保证了蒸馏不中断，但也意味着**运维人员不知道蒸馏在跑**。缺乏一个"后台任务进度"的可见性机制。
-
-**4. Sub Agent 降级覆盖不全**
-
-`executeByType` 只有 4 种类型的降级逻辑，大部分场景的降级是直接报错，形同虚设。
-
-**5. 非幂等工具的重试风险**
-
-宁可重做不可遗漏的策略，对非幂等工具（比如下单、发邮件）是灾难性的。需要工具级幂等标记。
-
-**6. Callbacks 和 Events 双系统共存**
-
-两个都能发出事件、两个都能消费事件，但没有统一的事件模型。排查时需要翻两个地方。
-
----
-
-## 十二、架构总结
-
-| 模式 | 解决问题 | 不足 |
-|------|----------|------|
-| 复活守卫（stopped 先于 cancel） | 防止自愿停止被误判为意外死亡 | — |
-| 指数退避复活 | 降低反复复活失败的日志冲击 | 仍无死亡计数器告警 |
-| 快照优先恢复（RecoverSnapshotOrEvents） | 秒级状态恢复 > 慢速事件回放 | 快照可能过期 |
-| ExperienceCheckpoint | Workflow step 级精准续传 | 30+ 字段的心智负担 |
-| 事件完整性校验（VerifyStreamIntegrity） | 防止事件流损坏带来的静默错误 | 字段级语义校验仍缺失 |
-| 错误容忍恢复链 | 部分恢复 > 完全不恢复 | 语义完整度不可验证 |
-| 谱系追踪（Genealogy） | 可追溯死亡-复活历史 | 仅内存存储，重启丢失 |
-| 上下文脱离（Background） | 蒸馏不因请求中断而中断 | 运维不可见 |
-| 信号量并发控制 | 限制并行子任务数 | — |
-| 工厂模式 + 事件回放 | 状态重建 | 非幂等工具不安全 |
-
-最让我高兴的一次测试：开了 10 个 Agent 跑分析任务，然后手动 `kill -9` 了进程。重启后所有 Agent 自动复活，继续干活。
+最让我高兴的一次测试：通过 Chaos `InjectFailure` 杀掉一个在跑的分析 Agent，任务被晾在 READY 上，然后 `VerifyRecovery` 把它的检查点续给一个顶替者——任务照常往后跑，token 一分没多花。
 
 那一刻我知道：**钱没白花。**
 
@@ -732,24 +392,25 @@ Emit(ctx, store, streamID, eventType, "runtime", payload)
 
 | 文件 | 核心职责 |
 |------|----------|
-| `internal/ares_runtime/runtime.go` | Runtime 接口与配置定义 |
-| `internal/ares_runtime/manager.go` | 注册、启动、停止、复活守卫、指数退避复活、健康检查 |
-| `internal/ares_runtime/recovery.go` | 快照优先恢复：`RecoverSnapshotOrEvents()`（先查快照，再回退事件流） |
-| `internal/ares_runtime/checkpoint.go` | ExperienceCheckpoint：30+ 字段的工作流 step 级快照 + `CheckpointPlugin` |
-| `internal/agents/base/agent.go` | Agent 接口层级：Agent / StatefulAgent / Heartbeater（含 `Snapshot()`） |
-| `internal/agents/leader/agent.go` | Leader 编排管线 + 状态恢复 + 安全蒸馏 |
-| `internal/agents/leader/dispatcher.go` | 信号量并发分发 |
-| `internal/agents/leader/supervisor.go` | **已废弃**：心跳监控 + 故障转移 + 冷重启（仅用于测试兼容） |
-| `internal/agents/leader/checkpoint.go` | LeaderCheckpoint：PostgreSQL 持久化的 Agent 级会话 checkpoint |
-| `internal/agents/leader/event_recovery.go` | 从事件流重建 RecoveryState（事件回放降级策略） |
-| `internal/plugins/resurrection/resurrection.go` | 复活插件：替代废弃的 LeaderSupervisor，共享快照优先恢复机制 |
-| `internal/workflow/engine/dynamic_executor.go` | `ExecuteDynamicFromCheckpoint()`：基于 ExperienceCheckpoint 的 step 级续传 |
-| `internal/agents/sub/agent.go` | Sub Agent 生命周期 |
-| `internal/agents/sub/executor.go` | LLM 执行引擎（重试 + 降级） |
-| `internal/agents/sub/heartbeat.go` | 心跳发送 + sync.Once 关闭 |
-| `internal/ares_shutdown/manager.go` | 四阶段关闭（含 Graceful 和 Forceful） |
-| `internal/ares_callbacks/callbacks.go` | LLM/Agent/Tool 生命周期钩子 |
+| `internal/agentfabric/agent.go` | `Agent` 结构 + 状态 `IDLE/RUNNING/SUSPENDED/RETIRED` + `CognitiveState` + `Executable()` |
+| `internal/agentfabric/lifecycle.go` | `SpawnSpec` + `spawn/suspend/resume/retire/kill/recover` 生命周期原语 |
+| `internal/agentfabric/fabric.go` | `Fabric` 注册表、进程树（溯源）、资源配额、EventSink |
+| `internal/agentfabric/executor.go` | `Cognition` / `StepOutcome` / `CognitionFactory` / `CognitionFunc` |
+| `internal/agentfabric/l2graph.go` | `L2Graph` + router/tool/answer/root/plan 认知 + `DAGExecution` 门 |
+| `internal/agentfabric/snapshot.go` | `AgentSnapshot` + `snapshotStore` + `LastSnapshot/ClearSnapshot/FindRevivableSnapshot` |
+| `internal/aresrecovery/recovery.go` | `Recovery` + `RestartPolicy` + 恢复链路（含 test/chaos-only 路径） |
+| `internal/aresrecovery/chaos.go` | `Chaos` 故障注入（kill/suspend）+ `VerifyRecovery` |
+| `internal/taskfabric/state.go` | Task 状态（`READY/RUNNING/SUSPENDED/FAILED`…）与迁移 |
+| `cmd/ares` | `runKernelRecoveryLoop` —— 生产恢复环路 |
 
+---
 
-Agent 挂了怎么办？这是所有 Agent 框架都绕不开的问题，但很少有人认真回答。这篇文章会带你走一遍 Runtime 子系统的设计历程——从"怎么不让 Agent 
-死"到"死了怎么自己爬起来"，再到"爬起来怎么记得之前干到哪了"。你会看到复活守卫的并发陷阱、两阶段状态恢复的容错哲学、Context 脱离的蒸馏设计，以及每个方案背后的纠结和已知缺陷。适合正在做 Agent 稳定性、分布式编排、或有状态服务自动恢复的开发者阅读。
+**本系列（运行时篇）**
+
+| 章节 | 主题 |
+|------|------|
+| [01 架构总览](01-architecture-overview-deep-dive.md) | 全盘架构与设计原则 |
+| [02 Agent Harmony 协议](02-agent-harmony-protocol.md) | Agent 间通信与协作 |
+| [07 运行时与生命周期](07-runtime-lifecycle-deep-dive.md) | **本篇**：Fabric 出生/死亡/新出生 |
+| [08 事件系统](08-event-system-deep-dive.md) | 事件溯源与状态重建 |
+| [09 Arena 故障注入](09-arena-fault-injection-deep-dive.md) | 故障注入战场 |

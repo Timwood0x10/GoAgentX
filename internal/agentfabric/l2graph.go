@@ -72,6 +72,73 @@ func NewL2Graph(rootID, prompt string, params map[string]any) (*L2Graph, error) 
 // Root returns the session root node id.
 func (g *L2Graph) Root() string { return g.root }
 
+// planAgentType is the L2 capability for plan nodes (M2). Used by PlanDepth
+// to count plan nodes and by AddToolNode to stamp the right AgentType.
+const planAgentType = "ares/plan"
+
+// PlanDepth returns the current plan-tool growth depth of the L2 graph
+// (M2-④: 生长深度上界护栏). Depth is the number of plan nodes in the graph
+// minus the root (which is an admission node, not a plan node). The planner
+// reads this to enforce the growth-depth upper bound.
+func (g *L2Graph) PlanDepth() int {
+	g.mu.RLock()
+	defer g.mu.RUnlock()
+	steps := g.dag.StepIndex()
+	depth := 0
+	for _, s := range steps {
+		if s.AgentType == planAgentType {
+			depth++
+		}
+	}
+	return depth
+}
+
+// Predecessor returns the direct predecessor node ID of the given node, or
+// "" when the node has no predecessor or is not in the graph. The planner
+// uses this to walk the dependency path when assembling LLM context from
+// predecessor outputs.
+func (g *L2Graph) Predecessor(nodeID string) string {
+	g.mu.RLock()
+	defer g.mu.RUnlock()
+	steps := g.dag.StepIndex()
+	s, ok := steps[nodeID]
+	if !ok || len(s.DependsOn) == 0 {
+		return ""
+	}
+	return s.DependsOn[0]
+}
+
+// HasNode reports whether the given node ID exists in the L2 graph. The
+// planner uses this to decide whether to add the current plan node before
+// growing tool nodes that depend on it.
+func (g *L2Graph) HasNode(nodeID string) bool {
+	g.mu.RLock()
+	defer g.mu.RUnlock()
+	steps := g.dag.StepIndex()
+	_, ok := steps[nodeID]
+	return ok
+}
+
+// CountToolClass counts how many L2 tool-instance nodes of the given tool
+// currently exist in the graph. The planner uses this to enforce the L1 budget
+// constraint (M5: budget=N caps instances per session).
+//
+// One tool name is one ToolClass: the class shape is derived from the tool's
+// DECLARED schema (resources.ToolArgShape), which is a property of the tool,
+// not of any single call. Counting by capability is therefore exact — no need
+// to re-derive a per-node shape.
+func (g *L2Graph) CountToolClass(toolName string) int {
+	g.mu.RLock()
+	defer g.mu.RUnlock()
+	count := 0
+	for _, s := range g.dag.StepIndex() {
+		if s.AgentType == "tool/"+toolName {
+			count++
+		}
+	}
+	return count
+}
+
 // DAG returns the underlying execution graph. Callers must treat it as
 // read-only unless initiated through graph mutations; the returned graph is
 // the live object so mutation events propagate.
@@ -86,6 +153,15 @@ func (g *L2Graph) DAG() *engine.MutableDAG {
 // cognition. Only argMetadataPrefix-stripped keys are passed to CallTool;
 // everything else is ignored, so envelope plumbing never reaches the tool.
 const argMetadataPrefix = "arg."
+
+// sessionMetadataKey rides Step.Metadata UNPREFIXED because it is envelope
+// plumbing, not a tool argument: planprojection.parseSessionID reads this
+// exact key to populate Task.SessionID, and argsFromPayload ignores every
+// unprefixed key. Prefixing it would break both ends at once — the session id
+// would never reach the envelope (so the next plan quantum could not find its
+// graph) and it WOULD reach CallTool as an undeclared argument, which a
+// strict-schema tool (additionalProperties:false) rejects.
+const sessionMetadataKey = "session_id"
 
 // AddToolNode grows a tool-instance node into the session graph in ONE AddNode
 // call, with the predecessor already in step DependsOn (the session root, or
@@ -115,9 +191,12 @@ func (g *L2Graph) AddToolNode(ctx context.Context, id, tool string, args map[str
 	defer g.mu.Unlock()
 
 	var agentType string
-	if tool == "answer" {
+	switch tool {
+	case "answer":
 		agentType = "ares/answer"
-	} else {
+	case "plan":
+		agentType = planAgentType
+	default:
 		agentType = "tool/" + tool
 	}
 	step := &engine.Step{
@@ -171,8 +250,9 @@ func (g DAGExecution) Select(chat, router Cognition) Cognition {
 // buildQuantumStep re-wraps Result into the envelope and the dispatcher reads
 // it from there. The L2 graph holds topology + Metadata (the plan) only.
 type routerCognition struct {
-	binder ToolBinder
-	logger *slog.Logger
+	binder  ToolBinder
+	planner Cognition // optional: ares/plan dispatch body (M2)
+	logger  *slog.Logger
 }
 
 var _ Cognition = (*routerCognition)(nil)
@@ -180,8 +260,19 @@ var _ Cognition = (*routerCognition)(nil)
 // NewRouterCognition builds the capability-dispatch Cognition for an L2
 // session agent. binder executes tool nodes (may be nil only when the agent
 // declares no tool capabilities); logger is shared by the tool/answer bodies.
+// planner is the optional ares/plan dispatch body (M2: the plannerCognition
+// that grows the L2 graph); when nil, an ares/plan task returns an error
+// instead of silently no-op'ing.
 func NewRouterCognition(binder ToolBinder, logger *slog.Logger) Cognition {
 	return &routerCognition{binder: binder, logger: logger}
+}
+
+// NewRouterCognitionWithPlanner builds a router that also dispatches ares/plan
+// to the given planner Cognition. This is the M2 production constructor: the
+// planner carries session-scoped dependencies (L2 graph registry, fabric
+// reader, LLM client) that the router itself does not own.
+func NewRouterCognitionWithPlanner(binder ToolBinder, planner Cognition, logger *slog.Logger) Cognition {
+	return &routerCognition{binder: binder, planner: planner, logger: logger}
 }
 
 // ExecuteStep routes by task.AgentType (the node's capability). Tool nodes
@@ -198,6 +289,16 @@ func (r *routerCognition) ExecuteStep(ctx context.Context, task *models.Task) (*
 		return (&toolCognition{tool: tool, binder: r.binder, logger: r.logger}).ExecuteStep(ctx, task)
 	case name == "ares/answer":
 		return (&answerCognition{logger: r.logger}).ExecuteStep(ctx, task)
+	case name == "ares/plan":
+		// The planner cognition is injected by the session wiring (it
+		// carries the L2 graph + fabric handles); the router does not
+		// construct it because it needs session-scoped dependencies.
+		// If the router received a planner, dispatch to it; otherwise
+		// this is a wiring error (the peer was spawned without a planner).
+		if r.planner != nil {
+			return r.planner.ExecuteStep(ctx, task)
+		}
+		return nil, fmt.Errorf("agentfabric: plan node %q has no planner cognition", name)
 	case name == "ares/root":
 		return (&rootCognition{}).ExecuteStep(ctx, task)
 	default:
@@ -319,6 +420,10 @@ func argsMetadata(args map[string]any) map[string]string {
 	}
 	md := make(map[string]string, len(args))
 	for k, v := range args {
+		if k == sessionMetadataKey {
+			md[k] = stringify(v)
+			continue
+		}
 		md[argMetadataPrefix+k] = stringify(v)
 	}
 	return md

@@ -1,491 +1,672 @@
 # ares Architecture Deep Dive (XV): MCP Integration — Teaching Agents to Use Tools (0.3.x)
 
-I broke the tool system on a Tuesday afternoon.
+The old way of giving an Agent a tool went like this: write a Go struct that implements the `core.Tool` interface, register it into the `Registry`, done. Every new tool meant writing code, compiling, and deploying again.
 
-It was supposed to be a simple demo. I'd written a custom tool that talked to a code analysis server — spawn a process, send a JSON request, parse the response. Worked perfectly in my dev environment. Then someone else tried to run it on their machine and got nothing. No error, no output, just a silent failure. Turns out the tool was hardcoded to spawn a binary at an absolute path that only existed on my laptop.
+Then someone asked: "what if our users want to plug in *their own* tools without you writing any code?" The architecture had never considered "tools that come from outside."
 
-That was the moment I realized: **we had a tool registration problem, not a tool execution problem.** Every tool was a bespoke integration. Every tool author had to know the internals of our registry. Every deployment was a game of "did you install the right binary?" We needed a protocol — something that let tools describe themselves, discover themselves, and connect without the framework knowing the details.
+This article, like the rest of this series, only talks about what I actually **read in `internal/ares_mcp/` and can show you source for**. Anything that doesn't line up with the code, I cut it or mark it （待核实） — I don't make things up.
 
-That protocol already existed. It's called MCP.
+## One: The Tool-Registration Problem
 
----
-
-## The Problem: Brittle Tools Everywhere
-
-Before MCP, registering a tool in ares looked like this:
+Tools were too tightly coupled to the framework. Everything was decided at compile time. Take `Calculator` from `internal/tools/resources/builtin/math/calculator.go` — it's pure Go:
 
 ```go
-// The old way: manual, fragile, coupled
-registry.Register("codegraph_analyze", &CodeGraphTool{
-    binaryPath: "/usr/local/bin/codegraph-server",  // breaks on every machine
-    timeout:    30 * time.Second,
-})
+// internal/tools/resources/builtin/math/calculator.go
+type Calculator struct {
+	*base.BaseTool
+	compiled map[string]*vm.Program
+	mu       sync.RWMutex // guards the compiled cache
+}
+
+func NewCalculator() *Calculator {
+	params := &core.ParameterSchema{ /* ... */ }
+	return &Calculator{
+		BaseTool: base.NewBaseToolWithCapabilities("calculator",
+			"Evaluate mathematical expressions...",
+			core.CategoryCore, []core.Capability{core.CapabilityMath}, params),
+		compiled: make(map[string]*vm.Program),
+	}
+}
+
+func (t *Calculator) Execute(ctx context.Context, params map[string]interface{}) (core.Result, error) {
+	expression, ok := params["expression"].(string)
+	if !ok || expression == "" {
+		return core.NewErrorResult("expression is required"), nil
+	}
+	// evaluate via the expr library ...
+	return core.NewResult(true, map[string]interface{}{"result": result}), nil
+}
 ```
 
-Every tool was a Go struct that implemented the `core.Tool` interface. Every tool author had to import our internal packages, understand our parameter schema format, and handle their own process management. If you wanted to add a tool written in Python or Rust? Good luck. You'd be writing a Go wrapper that spawned a subprocess and spoke some ad-hoc JSON protocol over stdin.
+These are the exact type "sockets" the whole MCP integration plugs into:
 
-The worst part was discovery. You couldn't ask a running tool server "what tools do you have?" You had to read the documentation, hope it was up to date, and manually wire everything together. Tools were static. Configuration was manual. And every new integration meant touching the framework's source code.
+- `core.Tool` / `core.Result` / `core.ParameterSchema` (`internal/tools/resources/core/`)
+- `base.NewBaseToolWithCapabilities` (`internal/tools/resources/base/base_tool.go`)
+- `core.Registry`'s `Register` / `Unregister` / `List` / `Get`
 
-We needed tools that could **announce themselves**.
+Tools defined, implemented, and registered all in Go. Want a new tool? Write code, compile, deploy. Want an external process to expose its own tools? Not possible back then.
+
+Flip the question around and the answer is clear: instead of building a custom wheel inside the framework, use a **standard protocol** by which an external process declares what tools it has. That protocol is MCP (Model Context Protocol).
 
 ---
 
-## MCP: The Protocol That Describes Tools
+## Two: MCP — a practical case study in JSON-RPC 2.0
 
-The Model Context Protocol is a JSON-RPC 2.0 specification for tool discovery and invocation. The core idea is simple: a server exposes tools with JSON Schema definitions, and a client discovers and calls them over a standard wire format.
+The core idea of MCP is simple: **an external process declares what tools it has, and the framework discovers and invokes them over a standard protocol.**
 
-The handshake looks like this:
+The protocol is JSON-RPC 2.0 in three steps:
 
 ```mermaid
 sequenceDiagram
-    participant C as ares (Client)
-    participant S as MCP Server
+    participant Client as MCP Client (ares)
+    participant Server as MCP Server (external process)
 
-    C->>S: initialize (protocol version, capabilities)
-    S-->>C: initialize result (server info, capabilities)
-    C->>S: notifications/initialized
-    C->>S: tools/list
-    S-->>C: tools (name, description, inputSchema)
-    C->>S: tools/call (name, arguments)
-    S-->>C: tool result (content blocks, isError flag)
+    Note over Client,Server: Handshake
+    Client->>Server: initialize {protocolVersion, clientInfo, capabilities}
+    Server-->>Client: {serverInfo, capabilities}
+    Client->>Server: notifications/initialized
+
+    Note over Client,Server: Tool discovery
+    Client->>Server: tools/list
+    Server-->>Client: {tools: [{name, description, inputSchema}, ...]}
+
+    Note over Client,Server: Tool invocation
+    Client->>Server: tools/call {name, arguments}
+    Server-->>Client: {content: [{type:"text", text:"..."}], isError:false}
 ```
 
-Three things make this powerful:
-
-1. **Self-describing tools** — the server provides JSON Schema for each tool's parameters. No guessing, no documentation rot.
-2. **Transport-agnostic** — the protocol doesn't care if you're talking over stdin/stdout or HTTP. Same messages, different wires.
-3. **Dynamic discovery** — the server can notify the client when tools change. No restart required.
-
-In ares, we implement this in `internal/ares_mcp/client.go`. The `MCPClient` struct manages a single connection to one MCP server. The `Connect` method performs the full handshake:
+In `internal/ares_mcp/jsonrpc.go` the message model looks like this:
 
 ```go
-func (c *MCPClient) Connect(ctx context.Context) error {
-    if err := c.transport.Start(ctx); err != nil {
-        return fmt.Errorf("start transport: %w", err)
-    }
-    c.receiveLoop.Go(c.runReceiveLoop)
-    if err := c.initialize(ctx); err != nil {
-        return fmt.Errorf("initialize: %w", err)
-    }
-    if _, err := c.ListTools(ctx); err != nil {
-        return fmt.Errorf("list tools: %w", err)
-    }
-    return nil
+type JSONRPCMessage struct {
+	JSONRPC string          `json:"jsonrpc"`
+	ID      *int64          `json:"id,omitempty"`   // nil = notification
+	Method  string          `json:"method,omitempty"`
+	Params  json.RawMessage `json:"params,omitempty"`
+	Result  json.RawMessage `json:"result,omitempty"`
+	Error   *JSONRPCError   `json:"error,omitempty"`
 }
 ```
 
-Start the transport, launch the background receive loop, shake hands, discover tools. Four steps, no ambiguity.
+The presence of `ID` decides the message type: with `ID` it's a request/response, without `ID` it's a notification. The helper predicates `IsRequest` / `IsResponse` / `IsNotification` / `IsError` all rely on exactly that.
+
+`MCPClient.receiveLoop` dispatches incoming messages by type — responses go to their pending channel, notifications are handled asynchronously:
+
+```go
+// internal/ares_mcp/client.go
+func (c *MCPClient) receiveLoop() error {
+	for {
+		msg, err := c.transport.Receive(c.ctx)
+		// ...
+		switch {
+		case IsResponse(msg) || IsError(msg):
+			c.dispatchResponse(msg)
+		case IsNotification(msg):
+			// each notification runs in its own goroutine, capped by notifySlots (max 8)
+			select {
+			case c.notifySlots <- struct{}{}:
+				c.eg.Go(func() error {
+					defer func() { <-c.notifySlots }()
+					c.handleNotification(msg)
+					return nil
+				})
+			default:
+				// slots full: drop the notification, so a flooded server can't exhaust our memory
+			}
+		}
+	}
+}
+```
+
+"JSON-RPC is async by nature" isn't hype here: `call` generates an id via `IDGenerator` (atomic counter), stores a pending channel in a map keyed by id, and `select`s on a timeout context. The default timeout is `defaultClientTimeout = 30 * time.Second`, overridable per server in config.
+
+One detail in `dispatchResponse` is worth mentioning: it delivers the response to the pending channel while holding the lock and relies on `delete(pending, id)` to avoid racing `Close()` — that's the crux of the thread-safety.
 
 ---
 
-## Two Transports, One Interface
+## Three: Transport layer — two paths, one interface
 
-The MCP spec defines two transport mechanisms. We implement both, behind a single `Transport` interface in `internal/ares_mcp/transport.go`:
+MCP doesn't care how a message travels — only the JSON-RPC wire format. Moving bytes from A to B is the Transport's job. `internal/ares_mcp/transport.go` defines a 4-method interface:
 
 ```go
 type Transport interface {
-    Start(ctx context.Context) error
-    Send(ctx context.Context, msg *JSONRPCMessage) error
-    Receive(ctx context.Context) (*JSONRPCMessage, error)
-    Close() error
+	Start(ctx context.Context) error
+	Send(ctx context.Context, msg *JSONRPCMessage) error
+	Receive(ctx context.Context) (*JSONRPCMessage, error)
+	Close() error
 }
 ```
 
-**Stdio transport** (`internal/ares_mcp/transport_stdio.go`) launches a subprocess and communicates over newline-delimited JSON on stdin/stdout. This is the workhorse for local tools — the framework spawns the tool server as a child process, and they talk through pipes. The tricky part is making `Receive` interruptible: the underlying `bufio.Scanner.Scan()` blocks, so we run it in a goroutine and use a channel to shuttle messages back. When the context is cancelled, we close the stdout pipe to unblock the scanner.
+```mermaid
+graph TB
+    subgraph "Transport interface"
+        T[Transport]
+        T --> Start[Start establish connection]
+        T --> Send[Send message]
+        T --> Receive[Receive message]
+        T --> Close[Close connection]
+    end
 
-**SSE transport** (`internal/ares_mcp/transport_sse.go`) communicates over HTTP. The receive path opens a long-lived Server-Sent Events stream via GET; the send path POSTs JSON-RPC messages to a URL the server provides dynamically through an `endpoint` event. This is for remote tool servers — anything running on another machine, in a container, or behind a network boundary.
+    subgraph "StdioTransport"
+        STD[subprocess stdin/stdout]
+        STD --> CMD[exec.CommandContext]
+        STD --> SCAN[bufio.Scanner 1MB buffer]
+        STD --> ERR[stderr drained to Debug log]
+    end
 
-The factory at the bottom of `client.go` selects between them based on configuration:
+    subgraph "SSETransport"
+        SSE[HTTP SSE]
+        SSE --> GET[GET /sse receive stream]
+        SSE --> POST[POST /message send]
+        SSE --> EP[endpoint event updates POST URL]
+    end
+
+    T -.implements.-> STD
+    T -.implements.-> SSE
+```
+
+### 3.1 Stdio: the standard posture for local processes
+
+An external tool starts as a subprocess; ares writes requests to stdin and reads responses from stdout:
 
 ```go
-func NewTransportFromConfig(config TransportConfig) (Transport, error) {
-    switch config.Type {
-    case "stdio":
-        return NewStdioTransport(*config.Stdio), nil
-    case "sse":
-        return NewSSETransport(*config.SSE), nil
-    default:
-        return nil, fmt.Errorf("unsupported transport type: %s", config.Type)
-    }
+// internal/ares_mcp/transport_stdio.go
+type StdioConfig struct {
+	Command string            `yaml:"command" json:"command"`
+	Args    []string          `yaml:"args" json:"args"`
+	Env     map[string]string `yaml:"env" json:"env"`
+	WorkDir string            `yaml:"work_dir" json:"work_dir"`
 }
 ```
 
-**Honest reflection**: We considered a third transport — gRPC — because it's faster and has better tooling. We decided against it because MCP's spec only defines stdio and SSE, and we didn't want to maintain a non-standard extension. If the spec adds gRPC later, we'll add it. For now, two transports cover the real use cases: local processes and remote HTTP servers.
+`Start` launches the process with `exec.CommandContext`. A trap I hit: `bufio.Scanner` defaults to a 64KB buffer, and a big schema (e.g. a server with dozens of tools) trips `token too long`. The fix is to bump the buffer:
+
+```go
+t.stdout = bufio.NewScanner(stdoutPipe)
+t.stdout.Buffer(make([]byte, 0, stdoutBufferSize), stdoutBufferSize) // stdoutBufferSize = 1MB
+```
+
+`Send` has a write timeout (`stdioWriteTimeout = 10s`): if the subprocess stops reading stdin, `SetWriteDeadline` breaks the write — otherwise it would hold `t.mu` forever and even block `Close`. stderr is drained in a background goroutine to the Debug log, which has saved me more than once: when a user says "the tool doesn't work," the stderr log reveals whether it's a permission problem or a missing dependency.
+
+### 3.2 SSE: an HTTP story for remote servers
+
+Some MCP servers are remote web services; that's SSE (Server-Sent Events):
+
+```go
+// internal/ares_mcp/transport_sse.go
+type SSEConfig struct {
+	URL     string            `yaml:"url" json:"url"`
+	Headers map[string]string `yaml:"headers" json:"headers"`
+	Timeout time.Duration     `yaml:"timeout" json:"timeout"`
+}
+```
+
+Receiving is a long-lived HTTP GET (the SSE stream); sending is HTTP POST. The server can dynamically tell the client via an `event: endpoint` event "POST to this URL from now on." There's a **security boundary already in place**: `isSameHostEndpoint` requires the endpoint to share the SSE URL's host, preventing a malicious server from redirecting POSTs to an internal address (SSRF):
+
+```go
+func (t *SSETransport) handleSSEEvent(ctx context.Context, eventType, data string) {
+	switch eventType {
+	case sseEventTypeEndpoint:
+		endpoint := strings.TrimSpace(data)
+		if !t.isSameHostEndpoint(endpoint) {
+			log.Warn("mcp: rejecting endpoint URL with mismatched host (SSRF protection)", ...)
+			return
+		}
+		t.mu.Lock()
+		t.postURL = endpoint
+		t.mu.Unlock()
+	case sseEventTypeMessage:
+		var msg JSONRPCMessage
+		json.Unmarshal([]byte(data), &msg)
+		t.msgCh <- &msg
+	}
+}
+```
+
+> Honest correction: an earlier draft of this article listed "SSE POST URL has no relative-path handling" as technical debt — **that's been fixed**. Relative paths resolve against the base URL and are always allowed; absolute URLs must share the host.
 
 ---
 
-## Discovery: Finding Tool Servers in the Wild
+## Four: Service discovery — an optional helper that finds servers
 
-The Transport layer handles communication. The Manager handles connections. But there's a question neither answers: **which servers should we connect to?**
+**First, the bottom line: the Discovery subsystem exists but is independent and opt-in, and it is not currently wired to auto-connect into the MCP manager.** You'll see （待核实） where I stopped being able to verify the flow.
 
-Before the Discovery subsystem, every MCP server had to be manually configured in YAML. If a user installed a new MCP tool — say, a code analysis server written in Rust — they had to know the exact command, arguments, and transport type before it would appear in ares. New tool adoption required manual scaffolding.
+Transport handles communication and `MCPManager` handles connections, but neither answers the question: **which servers should we connect to?** Before Discovery, every MCP server had to be written manually in config.
 
-The Discovery subsystem changed this. It's a layered system that automatically finds MCP tool servers from multiple sources, normalizes identities, runs health checks, and feeds results into the framework — no YAML required.
+The Discovery subsystem (`internal/discovery/`) can discover MCP servers from several sources, merge them by identity, health-check them, and emit events. Layout:
 
-### Layered Architecture
+- `internal/discovery/`: engine, identity normalization, health checks, events, store
+- `internal/discovery/providers/`: filesystem scanners, binary probe
+- `api/discovery/`: a thin type-alias proxy for external callers (the files `discovery.go`/`doc.go` exist in the repo)
 
-```
-api/discovery/              → public API (type aliases, no duplication)
-internal/discovery/         → engine, identity, health, events, store
-internal/discovery/providers/ → filesystem scanner, binary probe
-```
+### The Provider system
 
-The public layer at `api/discovery` exports type aliases and thin delegation wrappers — a stable API contract for external consumers with zero code duplication. The internal layer below it does the real work.
-
-### Provider System
-
-Discovery is powered by providers. Each implements a simple interface:
+Every Provider implements a small interface:
 
 ```go
 type DiscoveryProvider interface {
-    Name() string
-    Confidence() int
-    Discover(ctx context.Context) ([]DiscoveryRecord, error)
+	Name() string
+	Confidence() Confidence
+	Discover(ctx context.Context) ([]DiscoveryRecord, error)
 }
 ```
 
-The `Confidence` value tells the engine how much to trust each source — explicit config files score higher than heuristic scans.
-
-**Filesystem provider** (`internal/discovery/providers/filesystem.go`) scans well-known config file locations for MCP server definitions:
-
-- **Claude**: `.claude/settings.json` with `mcpServers` key
-- **Cursor**: `.cursor/mcp.json`
-- **VS Code**: `.vscode/mcp.json`
-- **ARES**: `.codegraph/mcp-servers.json`
-
-Each format has a different schema, but the provider normalizes everything into a common `DiscoveryRecord`. Metadata like `config_name` is preserved across all formats so the framework can trace where each tool came from.
-
-**Binary probe provider** (`internal/discovery/providers/binary.go`) scans `$PATH` for known MCP binaries. It runs each candidate with `--help` and looks for MCP-specific keywords in the output. Matches get `ConfidenceMedium` — likely MCP tools, but less certain than an explicit config file.
-
-### Concurrent Discovery
-
-Providers run in parallel via `errgroup`. One failure doesn't block the others:
+Confidence is a `Confidence` type (in `discovery.go`):
 
 ```go
-g, gctx := errgroup.WithContext(ctx)
-for i, p := range providers {
-    idx, prov := i, p
-    g.Go(func() error {
-        records, err := prov.Discover(gctx)
-        if err != nil {
-            slog.Warn("discovery: provider failed",
-                "provider", prov.Name(), "error", err)
-            return nil
-        }
-        results[idx] = providerResult{records: records, name: prov.Name()}
-        return nil
-    })
-}
-_ = g.Wait()
+ConfidenceLow    = 60   // PATH scan, broadcast
+ConfidenceMedium = 80   // HTTP discovery, mDNS
+ConfidenceHigh   = 95   // Claude, Cursor, VSCode configs
+ConfidenceMax    = 100  // ARES own registry, verified
 ```
 
-A slow binary scan doesn't delay filesystem discovery. Results are merged after all providers complete — the engine waits for everyone before proceeding.
+**Filesystem Provider** (`providers/filesystem.go`) scans these actual paths:
 
-### Identity Normalization and Merging
+- **ARES**: `~/.ares/mcp-registry.json`, format `{"servers": [...]}`
+- **Claude**: `~/.claude.json` and project-local `.claude/settings.json`
+- **Cursor**: `~/.cursor/mcp.json`
+- **VS Code**: project-local `.vscode/mcp.json`
 
-The same MCP server might be discovered by multiple providers — Claude's config lists `codegraph`, VS Code's config lists it too, and the binary probe finds it in PATH. The engine merges duplicates into a single `DiscoveredService` through confidence-based rules:
+> Correction: an earlier draft said ARES scans `.codegraph/mcp-servers.json`; the real code is `~/.ares/mcp-registry.json`. The schemas differ, but each provider normalizes its findings into a `DiscoveryRecord`.
 
-- Higher-confidence records take precedence for connection details
-- `bestEndpoint()` selects the endpoint from the highest-confidence record
-- Known launchers (`uvx`, `npx`, `bunx`, `pipx`) are preserved as part of the endpoint identity
-- Tags and metadata are merged from all contributing records
+**Binary probe Provider** (`providers/binary.go`) does not scan whole PATH. It uses a `knownMCPBinaries` allowlist (`mcp-server-filesystem`, `mcp-server-git`, `mcp-server-postgres`, etc.), probes matched names with `--help`, and checks for MCP keywords. Anything outside the allowlist is never touched; matching uses a `knownMCPBinariesSet` keyed on `filepath.Base`.
 
-The `normalizeEndpoint` function extracts a canonical identity from raw endpoints:
+### Concurrent discovery and merging
 
-```go
-var knownLaunchers = map[string]bool{
-    "uvx": true, "npx": true, "bunx": true, "pipx": true,
-}
+`Engine.DiscoverNow` runs all providers concurrently via errgroup; one failure never fails the whole group (it logs a warning and returns nil). Then it merges via `mergeRecords`, diffs against the store with `diffServices`, dispatches `EventServiceAdded/Updated/Removed`, and finally emits `EventDiscoveryComplete`.
 
-func normalizeEndpoint(endpoint string) string {
-    // Extract binary name from path
-    // Preserve known launcher prefixes
-    // Strip everything else
-}
-```
+Passive registration also exists: `Engine.Register(ctx, RegisterRequest)` builds a `ConfidenceMax` `DiscoveredService` (`Healthy: false` — health is a separate step) and emits `EventServiceAdded`.
 
-The `hasChanged` method detects meaningful differences — endpoint changes, tag additions, config name updates — so the engine emits targeted events instead of full resyncs.
+### Health checks
 
-### Health Verification
+`MCPHealthChecker` (`internal/discovery/health.go`) runs `initialize → list_tools → close` against each service:
 
-Discovery tells you a server *might* exist. Health checks tell you it's actually running. The `MCPHealthChecker` connects to each discovered service and calls `list_tools`:
+- **URL endpoints**: `api_mcp.ConnectSSE`
+- **Binary endpoints**: `api_mcp.ConnectStdio`
 
-- **Binary endpoints**: connects via stdio (`ConnectStdio`)
-- **URL endpoints**: connects via SSE (`ConnectSSE`)
+But not every URL/binary can be probed. URLs only allow http/https (SSRF protection); binaries only allow paths under `allowedMCPBinaryDirs` (`/usr/local/bin`, `/usr/bin`, `/opt/homebrew/bin`) that still resolve inside the allowlist after symlink resolution.
 
-If the probe fails, the service is marked `Healthy: false`. Services can be re-probed at any time — useful for dashboard refresh cycles or recovery attempts.
+### Events and the store
 
-### Event System
+Events are dispatched through `EventHandler` / `EventHandlerFunc`. Services live in a `ServiceStore` (default `MemoryStore`). The engine is clean — it doesn't care who's listening.
 
-The discovery lifecycle emits typed events that the rest of the framework subscribes to:
+### Where I had to stop verifying（待核实）
 
-```go
-const (
-    EventServiceAdded      EventType = "service.added"
-    EventServiceRemoved    EventType = "service.removed"
-    EventServiceUpdated    EventType = "service.updated"
-    EventHealthChanged     EventType = "health.changed"
-    EventDiscoveryComplete EventType = "discovery.complete"
-)
-```
+The older draft drew a full flow where "Manager listens to `EventServiceAdded` → auto-connects the discovered server → tools land in the Registry." **I could not find that wiring in the code.** The real `ProvideDiscovery` (`internal/ares_bootstrap/provide_discovery.go`) does:
 
-Any component can subscribe via the `EventHandler` interface:
+- only build the engine if discovery is enabled in config, otherwise returns `ErrDiscoveryDisabled`
+- adds the ARES/Claude/Cursor/VSCode/Binary providers
+- `eng.StartAutoDiscovery(ctx, interval)` (default 5 minutes)
+- forwards events **to the shared `ares_events.EventStore`** under the `"discovery"` stream — and nothing more
 
-```go
-type EventHandler interface {
-    HandleDiscoveryEvent(event Event)
-}
-```
-
-The dashboard uses these events to update its UI in real time. The MCP Manager listens for `EventServiceAdded` and automatically connects to newly discovered servers. The event system decouples discovery from consumption — the engine doesn't know or care who's listening.
-
-### Passive Registration and ServiceStore
-
-Not all servers come from automated discovery. Some are explicit — the user knows the URL or command and wants a permanent entry. The `Register` method handles this:
-
-```go
-func (e *Engine) Register(ctx context.Context, req RegisterRequest) error {
-    // Creates a DiscoveredService with ConfidenceMax
-    // Sets Healthy: false (separate health check step)
-    // Emits EventServiceAdded
-}
-```
-
-All discovered and registered services live in a `ServiceStore`. The default `MemoryStore` uses proper deep copy to prevent data races. The `ServiceStore` interface is designed to be swappable — a persistent backend (SQLite, Bolt, JSON file) can be plugged in without changing the engine.
-
-### The Full Flow
-
-```mermaid
-graph LR
-    A[Filesystem Provider] --> D[Merge by Identity]
-    B[Binary Probe Provider] --> D
-    D --> E[Normalize Endpoints]
-    E --> F[Health Check All Services]
-    F --> G[Emit Discovery Events]
-    G --> H[Store in ServiceStore]
-    H --> I[MCP Manager connects<br>to healthy servers]
-    I --> J[Tools appear in Registry]
-```
-
-Discovery doesn't replace the MCP Manager. It feeds it. Discovery finds the servers; the Manager connects to them; the Bridge wraps their tools; the Registry serves them to agents. Each layer has a single responsibility, and they compose cleanly.
+In other words: **discovered services do not currently turn into connected MCP servers / tools automatically.** The engine finds "probably-present" services, but the bridge to the MCP manager isn't wired yet（待核实）. So the last two lines of the old flowchart — `MCP Manager connects healthy services → tools appear in the Registry` — should be struck.
 
 ---
 
-## The Manager: Juggling Multiple Servers
+## Five: MCPManager — the lifeline of many servers
 
-A single MCP client is useful. But in practice, you want to connect to multiple tool servers simultaneously — one for code analysis, one for database access, one for file operations. That's where `MCPManager` comes in.
-
-The manager lives in `internal/ares_mcp/manager.go`. It holds a map of named clients, each wrapped in a `managedClient` struct that tracks connection state, error history, and registered tool names:
+A single `MCPClient` connects to one server. Managing connections, tool registration/unregistration, and hot reload across many servers is `MCPManager` (`internal/ares_mcp/manager.go`):
 
 ```go
 type MCPManager struct {
-    clients  map[string]*managedClient
-    registry *core.Registry
-    mu       sync.RWMutex
-    config   *MCPManagerConfig
+	clients  map[string]*managedClient
+	registry *core.Registry       // tool registry
+	mu       sync.RWMutex
+	config   *MCPManagerConfig
+	toolChangeHandler func()     // callback invoked after listChanged (see below)
 }
 
 type managedClient struct {
-    client  *MCPClient
-    config  MCPServerConfig
-    connAt  time.Time
-    lastErr error
-    tools   []string
+	client  *MCPClient
+	config  MCPServerConfig
+	connAt  time.Time
+	lastErr error
+	tools   []string  // registered tool names
 }
 ```
 
-The `Start` method iterates the configuration and connects to every server marked `Enabled && AutoStart`. Each connection follows the same pattern: create transport, create client, handshake, register tools. If a server fails to connect, we log the error and move on to the next one. **One bad server doesn't block the others.**
+`NewMCPManager(config, registry)` requires a non-nil `registry` — that `core.Registry` is the final home of MCP tools.
 
-When a server sends a `notifications/tools/list_changed` notification — meaning it has added, removed, or modified tools — the client's `onChange` callback fires, which calls `RefreshTools` on the manager. This unregisters the old tools from the shared registry, re-discovers via `ListTools`, and re-registers the new set. The entire process is transparent to the rest of the framework.
+The core flow:
 
-The configuration is declarative:
-
-```yaml
-mcp:
-  servers:
-    - name: codegraph
-      enabled: true
-      auto_start: true
-      timeout: 30
-      transport:
-        type: stdio
-        stdio:
-          command: codegraph-mcp-server
-          args: ["serve"]
-          work_dir: /path/to/project
-    - name: remote-db
-      enabled: true
-      auto_start: true
-      transport:
-        type: sse
-        sse:
-          url: http://db-tools.internal:8080/mcp
+```mermaid
+graph TB
+    START[Manager.Start] --> LOOP{iterate config.Servers}
+    LOOP -->|Enabled && AutoStart| CONN[ConnectServer]
+    LOOP -->|otherwise| SKIP[skip]
+    CONN --> TRANSPORT[NewTransportFromConfig]
+    TRANSPORT --> CLIENT[NewMCPClient + Connect]
+    CLIENT --> HANDSHAKE[initialize handshake]
+    HANDSHAKE --> LISTTOOLS[ListTools discover]
+    LISTTOOLS --> REGISTER[registerTools]
+    subgraph "tool registration"
+        REGISTER --> WRAP[NewMCPTool wraps to core.Tool]
+        WRAP --> SCHEMA[ConvertJSONSchema]
+        SCHEMA --> REG[registry.Register]
+    end
 ```
 
-Validation in `internal/ares_config/config.go` catches configuration errors early: duplicate server names, missing commands for stdio, missing URLs for SSE, invalid transport types. Fail fast, fail loud.
+### 5.1 Connecting — and how tools get into the Registry
+
+`ConnectServer` is the entry point for a single server. It resolves the config, builds a transport, and `connectWithTransport` (the injection seam for tests/mock transports) does the rest:
+
+1. Builds an `MCPClient` (with an `OnChange` callback)
+2. `Connect`: start the transport → `initialize` handshake → `ListTools` to discover tools
+3. `registerTools(mc)` registers each tool into the registry
+
+The painful part was context scope: `MCPClient.ConnectWithLifetime` splits the **handshake timeout** from the **subprocess lifetime** into two contexts — `Connect`'s ctx only bounds the handshake, while the subprocess must live as long as `lifetimeCtx`. Otherwise the moment `Connect` returns, the tool dies. This directly solves `MCPToolFactory.Create` (section 10) returning a tool that would otherwise be cancelled immediately.
+
+`Start` never aborts on a failed connection — it logs and continues to the next server. One dead server must not take down the others or the Agent.
+
+### 5.2 tools/listChanged notifications（待核实: the hook exists, but nothing in serve binds it）
+
+The client declares `Tools: ListChanged: true`. When the server sends `notifications/tools/listChanged`, `MCPClient.handleNotification` re-fetches `ListTools` and, on success, triggers `OnChange`. In the manager's `connectWithTransport`, the `onChange` handler calls `RefreshTools` (re-discover + re-register) and then `notifyToolChange()`, which invokes the callback set via `SetToolChangeHandler`.
+
+**But `SetToolChangeHandler` is only defined in the manager — no call site anywhere in the repo wires it up.** So this hook is currently dangling. The older draft's claim that "`MCPManager.SetToolChangeHandler` bridges listChanged → Skill Catalog.Refresh (hash-based incremental re-indexing)" is **not wired in the real code**（待核实）.
+
+### 5.3 Skill lazy connect (this one is actually wired)
+
+`internal/ares_skills/catalog.go` declares the `MCPConnector` interface (just `ConnectServer`), and `*ares_mcp.MCPManager` happens to satisfy it:
+
+```go
+type MCPConnector interface {
+	ConnectServer(ctx context.Context, name string) error
+}
+```
+
+The wiring lives in `internal/ares_bootstrap/skills_wiring.go`'s `wireSkills(ctx, mem, mcp)`: as long as the memory manager exposes `SetSkillsRegistry`, it calls `catalog.SetMCPConnector(mcp)`. Then `Catalog.Activate(ctx, skillID)` connects each MCP server a skill declares via `c.mcp.ConnectServer(ctx, t.Target)` only at activation time. So timing goes from "connect at startup" to "connect when the skill is activated." That lazy path is genuine.
+
+### 5.4 Disconnect and hot reload
+
+- `DisconnectServer` / `Stop`: unregister tools first (`unregisterTools`), then close the client **outside the lock** (`MCPClient.Close` waits on notification goroutines that may themselves try to grab `m.mu` inside `RefreshTools` — closing under the lock deadlocks).
+- `ApplyConfig`: diffs old vs new config — connects new servers, disconnects removed ones, reconnects changed ones, and returns the list of changes.
+- `RefreshTools`: unregisters old tools then re-discovers. If `ListTools` fails, it best-effort **restores the previous registration** from the client's still-valid cached definitions, so a transient blip during hot reload doesn't zero the server's tools.
+
+### 5.5 Status queries
+
+`ListServers()` returns `[]MCPServerStatus`:
+
+```go
+type MCPServerStatus struct {
+	Name      string    `json:"name"`
+	Connected bool      `json:"connected"`
+	ToolCount int       `json:"tool_count"`
+	Version   string    `json:"version"`
+	Error     string    `json:"error,omitempty"`
+	ConnAt    time.Time `json:"connected_at,omitempty"`
+}
+```
+
+Note `Version` is **always empty** — the client doesn't expose a server version string, and the code deliberately leaves it empty rather than filling in a misleading state. Also, `ListServers` includes configured-but-not-yet-connected servers (`Connected: false, Error: "not connected"`), so a required server that's down surfaces as `Degraded` instead of vanishing.
+
+> About the Dashboard: the older draft's `MCPStatusProvider`, `MCPServerStatusView`, `ArenaActionMCPDisconnect`, and `FaultMCPDisconnect` **do not exist in the repo** (I could not find `internal/dashboard/` or those symbols). So I removed that whole section rather than gloss over it.
 
 ---
 
-## The Bridge: MCP Tools Become Native Tools
+## Six: MCPTool — making a remote tool "pretend to be local"
 
-Here's where the magic happens. The whole point of MCP integration is that **MCP tools should be indistinguishable from native tools** to the rest of the framework. An agent calling an MCP tool shouldn't know or care that the tool lives in a separate process.
-
-The bridge is `MCPTool` in `internal/ares_mcp/mcp_tool.go`:
+`MCPTool` is the key adapter of the whole integration. It implements `core.Tool` (there's a compile-time assertion `var _ core.Tool = (*MCPTool)(nil)` at the bottom), and forwards actual calls to the MCP server:
 
 ```go
+// internal/ares_mcp/mcp_tool.go
 type MCPTool struct {
-    *base.BaseTool
-    client     *MCPClient
-    serverName string
-    toolDef    *MCPToolDef
+	*base.BaseTool
+	client     *MCPClient
+	serverName string
+	toolDef    *MCPToolDef
 }
-```
 
-Construction happens in `NewMCPTool`. It takes an `MCPToolDef` (the server's description of the tool) and wraps it:
+func NewMCPTool(client *MCPClient, def *MCPToolDef) (*MCPTool, error) {
+	schema, err := ConvertJSONSchema(def.InputSchema)         // JSON Schema → core.ParameterSchema
+	name := fmt.Sprintf("mcp.%s.%s", client.ServerName(), def.Name)
+	bt := base.NewBaseToolWithCapabilities(name, def.Description,
+		core.CategoryExternal, []core.Capability{core.CapabilityExternal}, schema)
+	return &MCPTool{BaseTool: bt, client: client, serverName: client.ServerName(), toolDef: def}, nil
+}
 
-1. **Schema conversion** — The MCP `inputSchema` is raw JSON Schema. Our tool system uses `core.ParameterSchema`. The `ConvertJSONSchema` function in `internal/ares_mcp/schema.go` bridges the two, preserving type information, required fields, and enum constraints.
-
-2. **Namespacing** — Tool names become `mcp.<serverName>.<toolName>`. If the `codegraph` server exposes an `analyze` tool, the full name is `mcp.codegraph.analyze`. This prevents collisions between tools from different servers.
-
-3. **Categorization** — MCP tools get `core.CategoryExternal` and `core.CapabilityExternal`. The capability engine in `internal/tools/resources/core/capability.go` uses these to filter tools by origin.
-
-4. **Interface satisfaction** — By embedding `base.BaseTool`, the `MCPTool` automatically satisfies the `core.Tool` interface defined in `internal/tools/resources/core/tool.go`. No boilerplate.
-
-The `Execute` method is the payoff:
-
-```go
 func (t *MCPTool) Execute(ctx context.Context, params map[string]interface{}) (core.Result, error) {
-    result, err := t.client.CallTool(ctx, t.toolDef.Name, params)
-    if err != nil {
-        return core.NewErrorResult(err.Error()), nil
-    }
-    if result.IsError {
-        return core.NewErrorResult(extractText(result.Content)), nil
-    }
-    return core.NewResult(true, map[string]interface{}{
-        "content": extractText(result.Content),
-        "blocks":  result.Content,
-    }), nil
+	result, err := t.client.CallTool(ctx, t.toolDef.Name, params)
+	if err != nil {
+		return core.NewErrorResult(err.Error()), nil
+	}
+	if result.IsError {
+		return core.NewErrorResult(extractText(result.Content)), nil
+	}
+	text := extractText(result.Content)
+	return core.NewResult(true, map[string]interface{}{"content": text, "blocks": result.Content}), nil
 }
 ```
 
-The tool delegates to the MCP client, which sends a `tools/call` request over the transport. The response comes back as content blocks (text, images, embedded resources). We convert it to a `core.Result` and return it.
+The naming rule is `mcp.{serverName}.{toolName}` — deliberate. With multiple servers, two can expose a same-named tool (both `search`, say); the prefix avoids collisions.
 
-Notice the error handling: transport failures and tool-level errors both return `core.Result` with `Success: false`, not Go errors. The Go error return is always `nil`. This keeps the tool execution boundary clean — the caller checks `result.Success`, not `err != nil`.
+`Close()` is a no-op — connection lifecycle belongs to `MCPManager`, and closing one tool must not cut the shared connection owned by other tools on the same server (P0-4).
+
+### 6.1 Schema conversion: JSON Schema → ParameterSchema
+
+`ConvertJSONSchema` (`schema.go`) turns MCP `inputSchema` into ares' internal `core.ParameterSchema`. It handles `type` / `properties` / `required` / `description` / `enum` / `minimum` / `maximum` / `default` / `items`; an empty `type` defaults to `object` (properties default to `string`). But it is deliberately a **reduced implementation**:
+
+- recursion only covers one level of `properties`; no `$ref` / `oneOf` / `anyOf` / `allOf`
+- `items` is parsed but not mapped into a nested array constraint on `ParameterSchema`
+- `convertProperty` produces a `*core.Parameter` (`Type/Description/Default/Enum/Min/Max`)
+
+Honestly: **common cases are fine; complex nested schemas lose information.** This feeds the LLM, so schema quality directly affects tool-call accuracy. It's a real weak spot, not manufactured anxiety.
 
 ---
 
-## The Registry: One Map to Rule Them All
+## Seven: Error handling — timeouts, disconnects, and "the server just went quiet"
 
-The `core.Registry` in `internal/tools/resources/core/registry.go` is a thread-safe `map[string]Tool` with a lazy schema cache. MCP tools, built-in tools, plugin tools — they all live in the same registry. When an agent needs to execute a tool, it calls `registry.Execute(name, params)`. The registry looks up the tool by name, validates parameters against the cached schema, and calls `tool.Execute`.
+### 7.1 Timeouts
 
-The registration flow for MCP tools:
+`MCPClient.call` wraps the wait with `context.WithTimeout(ctx, c.timeout)`. Default 30s, overridable per server. A timeout returns an explicit error; it never hangs.
+
+### 7.2 Honest: no retries, and no circuit breaker
+
+**There is no automatic retry and no circuit breaker in the current implementation.** `Start` just logs a failing server and moves on. If a server dies mid-run, `receiveLoop` returns an error and the client doesn't reconnect automatically. That means: configure three servers, one dies, the tools on that server fail silently — no panic, no crash, but no coming back either.
+
+The priority back then was "get the protocol working first"; these were left for later:
+
+1. **Auto-reconnect**: after `receiveLoop` exits, let `MCPManager` probe and reconnect
+2. **Exponential backoff**: don't spin on reconnect
+3. **Circuit breaker**: after N consecutive failures mark the server unhealthy, stop trying, probe periodically
+4. **Tool-level degradation**: when a server is unavailable, `MCPTool.Execute` should return a clear error rather than blocking on a timeout
+
+These are the next-iteration technical debts. I'm listing the gaps on purpose — **admitting a problem is more important than pretending it doesn't exist.**
+
+### 7.3 Connection state tracking
+
+`ConnectServer` records `mc.lastErr`; `ListServers()` exposes `Connected` / `ToolCount` / `ConnAt` for every connected server. At least the user can **see** that a server is down, even if it can't be brought back automatically.
+
+---
+
+## Eight: How MCP tools actually reach the runtime (the real seam)
+
+So far tools are registered into the `core.Registry` that `MCPManager` holds — but that registry is created fresh inside bootstrap, and the agents use a `sub.ToolBinder` fed differently. **The thing that actually pushes MCP tools into the agent runtime is `setupMCP` in `cmd/ares/mcp.go`.**
+
+```go
+// cmd/ares/mcp.go
+func setupMCP(_ context.Context, mcpMgr *ares_mcp.MCPManager, registry *api_tools.Registry, deps builtintools.GeneralToolsDeps) (*core.Registry, error) {
+	internalReg := core.NewRegistry()
+	// register builtin general tools into internalReg ...
+	if mcpMgr != nil {
+		// bridge the tools already registered in the bootstrap MCP manager into internalReg
+		for _, tool := range mcpMgr.RegisteredTools() {
+			t := tool
+			if err := internalReg.Register(t); err != nil {
+				fmt.Printf("MCP bridge: failed to register tool %s: %v\n", t.Name(), err)
+			}
+		}
+	}
+	// also bridge into the public api/tools registry so dashboards see them...
+	return internalReg, nil
+}
+```
+
+`RegisteredTools()` is the read-side counterpart — it calls `m.registry.List()` + `Get` and hands out the MCP tools as `core.Tool`.
+
+Then `serve.go` turns it into the ToolBinder the agents use:
+
+```go
+// cmd/ares/serve.go
+toolBinder := newToolBinder(internalReg)   // sub.NewToolBinder() + binder.BridgeFromRegistry(internalReg)
+```
+
+That `toolBinder` is passed as a `sub.ToolBinder` into `createAndServeAgents`, and that's what agents execute tools through. So:
 
 ```mermaid
 graph LR
-    A[MCPManager.Start] --> B[ConnectServer]
-    B --> C[MCPClient.Connect]
-    C --> D[Transport.Start]
-    D --> E[initialize handshake]
-    E --> F[ListTools]
-    F --> G[registerTools]
-    G --> H["NewMCPTool (schema + namespace)"]
-    H --> I[registry.Register]
-    I --> J[Tool available to agents]
+    A[MCP Server<br/>external process] --> B[MCPClient.ListTools]
+    B --> C[NewMCPTool wrapper<br/>core.Tool impl]
+    C --> D[MCPManager.registry<br/>Register]
+    D --> E[RegisteredTools read-out]
+    E --> F[internalReg<br/>core.Registry]
+    F --> G[newToolBinder<br/>BridgeFromRegistry]
+    G --> H[sub.ToolBinder<br/>Agent executes tools]
 ```
 
-### 5.1 Capability Fabric Lazy Connection (new in 0.3.0)
+**Conclusion: the MCP→runtime binding path exists and is genuinely connected through the serve stack** — MCP Server → `MCPClient` discovery → `MCPTool` (a `core.Tool`) registered into the manager's registry → `setupMCP` bridges them via `RegisteredTools()` into `internalReg` → `newToolBinder`'s `BridgeFromRegistry` → the agent tool binder.
 
-Since 0.3.0, MCP connections gained a skill-driven lazy path (design principle 3: **a Skill is the lazy-loading boundary of an MCP server**): the `Catalog` in `internal/ares_skills` is wired at serve startup via `SetMCPConnector(mcpMgr)`, and the `skill_activate` tool calls `Catalog.Activate(ctx, skillID)`, which runs `ConnectServer(ctx, serverName)` for each `mcp` tool the skill declares.
-
-- Connection timing extends from "connect at startup (AutoStart)" to "**connect only when a skill is activated**" — 1000 MCP tools never enter context
-- `MCPManager.SetToolChangeHandler` bridges `tools/listChanged` notifications → `Catalog.Refresh` (hash-based incremental re-index), so tool changes surface in the catalog on demand
-- Coexists with AutoStart: servers explicitly declaring `auto_start=true` still connect through the legacy startup path
-
-The manager keeps a list of registered tool names per server. When disconnecting, it unregisters exactly those tools — no more, no less. This prevents stale tool references from lingering in the registry after a server goes down.
+One clarification to avoid confusion: `internal/agentsyscall` has a `BindTools(binder, kernel)`, but it binds the `spawn_agent` / `create_task` syscall tools — **unrelated to MCP**. MCP tools flow through the `core.Registry → sub.ToolBinder` path above, not through agentsyscall.
 
 ---
 
-## Error Handling: Timeouts, Retries, and Graceful Degradation
+## Nine: Configuration-driven — tools declared in YAML
 
-MCP tools are network calls in disguise. They can hang, fail, or return garbage. We handle this at multiple layers:
+The whole integration is config-driven. `mapMCPServerConfig` in `provide_mcp.go` converts `ares_config.MCPConfig` into `ares_mcp.MCPManagerConfig`. The shape is roughly:
 
-**Timeouts** — Every `CallTool` invocation uses `context.WithTimeout`, defaulting to 30 seconds. The timeout is configurable per-server in the YAML config. If a tool server doesn't respond in time, the context cancels, the pending request channel is cleaned up, and the caller gets a timeout error.
+```yaml
+# config (illustrative; field names follow ares_config)
+mcp:
+  servers:
+    - name: "code-search"
+      transport:
+        type: stdio
+        stdio:
+          command: "mcp-code-search"
+          args: ["--repo", "/path/to/repo"]
+      timeout: 30
+      enabled: true
+      auto_start: true
+    - name: "database"
+      transport:
+        type: sse
+        sse:
+          url: "http://localhost:8080/sse"
+      timeout: 60
+      enabled: true
+      auto_start: true
+```
 
-**Request correlation** — The `MCPClient` uses a `map[int64]chan *JSONRPCMessage` to correlate requests with responses. Each outbound request gets a unique ID from an atomic counter (`IDGenerator` in `internal/ares_mcp/jsonrpc.go`). A buffered channel is registered in the `pending` map before sending. The `receiveLoop` goroutine dispatches responses to the correct channel by matching `msg.ID`. If the context times out, the channel is removed from the map, preventing memory leaks.
-
-**JSON-RPC error codes** — The protocol defines standard error codes: `ParseError (-32700)`, `InvalidRequest (-32600)`, `MethodNotFound (-32601)`, `InvalidParams (-32602)`, `InternalError (-32603)`. Our `JSONRPCError` type implements the `error` interface, so protocol-level errors propagate naturally through Go's error handling.
-
-**Graceful close** — When a transport fails to close, we log the warning but don't propagate the error. The client's `Close` method drains all pending channels, ensuring no goroutine is left waiting on a response that will never come.
-
-**Honest reflection**: We don't have retry logic or circuit breakers yet. If a tool server crashes mid-request, the caller gets an error and that's it. We considered adding automatic retries with exponential backoff, but decided to keep it simple for now. The manager's `RefreshTools` handles server-side changes, but transient failures are the caller's problem. This is a gap we'll close when we see real production workloads that need it.
+`MCPServerConfig`'s `Enabled` (whether this server is in effect) and `AutoStart` (whether it auto-connects during `Manager.Start()`) combine for flexibility. `ProvideMCP` / the backward-compatible alias `SetupMCP` build the `MCPManager` at bootstrap and `Start` it. At runtime you can still `ConnectServer` / `DisconnectServer` dynamically. With no servers configured, `ProvideMCP` returns an empty manager (a valid minimal config).
 
 ---
 
-## Dashboard: Seeing What's Connected
+## Ten: Factory pattern — MCPToolFactory
 
-The web dashboard needs to show MCP server status in real time. We defined a clean interface for this in `internal/dashboard/types.go`:
+Besides `MCPManager`'s batch management, MCP tools can also be mass-produced:
 
 ```go
-type MCPStatusProvider interface {
-    ListServers() []MCPServerStatusView
+// internal/ares_mcp/factory.go
+type MCPToolFactory struct {
+	manager *MCPManager
+}
+
+func (f *MCPToolFactory) Name() string { return "mcp" }
+
+func (f *MCPToolFactory) Create(config map[string]interface{}) (core.Tool, error) {
+	// build MCPServerConfig from the map
+	// use ConnectWithLifetime to bound only the initial handshake
+	// return the first tool
 }
 ```
 
-The `MCPManager` satisfies this interface. `MCPServerStatusView` includes `Name`, `Connected`, `ToolCount`, `Version`, `Error`, `ConnAt`, and a `Tools` slice with per-tool details. The REST API exposes this at `GET /mcp` and `GET /mcp/{name}`.
+It implements `core.ToolFactory` (with the compile-time assertion `var _ core.ToolFactory = (*MCPToolFactory)(nil)`). Two things to note:
 
-For real-time updates, the dashboard uses WebSocket channels. When MCP tools change — a server connects, disconnects, or refreshes its tool set — a `mcp_tool_change` message is broadcast on the `mcp` WebSocket channel. The frontend subscribes to this channel and updates the UI without polling.
+1. **`Create` returns only the first tool** — if a server has ten tools you get just one. That's an obvious simplification/technical debt, and `ValidateConfig` is written to match.
+2. `ConnectWithLifetime(connectCtx, context.Background(), transport)` binds only the initial handshake to `connectCtx`; the client's lifetime context is independent (background), so the tool doesn't die the instant `Create` returns.
 
-The wiring happens in `internal/ares_bootstrap/bootstrap.go`:
+---
+
+## Eleven: The server side — ares can be an MCP server too
+
+So far we've talked about ares as an MCP **client**. But `internal/ares_mcp/server.go` has the other face — ares can host an MCP server and expose its own capabilities to other MCP clients:
 
 ```go
-func SetupMCP(ctx context.Context, cfg *ares_config.MCPConfig, registry *core.Registry) (*ares_mcp.MCPManager, error) {
-    // convert config types, create manager, call Start
+// internal/ares_mcp/server.go
+type MCPServer struct {
+	info              Implementation
+	capabilities      ServerCapabilities
+	tools             map[string]*registeredTool
+	resources         map[string]*registeredResource
+	resourceTemplates []*registeredResourceTemplate
+	prompts           map[string]*registeredPrompt
+	transport         ServerTransport
+	mu                sync.RWMutex
+	serveCtx          context.Context
+	handlerTimeout    time.Duration
 }
 ```
 
-This is called during bootstrap, before the dashboard or orchestrator starts. By the time the web UI loads, all auto-start MCP servers are already connected and their tools are registered.
+It registers three capability kinds: Tools (`ToolHandler`), Resources (`ResourceHandler`/`ResourceTemplate`), and Prompts (`PromptHandler`). Via the `ServerTransport` in `transport_server.go` it accepts clients over stdio and SSE server transports.
+
+That makes ares both a consumer of the MCP ecosystem (calling others' tools) and a producer (exposing its own). `internal/ares_skills/e2e_mcp_test.go` shows a real case: spawn a stdio subprocess serving an `MCPServer`, then connect to it with `MCPManager`'s stdio transport to exercise the whole "connect → register → call" chain.
 
 ---
 
-## The Plugin Factory: Dynamic Tool Creation
+## Honest reflection: how far this path runs, and what's still missing
 
-There's one more integration point: the `MCPToolFactory` in `internal/ares_mcp/factory.go`. It implements `core.ToolFactory` from `internal/tools/resources/core/factory.go`, which means MCP tools can be created dynamically through the plugin registry.
+**What works:**
 
-The factory accepts a config map with `name`, `transport_type`, `command` or `url`, creates a temporary MCP client, discovers tools, and returns the first one. This is useful for ad-hoc tool creation — "I need a tool that talks to this server, but I don't want to add it to the YAML config."
+1. **Clean Transport abstraction**: `Transport` has only 4 methods; Stdio and SSE don't affect each other. Adding a new transport (e.g. WebSocket) just means implementing the interface
+2. **Tool transparency**: `MCPTool` implements `core.Tool`; it's bit-for-bit on the same footing as builtin tools in the Registry, and callers never care about the source
+3. **Automatic schema conversion**: `ConvertJSONSchema` hands the LLM parameter metadata without manual translation
+4. **Config-driven**: YAML + bootstrap turns external tools into first-class citizens
+5. **Down servers are visible**: `ListServers()` marks configured-but-unconnected servers `Connected: false`
+6. **Two pragmatic security boundaries**: same-host SSE endpoint validation (anti-SSRF) and the health-check binary/URL allowlist
 
-We include a compile-time interface check to make sure we don't accidentally break the contract:
+**Still missing / unverified:**
 
-```go
-var _ core.ToolFactory = (*MCPToolFactory)(nil)
-```
+1. **No auto-reconnect / retry / circuit breaker**: a mid-run disconnect fails silently
+2. **Discovery → MCP manager bridge not wired**: the engine finds services but they don't become connected tools（待核实）
+3. **`SetToolChangeHandler` is dangling**: the listChanged → catalog re-index hook exists but serve doesn't bind it（待核实）
+4. **`MCPToolFactory.Create` returns only the first tool**: ten tools on a server, you get one
+5. **`ConvertJSONSchema` is a reduced implementation**: `$ref` / `oneOf` and complex schemas lose information
+6. **`MCPServerStatus.Version` is always empty**: the client doesn't expose the protocol version string
 
-This pattern appears everywhere in the MCP codebase. Every transport, every tool, every factory has a compile-time check. It's a small thing, but it catches integration bugs at build time instead of runtime.
-
----
-
-## The Honest Truth
-
-MCP integration was one of those features that started as a "nice to have" and became essential. The initial motivation was selfish — I was tired of writing Go wrappers for Python tools. But once we had the protocol working, something unexpected happened: **other people started writing tool servers.**
-
-The code analysis tool is written in Rust. The database tool is a standalone Go binary. The file search tool is a Python script. They all speak MCP, and they all appear as native tools in ares. The framework doesn't know or care what language they're written in. That's the real value of a protocol — it's a contract, not an implementation.
-
-**Honest reflection**: The schema conversion layer (`ConvertJSONSchema` in `internal/ares_mcp/schema.go`) is the weakest link. JSON Schema is a sprawling spec with `oneOf`, `anyOf`, `allOf`, `$ref`, and a dozen other constructs we don't fully support. We handle the common cases — objects with typed properties, required fields, enums, defaults — but complex nested schemas can produce surprising results. We'll need to invest in a proper JSON Schema parser if MCP adoption grows.
-
-The server-side implementation (`internal/ares_mcp/server.go`) is also more complete than we originally planned. We built it for testing, then realized it's useful for creating ares-to-ares tool bridges — one ares instance exposing its tools to another via MCP. This wasn't in the original design, but it fell out naturally from the protocol.
+These are real technical debts, not things I invented to pad the word count.
 
 ---
 
-## What's Next
+## Epilogue: the value of a protocol
 
-The MCP integration is stable, but there's more to do:
+Looking back at the whole MCP integration, the biggest takeaway is: **the value of a protocol is not how complex it is, but how much it decouples producers from consumers.**
 
-- **Retry and circuit breaker** patterns for transient failures
-- **Tool versioning** — handling schema changes when a server updates its tools
-- **Authentication** — MCP doesn't define auth yet, but we'll need it for production deployments
-- **Metrics** — tool call latency, error rates, server uptime
+Before MCP, tool registration was decided at compile time — write code, compile, deploy. With MCP, tool registration became runtime discovery — spawn a subprocess, handshake, discover and call. MCP tools enter the `core.Registry` as first-class `core.Tool`s, then reach the Agent through `setupMCP → newToolBinder`. Users don't have to wait for us to write code; they write their own MCP server and ares will find and use it.
 
-The protocol is young. The ecosystem is growing. And for the first time, adding a tool to ares doesn't require touching the framework's source code. That's the whole point.
+A protocol is infrastructure. MCP is to agent tools what HTTP is to web services — it doesn't solve a specific problem, it standardizes the way problems get solved.
+
+Key files:
+
+| File | Responsibility |
+|------|----------------|
+| `internal/ares_mcp/client.go` | MCP client: transport I/O, handshake, tool discovery, tool calls, notifications |
+| `internal/ares_mcp/manager.go` | Multi-server management: lifecycle, tool (un)registration, hot reload, status |
+| `internal/ares_mcp/mcp_tool.go` | `MCPTool` adapter: MCP tool → `core.Tool` |
+| `internal/ares_mcp/schema.go` | `ConvertJSONSchema`: JSON Schema → ParameterSchema |
+| `internal/ares_mcp/jsonrpc.go` | JSON-RPC 2.0 message model, encode/decode, classification |
+| `internal/ares_mcp/transport.go` | `Transport` interface (Start/Send/Receive/Close) |
+| `internal/ares_mcp/transport_stdio.go` | Stdio transport: subprocess stdin/stdout |
+| `internal/ares_mcp/transport_sse.go` | SSE transport: HTTP SSE + same-host endpoint check |
+| `internal/ares_mcp/factory.go` | `MCPToolFactory`: factory-created MCP tools |
+| `internal/ares_mcp/server.go` | MCP server: ares as an MCP server |
+| `internal/ares_mcp/types.go` | MCP protocol type definitions |
+| `internal/ares_bootstrap/provide_mcp.go` | `ProvideMCP`/`SetupMCP`: config → MCPManager |
+| `internal/ares_bootstrap/skills_wiring.go` | `wireSkills`: MCPManager as the skill lazy connector |
+| `internal/ares_skills/catalog.go` | `Catalog`: `SetMCPConnector` / `Activate` lazy connect |
+| `cmd/ares/mcp.go` | `setupMCP`: bridges MCP tools into internalReg + public registry |
+| `cmd/ares/tools.go` | `newToolBinder`: Registry → `sub.ToolBinder` |
+| `internal/discovery/` | Optional discovery engine (not wired to the manager; see notes) |
+| `internal/discovery/providers/filesystem.go` | ARES/Claude/Cursor/VSCode config scanning |
+| `internal/discovery/providers/binary.go` | Known-MCP-binary allowlist probe |
 
 ---
 

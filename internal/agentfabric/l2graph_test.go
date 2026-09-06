@@ -1,6 +1,7 @@
 package agentfabric
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"log/slog"
@@ -95,19 +96,21 @@ func TestL2Graph_TopologyPinsDependencies(t *testing.T) {
 // TestL2Graph_ArgsRoundTripJSON verifies structured args survive the
 // string-only Metadata round-trip back into a usable map. Payload keys ride
 // the arg. namespace (D3); unprefixed envelope plumbing never becomes a tool
-// arg.
+// arg. A namespaced value that only looks like JSON stays a plain string
+// rather than failing the extraction.
 func TestL2Graph_ArgsRoundTripJSON(t *testing.T) {
-	args, err := argsFromPayload(map[string]any{
-		"arg.query": `{"regex":"foo.*bar","case":true}`,
-		"arg.path":  "src/main.go",
-		"input":     "session prompt, not a tool arg",
+	args := argsFromPayload(map[string]any{
+		"arg.query":  `{"regex":"foo.*bar","case":true}`,
+		"arg.path":   "src/main.go",
+		"arg.broken": `{not json`,
+		"input":      "session prompt, not a tool arg",
 	})
-	require.NoError(t, err)
 	obj, ok := args["query"].(map[string]any)
 	require.True(t, ok, "JSON object arg must decode to a map")
 	require.Equal(t, true, obj["case"])
 	// A plain string arg passes through unchanged.
 	require.Equal(t, "src/main.go", args["path"])
+	require.Equal(t, `{not json`, args["broken"], "unparseable JSON is a plain string, not a failure")
 	require.NotContains(t, args, "input")
 }
 
@@ -172,14 +175,38 @@ func TestL2Cognition_RouterDispatchesTool(t *testing.T) {
 }
 
 // TestL2Cognition_RouterDispatchesAnswer verifies ares/answer capability
-// routes to answerCognition and yields the terminal result.
+// routes to answerCognition and emits the content the node carries.
 func TestL2Cognition_RouterDispatchesAnswer(t *testing.T) {
 	cog := NewRouterCognition(&stubBinder{}, slog.Default())
 
-	out, err := cog.ExecuteStep(context.Background(), taskFor("n3", "ares/answer", nil))
+	out, err := cog.ExecuteStep(context.Background(),
+		taskFor("n3", "ares/answer", map[string]any{"arg.content": "42 is the answer"}))
 	require.NoError(t, err)
 	require.True(t, out.Done)
-	require.Equal(t, "L2 session complete", out.Result.Items[0].Content)
+	require.Equal(t, "42 is the answer", out.Result.Items[0].Content)
+}
+
+// TestL2Cognition_AnswerWithoutContentSaysSo pins code_rules_v2 §0.2 on the
+// terminal node: with no supplied content and no summarizer wired, the body
+// states the absence and the gap is logged — it must NOT return a
+// success-sounding constant that reads like a real answer.
+func TestL2Cognition_AnswerWithoutContentSaysSo(t *testing.T) {
+	var logged bytes.Buffer
+	logger := slog.New(slog.NewTextHandler(&logged, &slog.HandlerOptions{Level: slog.LevelWarn}))
+	cog := NewRouterCognition(&stubBinder{}, logger)
+
+	out, err := cog.ExecuteStep(context.Background(), taskFor("n3", "ares/answer", nil))
+	require.NoError(t, err)
+	require.True(t, out.Done, "the session still terminates: a missing summary is not a task failure")
+	require.Equal(t, unansweredBody, out.Result.Items[0].Content)
+	require.Contains(t, logged.String(), "no summarizer is wired",
+		"the unimplemented summary must be visible to operations, not silent")
+
+	// Whitespace-only content is no content either.
+	blank, err := cog.ExecuteStep(context.Background(),
+		taskFor("n3", "ares/answer", map[string]any{"arg.content": "   "}))
+	require.NoError(t, err)
+	require.Equal(t, unansweredBody, blank.Result.Items[0].Content)
 }
 
 // TestL2Cognition_RouterDispatchesRoot verifies ares/root admits the session

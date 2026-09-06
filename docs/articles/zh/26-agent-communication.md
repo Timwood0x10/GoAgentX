@@ -1,179 +1,149 @@
-# ares 架构深度解析（二十六）：Agent 通信 — 原语层如何让 Agent 互相说话（0.3.x）
+# ares 架构深度解析（二十六）：Agent 通信 — Agent IPC 原语与 syscall 工具层（0.3.x）
 
-> 0.3.x 更新：AHP（Agent Harmony Protocol）演进为 **Agent IPC**——peer-mesh 消息总线。六原语：Send / Request / Reply / Delegate / Handoff / Subscribe。替代了 0.2.x 的五种消息类型（Task/Result/Progress/ACK/Heartbeat）。Agent 是同级认知进程（A ≡ B ≡ C），通信不需要 Leader 中转。旧 AHP 保留为兼容层。详见本系列文章（二）。
-
-> 说明：本文基于实际代码（`internal/agents/peer`、`internal/agents/leader`、`internal/ares_protocol/ahp`、`internal/agents/actionlog`、`internal/agents/lease`），是 docs 系列中 Agent OS 通信原语的专门篇。
+> 说明：本文基于实际代码（`internal/agentipc` 的 `bus.go` / `primitives.go` / `policy.go` / `deadletter.go` / `collaboration_observer.go`，以及 `internal/agentsyscall` 的 `syscall.go` / `plan.go`），是 docs 系列中 Agent 通信层的专门篇。Agent 是同级认知进程（A ≡ B ≡ C），通信走 peer-mesh 消息总线，不需要 Leader 中转。
 
 ## 一、为什么需要 Agent 通信
 
-多 Agent 系统里，leader 与 sub、sub 与 sub 之间需要交换消息。ARES 的默认执行路径是**事件驱动单路径**（`EventSubTaskScheduled` → 执行 → `EventSubTaskResult`），那为什么还要一套直连通信原语？
+多 Agent 系统里，Agent 与 Agent 之间需要交换消息——"我发现 X" / "帮我验证 Y" / "你的结论和我冲突"（`internal/agentipc/doc.go` 列出的典型协作短语）。这属于 ares-runtime 的 Kernel IPC pillar（P4），也是三层上下文中的第三层（Task Shared / Agent Private / IPC Messages）——前两级在 `internal/agentfabric` 存储，IPC 层由本包承载。
 
-因为事件流是"调度视角"，通信原语是"协作视角"：
+先厘清分工：**任务分发是 Scheduler（Task Fabric）的职责，Agent 通信是 IPC 的职责**。两者不是一回事：
 
-| 维度 | 事件流（EventStore） | 通信原语（peer） |
-|------|----------------------|------------------|
-| 视角 | 任务调度、审计、重放 | Agent 间临时协作、通知 |
-| 持久化 | 全量落库（事件溯源） | 内存注册表 + 即时投递 |
-| 时序 | 异步、可重放 | 同步调用、尽力而为 |
-| 职责 | 谁该执行什么 | 谁需要知道什么 |
+| 维度 | 任务分发（taskfabric / Scheduler） | Agent 通信（agentipc） |
+|------|-----------------------------------|------------------------|
+| 视角 | 谁该执行什么任务 | 谁需要知道什么消息 |
+| 路径 | 经 Task Fabric 创建 → 调度执行 | 对等直发 peer-mesh |
+| 语义 | 任务执行、可恢复、可重放 | 协作、请求答复、广播订阅、交接 |
+| 状态 | durable Task | 内存注册表 + 即时投递 |
 
-**核心原则：peer 直发是补充通知通道，不是任务执行通道。** 任务执行永远走事件流（保证可审计、可恢复）；peer 直发只做轻量通知（进度、协作提示），失败仅记日志，绝不阻塞主流程。
+**核心原则：Agent 表达意图（Send / Request / Delegate / Handoff / Subscribe），Kernel 保证送达。** 通信是"协作通道"，不是"任务执行通道"。
 
-## 二、Peer Registry：谁认识谁
+## 二、原生消息单元：Message
 
-`internal/agents/peer/registry.go` 是通信的地址簿：
+所有 IPC 一律走 `internal/agentipc/bus.go` 的 `Message`（design §13：Context layer 3 IPC Messages）：
 
 ```go
-// SendFunc 把一条消息投递给一个 Agent。实现方负责入队（阻塞或异步）。
-type SendFunc func(ctx context.Context, msg *ahp.AHPMessage) error
-
-type Registry struct {
-    peers map[string]SendFunc
-    mu    sync.RWMutex
+type Message struct {
+    ID            string    // 总线生成的唯一消息 ID
+    From          string    // 发送方 Agent ID
+    To            string    // 接收方 Agent ID（"" = 广播给订阅者）
+    Topic         string    // 消息主题（如 "verify-conclusion" / "handoff-task"）
+    CorrelationID string    // 关联 ID，配对 reply 与 request
+    Payload       any       // 消息体
+    At            time.Time // 发送时间戳
 }
 ```
 
-核心方法：
+配套的投递函数与错误哨兵（`Handler`、`ErrAgentNotRegistered`、`ErrNoHandler`、`ErrTimeout`、`ErrInvalidMessage`）都在同一包内定义。
 
-```go
-func (r *Registry) Register(agentID string, send SendFunc) error   // 注册投递函数
-func (r *Registry) Unregister(agentID string)                      // 注销
-func (r *Registry) Lookup(agentID string) (SendFunc, bool)         // 查找投递函数
-func (r *Registry) IDs() []string                                  // 全部在线 Agent
-func (r *Registry) Send(ctx context.Context, targetID string, msg *ahp.AHPMessage) error // 按 ID 投递
+## 三、六原语：Bus
+
+核心对象是 `Bus`（`internal/agentipc/bus.go`）：一个把 agent ID 映射到 handler 的 peer 消息总线。它维护 `handlers`、`subscribers`（topic → 订阅者列表）、`pending` / `pendingErr`（按关联 ID 的待答复通道 / 暂存错误）。原语全集：
+
+| 原语 | 语义 | 备注 |
+|------|------|------|
+| `Send` | fire-and-forget 直发 | 同步调用目标 handler，不等待答复 |
+| `Request` | 同步请求/答复 | 分配 correlation ID，等待 reply，带超时 |
+| `Reply` | 异步回执 | 目标 handler 稍后用 correlation ID 补答 |
+| `Delegate` | 代转发 | 转发给最终目标，保留端到端 correlation ID |
+| `Handoff` | 任务交接 | 结构化任务负载 + 接收方确认，不走 Scheduler |
+| `Subscribe` / `Unsubscribe` | 订阅 / 取消 | 主题订阅，配合 `Broadcast` 扇出 |
+
+> 注：`doc.go` 把原语集表述为 Send / Request / Delegate / Handoff / Subscribe（+ Reply），实现里另有 `Broadcast` / `Unsubscribe` 两个补充入口，一并列出。
+
+```mermaid
+graph TD
+    A[发起方 Agent] -->|Send / Broadcast| B[Bus]
+    A -->|Request / Delegate / Handoff| B
+    B -->|Send: 同步调 handler 不等待| C1[目标 handler]
+    B -->|Request: 分配 corrID + reply 通道| C2[目标 handler]
+    B -->|Broadcast: 按 topic 扇出| C3[订阅者 handlers]
+    C2 -->|Reply same corrID| A
+    C1 -->|结果 vs 失败| D[DeadLetterStore/协作观测]
+    C3 -->|投递计数| A
 ```
 
-`Register` 接受**投递函数**而非 Agent 对象——这让注册表与具体 Agent 实现解耦：任何能 `SendMessage` 的对象都能成为 peer，接口断言即可（见第四节生产接线）。
+### Send vs Request：两种协作姿态
 
-## 三、消息格式：AHP 协议
+- `Send(ctx, from, to, topic, payload) error`：fire-and-forget。目标 handler 在调用方 goroutine 里被同步调用；handler 返回错误会上抛，但不建立 reply 通道——"发完即完"，不配对答复。
+- `Request(ctx, from, to, topic, payload, timeout) (*Message, error)`：同步请求/答复。总线分配 correlation ID 并登记一条 pending reply 通道；目标 handler 必须用同一个 correlation ID 调 `Reply` 才能完成请求。**超时处理有默认值**：`timeout <= 0` 时落入 `defaultRequestTimeout = 30 * time.Second`（primitives.go，B16 防止无限阻塞）。请求在受管 goroutine 中执行，自带 recover 边界——handler 若 panic，被收拢为一个 `ErrHandlerPanic`，只失败这一条请求，不拖垮整个进程。
 
-消息统一走 `internal/ares_protocol/ahp` 的 `AHPMessage`：
+## 四、Delegate 与 Handoff：委托与交接
 
-```go
-type AHPMessage struct {
-    ID        string            // 消息唯一 ID
-    From      string            // 发送方 Agent ID
-    To        string            // 接收方 Agent ID
-    Method    AHPMethod         // task / ack / heartbeat / progress ...
-    Payload   map[string]any    // 业务负载
-}
-```
+- `Delegate(ctx, delegator, to, topic, payload, timeout)`：在调用方立场上把请求转发给另一个 Agent。原请求者的 correlation ID 端到端保留，答复能一路链回。语义是"我处理不了——让能处理的人来"。
+- `Handoff(ctx, from, to, taskID, contextSnapshot, timeout)`：把任务的"所有权"从 yield 的 Agent 移交给 accept 的 Agent。负载为 `{task_id, context, artifacts}`，topic 为常量 `handoff-task`，接收方返回接受答复。**关键点：这是 peer-to-peer 的任务转移原语，不经过 Scheduler。**
 
-方法集（`AHPMethod`）：
-- `AHPMethodTask`：任务请求（sub 的 `messageHandler` 收到后**不做任务执行**——任务由事件流驱动，见第九节）
-- `AHPMethodACK`：确认回执（同样是协议级占位，任务结果走事件流）
-- `AHPMethodHeartbeat`：心跳
-- `AHPMethodProgress`：进度通知（NotifyPeer 使用）
-
-## 四、NotifyPeer：leader 的补充通知
-
-`internal/agents/leader/agent_types.go` 的 `NotifyPeer` 是 leader 侧的直发入口：
+## 五、发布订阅：Subscribe / Broadcast / Unsubscribe
 
 ```go
-func (a *leaderAgent) NotifyPeer(ctx context.Context, targetID, message string) {
-    // 无注册表或空 target 直接返回（幂等空操作）
-    msg := ahp.NewMessage(ahp.AHPMethodProgress, a.id, targetID, "", "")
-    msg.Payload = map[string]any{"note": message}
-    if err := reg.Send(ctx, targetID, msg); err != nil {
-        log.Debug("leader peer notify skipped", "target", targetID, "error", err)
-    }
-}
+func (b *Bus) Subscribe(agentID, topic string) error   // 幂等：重复订阅被去重
+func (b *Bus) Unsubscribe(agentID, topic string)
+func (b *Bus) Broadcast(ctx context.Context, from, topic string, payload any) int
 ```
 
-注意两处刻意设计：
-1. **失败仅 Debug 日志**——直发是"补充通知"，丢了不影响任务执行，绝不上抛
-2. **进度消息语义**——NotifyPeer 发的是 `AHPMethodProgress`，接收方知道这是"协作提示"而非"任务指令"，不会与事件流任务混淆
+`Broadcast` 把一条消息扇给该 topic 的每个订阅者 handler；某个 handler 出错不影响其余投递，返回成功投递数量。Subscribe 对同一 agent + 同一 topic 去重（B16）。
 
-## 五、消息队列：缓冲与背压
+## 六、可观测性：DeadLetterStore 与 CollaborationObserver
 
-`internal/ares_protocol/ahp/queue.go` 提供有界消息队列：
+IPC 不只是通信，还是进化回路的一路输入（N-11 / GAP-3 闭环）：
+
+- **DeadLetterStore**（`deadletter.go`）：有界 FIFO，记录投递失败（`ErrAgentNotRegistered` / `ErrTimeout` / handler 错误）。容量默认 1024（`capacity <= 0` 时回落）。`Record`（最旧被淘汰）、`Snapshot`、`Count` 供诊断与重交付。Send 与 Request 的失败路径都会 `Record`。
+- **CollaborationObserver**（`collaboration_observer.go`）：每条有可观测回执的协作尝试向观察者发一条 `feedback.CollaborationOutcome`。`Send` 与 `Request`（及其上的 Delegate / Handoff）被观测；`Broadcast` 刻意不被观测（无单一目标可归因）。观察器被调在被发起方路径上，因此约定必须非阻塞，锁外调用。
+
+```mermaid
+graph LR
+    S[发起方] -->|Send / Request 失败| DL[DeadLetterStore 有界 FIFO]
+    S -->|Send / Request 回执| OBS[CollaborationObserver]
+    OBS --> FB[feedback 源: collaboration]
+    DL -->|Snapshot / 重交付| OPS[诊断 / ops 工具]
+```
+
+## 七、syscall 层：Kernel 与工具
+
+`internal/agentsyscall` 把 IPC/协作能力封装成 **LLM 可调的工具**（W2 设计：真实 LLM 执行体 sub.Agent 决定是否拆分任务，Kernel 校验执行——"Agent decides. Kernel enforces."）。`BindTools(binder, kernel)` 注册四个工具：
+
+| 工具常量 | 对应 Kernel syscall | 系统调用含义 |
+|----------|---------------------|--------------|
+| `SpawnAgentTool` (`spawn_agent`) | `Kernel.SpawnAgent` | 生成一个带声明能力(capability)的 peer Agent，校验配额并注册为可调度 executor |
+| `CreateTaskTool` (`create_task`) | `Kernel.CreateTask` | 在 Task Fabric 创建子任务（→ READY），交给 Scheduler |
+| `AskAgentTool` (`ask_agent`) | `Kernel.AskAgent` | 向指定目标 Agent 就其 topic 发协作请求（"知道该问谁"时用） |
+| `CreatePlanTool` (`create_plan`) | `Kernel.CreatePlan` | 整张依赖 DAG 一次性批量编译为任务（含可选有界 round-loop） |
+
+`ToolSchemas()` 返回这些工具的 LLM 面 schema，注入 `resources.Registry`，与内置工具并列出现在 Chat API。
+
+**Kernel 的 `AskAgentFn` 是关键注入点**（`syscall.go`）：
 
 ```go
-type Queue struct {
-    MaxSize    int              // 默认 1000（sub 任务场景配置 500）
-    messages   chan *AHPMessage
-}
+type AskAgentFn func(ctx context.Context, from, to, topic string, payload any) error
+
+// WithAskAgent 注入协作原语；SetAskAgent 可在 serve 组装期（setupPeerRegistry 之后）替换。
+// 生产接线为 aresrecovery.EvolutionAwareIPC.Send → agentipc Bus。
 ```
 
-- 有界容量 → 天然背压：队列满时发送方感知阻塞/丢弃，防止内存无界增长
-- 生产接线：`ahp.NewMessageQueue(leaderID, &ahp.QueueOptions{MaxSize: 500})`（leader 与 sub 各一个）
+`ask_agent` 是协作通道的 ACT 半环（Step Y.2-ACT）：它把"该问谁"变成一个 Agent 可见、可改的决策。`Kernel.AskAgent` 要求目标非空、原语必须被注入（未注入则 fail-loud，绝不静默 no-op）。**注意其语义是 fire-and-forget send：`AskAgentResult.Accepted` 表示"请求已交给协作原语"，不是"拿到了答案"。**
 
-## 六、Action Log：可审计的任务记录
-
-`internal/agents/actionlog/actionlog.go` 是"做了什么事"的追加式审计日志（`Store`）：
-
-```go
-func (s *Store) Append(ctx context.Context, e Entry) error        // 追加（幂等）
-func (s *Store) List(sessionID string) []Entry                    // 会话内全部记录
-func (s *Store) Replay(sessionID, startID string) ([]Entry, error) // 从某条之后重放
-func (s *Store) Count() int                                       // 记录数
+```mermaid
+graph LR
+    LLM[LLM Agent] -->|ask_agent 工具调用| Bind[BindTools 绑定]
+    Bind --> K[Kernel.AskAgent]
+    K -->|AskAgentFn: ipc.Send| BUS[agentipc Bus.Send]
+    BUS --> H[目标 Agent handler]
+    H -->|回执| OBS[CollaborationObserver]
+    OBS --> FB[collaboration feedback 源]
 ```
 
-- sub agent 在任务完成的三个结果出口（成功/失败/异常）都会 `recordAction` 追加一条 `actionlog.Entry`（任务结果 + 元数据）
-- `Append` 幂等：同一条 Entry 重复追加不产生重复记录（重试/事件重放安全）
-- `Replay` 支持从指定 `startID` 之后重放——审计与故障恢复的抓手
+## 八、双轨分发策略：DispatchPolicy
 
-## 七、Session Lease：并发会话控制
+`policy.go` 展示 IPC 之外的任务分发如何过渡：`ExecutionPolicy` 枚举 `PolicyLegacy`（旧 leader+sub 路径，仅作库常量保留）与 `PolicyTaskFabric`（Kernel 路径：Task Fabric → Scheduler → Agent）。`PolicyFlag` 是原子特征开关；`DualTrackDispatcher` 让两条路径并存，**shadow 模式下未激活路径也运行并比较结果**（结果一致性 = 双轨等价验证），不一致计数经 `Mismatches()` 暴露。这是 P4 D4"并行 + 特征开关渐进切换"的具体落地。
 
-`internal/agents/lease` 提供**会话级租约**（TTL 租约）：并发 worker 在修改同一 session 前必须先获取租约，防止两个 worker 同时写一个会话导致竞态。
+## 九、总结
 
-- 挂载点：`internal/ares_memory` 的 memoryManager（`leaseMgr` 字段）
-- 语义：租约有时效（TTL），超时自动失效；持有者必须在租约内完成操作或主动释放
-- 与 peer 通信的关系：lease 是"谁能动这个会话"的互斥控制，peer 是"谁需要知道这个消息"的协作通知——两者正交
+| 原语 / 部件 | 包 | 职责 |
+|-------------|-----|------|
+| `Message` + `Handler` | `internal/agentipc` | IPC 消息单元与投递回调 |
+| `Bus`（Send/Request/Reply/Delegate/Handoff/Subscribe/Broadcast/Unsubscribe） | `internal/agentipc` | peer 消息总线与全套协作原语 |
+| `DeadLetterStore` | `internal/agentipc` | 失败投递的有界 FIFO 记录（默认容量 1024） |
+| `CollaborationObserver` | `internal/agentipc` | 协作回执 → feedback 源 |
+| `DualTrackDispatcher` + `PolicyFlag` | `internal/agentipc` | 双轨等价分发 / 特征开关 |
+| `Kernel`（SpawnAgent/CreateTask/AskAgent/CreatePlan） | `internal/agentsyscall` | LLM 可调用的 syscall 工具内核 |
 
-## 八、生产接线：buildPeerRegistry
-
-`cmd/ares/serve.go` 在创建 leader/sub 后组装通信原语：
-
-```go
-// buildPeerRegistry 把 leader 与 sub 的消息投递能力注册进 peer.Registry。
-// 不暴露 SendMessage 的 Agent（接口断言失败）被跳过，不算错误。
-func buildPeerRegistry(leaderAgent leader.Agent, subAgents []sub.Agent) *peer.Registry {
-    reg := peer.NewRegistry()
-    if sender, ok := leaderAgent.(interface{ SendMessage(...) error }); ok {
-        _ = reg.Register(leaderAgent.ID(), sender.SendMessage)
-    }
-    for _, sa := range subAgents {
-        if sender, ok := sa.(interface{ SendMessage(...) error }); ok {
-            _ = reg.Register(sa.ID(), sender.SendMessage)
-        }
-    }
-    return reg
-}
-```
-
-然后：
-
-```go
-leaderWithPeer := leaderAgent // 构造后
-leaderWithPeer.SetPeerRegistry(peerRegistry) // leader 获得 peer 注册表
-```
-
-**接口断言而非类型断言**——这是关键设计：peer 注册表只要求"能发消息"，不要求具体类型，新增 Agent 类型无需改注册逻辑。
-
-## 九、通信 vs 任务执行：边界在哪
-
-sub 的 `messageHandler`（`internal/agents/sub/handler.go`）收到 AHP 直发消息时的处理方式最能说明边界：
-
-```go
-case ahp.AHPMethodTask:
-    return h.handleTaskMessage(ctx, msg)  // 空实现：任务执行由 executor 负责
-case ahp.AHPMethodACK:
-    return h.handleAckMessage(ctx, msg)   // 空实现：协议级占位
-case ahp.AHPMethodHeartbeat:
-    return nil // 心跳确认
-```
-
-`handleTaskMessage` / `handleAckMessage` 的空实现**是有意的**（代码注释明确）：任务执行永远由事件流（`EventSubTaskScheduled`）驱动，AHP 直发 task/ack 仅是协议层的消息通道占位——避免两套任务分发路径并存导致重复执行。
-
-## 十、总结
-
-| 原语 | 包 | 职责 | 失败语义 |
-|------|-----|------|----------|
-| Peer Registry | `internal/agents/peer` | Agent 地址簿 + 直发投递 | 尽力而为，失败仅日志 |
-| NotifyPeer | `internal/agents/leader` | leader 的补充通知（Progress 语义） | Debug 日志，不上抛 |
-| Message Queue | `internal/ares_protocol/ahp` | 有界缓冲 + 背压 | 队列满 → 阻塞/丢弃 |
-| Action Log | `internal/agents/actionlog` | 任务审计 + 重放（Append 幂等） | 记录失败不影响任务 |
-| Session Lease | `internal/agents/lease` | 并发会话互斥（TTL 租约） | 超时自动失效 |
-
-**设计主线：通信原语是协作层，事件流是执行层。** 两者职责严格分离——执行可审计、可恢复、可重放；协作轻量、即时、可丢。这正是 Agent OS 原语层"积木式"设计：每个原语可独立拆装，也可随机组合，都不影响主执行闭环。
+**设计主线：Agent 表达意图，Kernel 保证送达，进化回路可观测。** 通信原语是对等协作层，任务分发是调度执行层，两者正交；而 ask_agent 把"协作意图"变成一个可注入、可观测、可进化的真工具，把 IPC 从库原语接进 Agent 的认知闭环。

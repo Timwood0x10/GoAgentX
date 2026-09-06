@@ -210,11 +210,84 @@
 
 - **前置**：M3 对拍通过且外部行为一致，否则停在双跑（本步不可逆）。
 
+- **详细步骤与生产保障**：见下一节；本节只是摘要，实施以下一节为准。
+
+### M4 执行计划：彻底删除 ReAct
+
+**判定（2026-09-06 实测）：不能直接砍。** 基线已绿（`go test ./...` 137 包 ok、`gofmt -l` 空、`make gate` 绿），但四项前置未达成。
+
+| # | 前置 | 实测 | 为什么阻塞 |
+|---|---|---|---|
+| P1 | 闸门可开 | `DAGExecution` 生产零值（`peer_mode.go:308`）；`internal/ares_config` 零配置键 | 不改代码打不开，无法灰度 |
+| P2 | L2 路径有生产流量 | `Enabled=true` 只出现在 `l2graph_test.go:29`、`m3_context_test.go:158` | 生产请求数 0，全部证据是单元测试 |
+| P3 | `chatCognition` 消费者都在闸门后 | 4 处生产构造，**2 处不在闸门后**：`shadow_execution.go:90`、`introspect/dashboard.go:261` | 删即断影子执行与 introspection 面板 |
+| P4 | 只有一条 ReAct 路 | `peer_mode.go:145-148` 把 `sub.Agent` 注册进调度器执行池 | `sub/executor.go` 的循环是生产可达的第二条活路 |
+
+**ReAct 为什么在这里**（决定了删除是收敛而非取舍）：首提交的执行模型是 YAML 声明的**静态** DAG（`docs/engine/zh.md §4.2`），全库无 ReAct。轮次工具循环在 `6fe11772`（2026-06-30）进入 `sub/executor.go`，比 `MutableDAG` 出生（`296d12f4`，2026-06-12）**晚 18 天**——图当时已能运行时长节点，缺的是增量编译器（一次图变更 → 一个任务，不重建批次），所以循环留下，并被复制三份。M0 补上了那块缺口，ReAct 的存在理由随之消失。
+
+#### 保障策略：三层，前两层随 D 阶段失效，第三层永久
+
+| 层 | 机制 | 生效期 |
+|---|---|---|
+| **S1 配置回滚** | `kernel.dag_execution.enabled` 改配置重启即回 ReAct | A → D 前 |
+| **S2 影子对拍** | 复用 `shadow_execution.go`（`errShadowToolDenied` 在接口层拒掉工具调用），L2 路径跑任务副本，只比对工具序列，零生产副作用 | B1 |
+| **S3 生长护栏 + 可观测** | 深度上界、强制收敛、会话终止原因 | **永久**——D 之后唯一还在的一层 |
+
+**S3 的现存缺口（D 前必须补）**：深度耗尽已有强制收敛——`planner_cognition.go:203-209` 命中 `depth >= maxDepth` 时 warn 并 `growAnswerNode(..., "max plan depth reached")`，等价于 ReAct 的 `chat_cognition.go:248-255` 降级纯文本。但 `maxPlanDepth = 10`（`planner_cognition.go:19-23`）**未接配置**（`MaxDepth` 仅出现在 `:47/48/108`），而 ReAct 的 `MaxRounds` 是可配的（`peer_agents.go:113` → `subCfg.MaxToolRounds`）。直接删 ReAct 会把「可运维调参的上限」换成「硬编码上限」，是运维能力回退。
+
+#### A 阶段 — 装回滚手柄（可逆，不改默认行为）
+
+| # | 任务 | 验收 |
+|---|---|---|
+| A1 | 加配置键 `kernel.dag_execution.enabled`（默认 false），`peer_mode.go:308` 从配置读 | 配置 false → `Select` 返回 chat；true → 返回 router；默认值缺省时与今天逐字节一致 |
+| A2 | `MaxDepth` 接配置 `kernel.dag_execution.max_plan_depth`（默认 10） | 配置 3 时第 3 层强制收敛为 answer 节点，不再生长 |
+| A3 | 会话可观测：图深度、节点数、终止原因（正常收敛 / 深度耗尽） | 深度耗尽各产生一次带 session id 的 warn + 一次计数 |
+
+#### B 阶段 — 生产对拍（可逆，唯一能消除 P2 的一步）
+
+| # | 任务 | 验收 / 门 |
+|---|---|---|
+| B1 | 影子对拍：同一请求两条路都跑，工具调用被 `errShadowToolDenied` 拦下，比对工具名序列 | 真实请求上序列一致率达标；不一致样本全部归档，逐条定性 |
+| B2 | 灰度：部分 peer `Enabled=true`，真实工具调用 | 工具调用次数 / 时延 / 失败率与 ReAct 基线对齐；深度耗尽率低于阈值 |
+
+**门**：B2 不通过就停在双跑，不进 C。这是 §5 M4 前置「否则停在双跑」的落地含义。
+
+#### C 阶段 — 为删除清场（可逆）
+
+| # | 任务 | 验收 |
+|---|---|---|
+| C1 | `shadow_execution.go:90` 改用 router（影子执行本不该依赖具体执行体） | 影子判决行为不变 |
+| C2 | `introspect/dashboard.go:261` 同上 | 面板行为不变 |
+| C3 | 摘掉 `peer_mode.go:145-148` 的 `sub.Agent` 执行池注册 | 调度器不再有第二条 ReAct 路 |
+| C4 | 能力广告分叉（`peer_mode.go:344-354`、`:375-378`）塌成一条前，验一次外部 capability 不被误路由：`actions.go:415 req.Capability` → `submitPeerTask:606` → `:624` | 放宽后每个 peer 都广告 `ares/*` + `tool/*`，既有外部提交的 capability 仍落到正确 peer |
+| — | 收口检查 | `NewChatCognition` 的生产构造点只剩闸门后那一处 |
+
+#### D 阶段 — 删除（不可逆，单个提交内完成）
+
+| # | 对象 | 位置 |
+|---|---|---|
+| D0 | `toolprojection` 投影器 + `tool_projection_worker.go` + 配置键 | 与 ReAct 无关、无生产调用方，**可独立先做**。包外 `toolprojection.ToolStepID` 只被测试调用（`ares_evolution/tool_dimension_transmission_test.go:216-217`）；生产侧 `ToolStepID` 命中是 `feedback` / `fitness_aggregator` 的**同名字段**，不是这个函数 |
+| D1 | `chatStepState` + `chatStep` + `decodeChatStepState` | `chat_cognition.go:78` 起 |
+| D2 | 两处 `stepSchemaVersion` + 两处 `defaultMaxToolRounds` | `chat_cognition.go:47/43`、`sub/executor.go:40/36` |
+| D3 | `chatCognition` 整体 + `sub/executor.go` 工具循环 | 收敛到 §2.1 三执行体 |
+| D4 | **`DAGExecution` + `Select` 本身**，连 `TestDAGExecution_SelectKeepsLegacyBehaviorOff`、`TestM3_GateOffKeepsLegacyBehavior` 一起删 | 必须与 D3 同提交：先删 chat 后删闸门的中间态是 `Select(nil, router)` |
+| D5 | `agentloop/engine.go` **冻结不删** | 无生产 cmd 引用，动它是纯风险（§7 已裁定） |
+
+**验收**：`rg "chatStepState|stepSchemaVersion|toolprojection" -g '*.go' internal cmd` 0 命中；`go test ./...` 全绿；`make gate` 绿。
+
+**D 之后的回滚**：配置手柄随 D4 消失，回滚降级为 revert D 提交 + 重新构建部署。因此 D 前必须打 tag 并把回滚 runbook 写进发布说明——这是明账交换，不是遗漏。
+
+#### §8-6 的处置
+
+第一句（`DAGExecution` 默认关）随 D 作废：闸门是过渡工具，路径只剩一条时它没有语义，且保留它同时违反 code_rules_v2 §5.1（禁止并存两套执行循环）与本文 §7（不留「以防万一」的旁路）。§8-6 的措辞本身自带有效期——「M1.5–M5 落地后外部行为与今天一致」。第二句（`tool_weight` 默认 0）**不受影响**，属 M6 进化侧（`ares_config/config.go:1015` → `evolution_lifecycle_config.go:94`）。
+
+**不在 M4 范围**：`buildLiveAgentDAG` / `buildEvolutionDAG` 重写属 M5。
+
 ### M5 — L1 能力图
 
 - **目标**：进化有稳定作动面。
 
-- **任务**：① `buildLiveAgentDAG` 重写为 ToolClass 图，`argShape` 按**类型签名**归一（`read_file(path:string, offset:int)`），不按取值；② 把「编译进 fabric」从 live DAG key 上解绑（今天 `serve_agents.go:93 CompileDAG(ctx, liveDAG)` + `:98` 订阅会把 ToolClass 节点编成垃圾任务、把每次 L1 变异投影成任务创建），peer 级任务供给另行接入；③ `plannerCognition` 生长前读 L1 `enabled/budget/prior`。
+- **任务**：① `buildLiveAgentDAG` 重写为 ToolClass 图，`argShape` 按**声明的参数名集合**归一（`read_file` 声明 `path,offset` 即 `read_file#offset,path`），不按取值、不含类型；② 把「编译进 fabric」从 live DAG key 上解绑（今天 `serve_agents.go:93 CompileDAG(ctx, liveDAG)` + `:98` 订阅会把 ToolClass 节点编成垃圾任务、把每次 L1 变异投影成任务创建），peer 级任务供给另行接入；③ `plannerCognition` 生长前读 L1 `enabled/budget/prior`。
 
 - **验收**：`enabled=false` → 该类节点不再长出；`budget=1` → 最多 1 个实例；`ask_agent` 同受约束（协作 ACT 在此闭合）；L1 节点数不随 LLM 参数微变增长。
 

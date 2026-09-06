@@ -1,425 +1,309 @@
-# ares 架构深度解析（九）：Arena / 故障注入 — 故意破坏，见证自愈（0.3.x）
-
-> 0.3.x 更新：Arena 与 Agent Fabric 的 spawn/kill/recover 生命周期深度集成。故障注入不再只测试 Agent 复活，而是测试 **Agent 死亡 ≠ Task 死亡**——杀掉 Agent 后，Task Fabric 从检查点恢复进度，Agent Fabric 创建新 Agent 继续执行。
+# ares 架构深度解析（九）：Arena / 故障注入 — 故意破坏，然后自己爬起来（0.3.x）
 
 > 别的 Agent 框架给你展示的是 Agent 有多聪明：对话流利、推理能力强、工具用得溜。
-> ares 展示的是另一件事：**当你故意杀死它的 Agent 时，它能不能活下来。**
-> 我管这个叫"秽土转生验证"——在 Dashboard 上点一个按钮，暗杀正在工作的 Agent，看它能不能自己爬起来。
+> ares 想展示的是另一件事：**你故意破坏它，它能不能自己爬起来。**
+> 你可以在 Dashboard 上点一个按钮，杀掉正在工作的 Agent，看它能否自己恢复。
+>
+> 0.3.x 更新：故障注入与恢复验证分成了两套独立的表面。
+> - **`internal/aresrecovery`**：面向新的 Kernel 模型（agentfabric + taskfabric）。core 源码注释里写得很直白：**"Chaos breaks, Recovery fixes."**（Chaos 负责破坏，Recovery 负责修复）。这才是真正被接进生产 serve 路径、并带失效保护(fail-safe)的那套。
+> - **`internal/ares_arena`**：面向旧的"leader / sub agent + DAG"模型，是独立的 `ares arena serve` 混沌演练进程。它的 `Injector` 注释同样直白：**"它不实现恢复，恢复交给已有的 resurrection 插件和 failover。"**
+
+> 先说明本文的边界：下面讲到的每个符号、每条流程都是我在这份代码里实际读到的。凡是"配置了但代码里明确还没做成"或"需要额外接线才能生效"的部分，我会标出（待核实），不替它吹。
 
 ---
 
-## 一、我为什么做了一个"搞破坏"的功能
+## 一、为什么要做一个"搞破坏"的功能
 
-说起来你可能不信，Arena 模块的灵感来自于一次生产事故。
+你手动 kill 掉一个在跑的 Agent，发现它自己又起来了，还继续干刚才没干完的活——这体验确实很爽。但爽归爽，**你只会傻乐，不能证明系统真的能扛**。
 
-当时我在测试 Agent 的稳定性，手动 kill 了一个进程。结果发现 Agent 自动复活了，而且继续干之前没干完的活。我当时很兴奋，但转念一想：**这只是我手动测的，能不能自动化测试？**
+所以要做 ChAOS Engineering：不是手动点一次，而是**系统性、可重复地把故障打进去，然后验证恢复**。这也正是本系列第 7 篇讲的生命周期里，Kernel 模型那个最关键断言的实验台——**"Agent 死亡 ≠ Task 死亡"**。
 
-于是就有了 Arena——一个专门用来"搞破坏"的模块。它不是用来展示 Agent 有多聪明的，是用来展示 Agent 在持续被搞的情况下能不能活下来的。
+---
 
-Arena 的秘密其实很简单：**它不自己实现任何 Runtime、DAG 或恢复逻辑。它只是故意调用现有的危险 API（StopAgent、RemoveNode、RemoveEdge），然后等着看系统自己修好自己。**
+## 二、先分清两套"混沌"
+
+读代码时最容易踩的坑，是这个仓库里**有两套各自独立**的故障注入/恢复逻辑，不能混为一谈：
+
+| 表面 | 位置 | 目标模型 | 生产接线 | 恢复责任 |
+|------|------|----------|----------|----------|
+| Kernel 混沌 | `internal/aresrecovery` | agentfabric + taskfabric（新） | `cmd/ares` 的 `wireChaos`（live 模式多重门槛，默认 shadow） | `Recovery` 自己实现完整恢复链 |
+| Arena 演练 | `internal/ares_arena` | 旧 leader/sub agent + DAG | 独立进程 `ares arena serve` | `Injector` 明确**不**实现恢复，交给 ares_runtime 的 resurrection/failover |
+
+两者都叫"混沌"，但一个是**被接进生产、带失效保护的恢复验证**，另一个是**独立于生产之外的演练进程**。下文分别讲。
+
+---
+
+## 三、Kernel 混沌：Chaos 破坏，Recovery 修复
+
+`internal/aresrecovery/chaos.go` 顶部注释就是这个模块的纲领：
+
+> "Chaos is the Failure Injection + Recovery Verification harness… it deliberately kills agents to prove the Runtime (Recovery subsystem) can restore their tasks. **Chaos is SEPARATE from Recovery — Chaos breaks, Recovery fixes.**"
+
+拆开看：
+
+- `FailureType` 只有两种：
+  - `FailureKill` — 硬杀（crash）：Agent 被立即移除
+  - `FailureSuspend` — 软挂起（模拟 hang/卡住，不是崩溃）
+- `Chaos.InjectFailure(ctx, agentID, failure)` — 只负责破坏。注释特别强调：**这里不会触发恢复**，恢复要显式调用 `VerifyRecovery`。这样测试才能先断言"注入后任务卡住（stranded）"，再断言"调 VerifyRecovery 后任务恢复"。它记录 `injected[agentID] → FailureType`。
+- `Chaos.VerifyRecovery(ctx) int` — 把转发给 `Recovery.RecoverFromAgentDeath`，返回**完整恢复的任务数**。这就是"Recovery Verification"的一半。
+
+`Recovery`（`recovery.go`）负责真正修复，恢复链是：
+
+1. `RequeueExpiredLeases()` → 扫已过期租约，把**只有真正过期的任务**重排队回 READY。代码注释强调：绝不能遍历所有 READY 任务，那样会劫持与本崩溃无关的新任务。
+2. `RecoverTaskCheckpoint(taskID, replacementID)` → 找到/生成一个替换 Agent，为它 Acquire 任务，并把保存的检查点安装成新 Agent 的认知状态（从断点续跑）。
+3. `RestartAgent(deadAgentID, cognitive, capabilities)` → 用调试预算按固定 ID 原地复活（有 death snapshot 时保留同一身份），否则生成全新 ID。重启预算是**终身累计**的：默认 5 次、退避 1s→30s 封顶（`DefaultRestartPolicy`），预算耗尽返回 `ErrRecoveryExhausted`，防止一个坏 Agent 无限循环。注意：一次复活成功**不会**重置累计次数，只有死亡总数消耗它。
+4. `RecoverFromAgentDeath(ctx) int` → 把 1-3 串起来，扫过期租约 → 重排队 → 对每个重排队任务做检查点恢复，返回成功恢复的数量。
+
+> 需要坦率说明的两点：
+> - `RecoverTaskCheckpoint` 和 `RecoverFromAgentDeath` 的注释都标注为 **TEST / CHAOS-ONLY**：它们用 `agents.SetCognitiveState` + 自己手动 Acquire，是独立于生产调度路径（`runKernelRecoveryLoop` → `taskfabric.DecodeCheckpoint`）的另一套机制，**不应当被接进生产 serve 路径**。生产恢复走 `cmd/ares` 的 `runKernelRecoveryLoop`。
+> - 所以 `Chaos`/`Recovery` 这套，语义重心落在**恢复验证**；真正跑在生产上、被事件驱动的恢复循环是 `cmd/ares/kernel_loop.go` 的 `runKernelRecoveryLoop`。
 
 ```mermaid
-graph TB
-    subgraph "Arena 控制台"
-        D[Dashboard\nDAG 视图 + 控制面板]
+flowchart TB
+    subgraph CHAOS["Chaos —— 破坏（Chaos breaks）"]
+        INJ["Chaos.InjectFailure(ctx, agentID, FailureType)"]
+        K["FailureKill = 硬杀（立即移除）"]
+        S["FailureSuspend = 软挂起（模拟卡住）"]
+        INJ --> K
+        INJ --> S
     end
 
-    subgraph "Arena 引擎"
-        I[Fault Injector]
-        S[Service]
-        M[Metrics Collector]
+    subgraph STATE["Agent 死亡之后"]
+        AD["agentfabric：Agent 被 kill / suspend"]
+        EX["taskfabric：租约过期 → 任务回到 READY"]
+        AD --> EX
     end
 
-    subgraph "ares 运行时"
-        RT[Runtime]
-        DAG[MutableDAG]
-        ES[EventStore]
-        FR[Flight Recorder]
+    subgraph REC["Recovery —— 修复（Recovery fixes）"]
+        VR["Chaos.VerifyRecovery(ctx)"]
+        R1["RequeueExpiredLeases：只重排队真正过期的任务"]
+        R2["RecoverTaskCheckpoint：新 Agent + 安装检查点续跑"]
+        R3["RestartAgent：重启预算 5 次，1s→30s 退避"]
+        VR --> R1 --> R2 --> R3
     end
 
-    D -->|刺杀 Leader| I
-    D -->|杀死 Agent| I
-    D -->|删除节点| I
-    D -->|删除边| I
-    D -->|注入故障| I
-    I -->|调用| RT
-    I -->|调用| DAG
-    S -->|记录| ES
-    S -->|桥接| FR
-    M -->|读取| ES
-    M -->|计算| SC[ResilienceScore]
+    EX -. "注入后状态由 Recovery 接手" .-> VR
+    R3 --> DONE["返回完整恢复的任务数"]
 ```
 
-核心文件：
+### 生产接线：wireChaos（shadow / live）
+
+`cmd/ares/serve_chaos.go` 的 `wireChaos` 把 Chaos 接进 serve 路径，默认且最安全的姿态是 **shadow**：
+
+- 默认 `mode=shadow`（或未启用、或 live 但门槛不满足）→ 只跑 `shadowSandboxLoop`：用**独立的 scratch fabric** 周期重放"spawn→create→acquire→kill→lease expire→recover"，**绝不碰生产 Agent**，把验证结果上报 introspect 面板。
+- 要切到 `mode=live`，必须**四个门槛同时满足**：`chaos.enabled=true`、`allow_live=true`、`eligible_capabilities` 非空（目标白名单，空列表直接拒绝上膛）、`stop_token` 非空（紧急停靠凭据）。缺一就退回 shadow。
+- live 循环 `liveChaosLoop` 有**六重护栏**（注释原话）：紧急停止 `POST /api/chaos/stop`、失效保护闩、GA 静默窗口、令牌桶限速、每 Agent 冷却、能力白名单。每次注入都是 `InjectFailure(FailureKill)` → `runLiveChaosInjection` → `VerifyRecovery`；**如果恢复验证返回 0，立即扳失效保护闩，此后不再注入，直到进程重启**。
+
+```mermaid
+flowchart LR
+    subgraph Guards["live 混沌六重护栏"]
+        G1["紧急停止 /api/chaos/stop"]
+        G2["失效保护闩：恢复=0 即停"]
+        G3["GA 静默窗口"]
+        G4["令牌桶限速 RatePerMin"]
+        G5["每个 Agent 冷却 Cooldown"]
+        G6["能力白名单 eligible_capabilities"]
+    end
+    LOOP["liveChaosLoop"] --> Guards
+    Guards --> INJ2["InjectFailure(FailureKill)"]
+    INJ2 --> VR2["VerifyRecovery(ctx)"]
+    VR2 -->|"恢复=0"| LATCH["失效保护：停止后续注入"]
+    VR2 -->|"恢复>0"| CONT["继续下一轮"]
+```
+
+---
+
+## 四、Arena 演练进程：`internal/ares_arena`
+
+这是旧的、独立于生产的混沌演练层，由 `ares arena serve` 启动。它自己起一个 demo Agent 池（`arena-worker-1..3`，type=coder）和一棵可变 DAG，专门用来演示"打进故障 → 看系统反应"。
+
+核心文件（真实路径，与旧文不同）：
 
 | 文件 | 用途 |
 |------|------|
-| `internal/arena/types.go` | ActionType、Action、Result、Stats |
-| `internal/arena/injector.go` | FaultInjector — 包装 Runtime + DAG API |
-| `internal/arena/service.go` | Arena Service — 执行动作、记录历史 |
-| `internal/arena/http.go` | REST API + SSE 推流 |
-| `internal/arena/scenario.go` | 场景编排器 |
-| `internal/arena/survival.go` | 生存模式 — 持续随机故障 |
-| `internal/arena/metrics.go` | MetricsCollector — 恢复耗时 + 计数 |
-| `internal/arena/score.go` | ResilienceScore — 三维评分 |
-| `internal/arena/integration.go` | FlightBridge — Arena → Flight Recorder |
-| `internal/dashboard/static/app.js` | 前端：DAG 可视化、控制面板、事件日志 |
-| `cmd/arena/main.go` | CLI：run / validate / list / survival / inspect / serve |
+| `internal/ares_arena/types.go` | ActionType（13 种）、Action、Result、Stats |
+| `internal/ares_arena/injector.go` | Injector — 包装 `ares_runtime` + `MutableDAG`，**不实现恢复** |
+| `internal/ares_arena/service.go` | Service — Execute 动作、记录指标、发事件/失败证据 |
+| `internal/ares_arena/scenario.go` | 场景编排：YAML → 串行动作 → 报告 |
+| `internal/ares_arena/survival.go` | 生存模式：按间隔随机注入 |
+| `internal/ares_arena/metrics.go` | MetricsCollector — 每动作类型聚合 |
+| `internal/ares_arena/score.go` | 三维弹性评分 |
+| `internal/ares_arena/http.go` | REST + SSE + API key 认证 |
+| `internal/ares_arena/integration.go` | FlightBridge — arena 动作 → 飞行记录器 |
+| `internal/ares_arena/evolution_bridge.go` | EvolutionBridge → evolution Coordinator（待核实） |
+| `cmd/ares/arena.go` | `ares arena` CLI：run / validate / list / serve / survival / inspect |
+| `cmd/ares/serve_chaos.go` | 生产 kernel 混沌接线（上一节的 wireChaos） |
 
----
+> 旧文里的 `internal/arena/…`、`internal/dashboard/static/app.js`、`cmd/arena/main.go` 等路径**在仓库里并不存在**。真实路径是上面这些；arena 没有内置静态前端，前端可视能力由 REST/SSE 端点提供。
 
-## 二、架构
+### 4.1 注入器：薄薄一层，不实现恢复
 
-### 2.1 核心设计原则
-
-Arena **不实现自己的** Runtime、DAG 或恢复系统。它是一个薄层，直接调用已有 API：
-
-```go
-func (in *Injector) KillAgent(ctx context.Context, id string) error {
-    return in.runtime.StopAgent(ctx, id)
-    // 复活由现有的 Resurrection 插件自动处理
-}
-
-func (in *Injector) RemoveNode(ctx context.Context, id string) error {
-    return in.dag.RemoveNode(ctx, id)
-    // MutableDAG 自动重建拓扑
-}
-```
-
-### 2.2 十三种混沌动作
-
-```mermaid
-graph LR
-    subgraph "基础设施故障"
-        A[杀死 Leader] -->|触发| LF[Leader 故障转移]
-        B[杀死 Agent] -->|触发| AR[自动复活]
-        C[杀死编排器] -->|触发| LF
-    end
-
-    subgraph "拓扑故障"
-        D[删除节点] -->|触发| DR[DAG 重建]
-        E[删除边] -->|触发| DR
-    end
-
-    subgraph "运行时故障"
-        F[暂停 Agent] -->|测试| SS[慢启动]
-        G[减慢 Agent] -->|测试| TO[超时处理]
-        H[网络分区] -->|测试| NC[网络韧性]
-    end
-
-    subgraph "组件故障"
-        I[工具超时] -->|测试| TR[工具重试]
-        J[内存破坏] -->|测试| MR[内存恢复]
-        K[MCP 断连] -->|测试| MRR[MCP 重连]
-        L[LLM 故障] -->|测试| LR[LLM 重试/降级]
-    end
-```
-
-### 2.3 三层架构
-
-```mermaid
-graph TB
-    subgraph "API 层 (http.go)"
-        REST[REST API\n20+ 端点]
-        SSE[SSE 推流\n/arena/stream]
-    end
-
-    subgraph "服务层 (service.go)"
-        EXEC[执行动作]
-        HIST[历史 + 统计]
-        SCORE[ResilienceScore]
-        SURV[生存模式]
-        SCEN[场景运行]
-    end
-
-    subgraph "注入层 (injector.go)"
-        KILL[KillAgent / KillLeader]
-        DAG_OPS[RemoveNode / RemoveEdge]
-        FAULT[ToolTimeout / MemCorrupt / ...]
-    end
-
-    REST --> EXEC
-    EXEC --> KILL
-    EXEC --> DAG_OPS
-    EXEC --> FAULT
-```
-
----
-
-## 三、故障注入
-
-### 3.1 注入器设计
-
-`Injector` 依赖两个接口——`RuntimeProvider` 和 `DAGProvider`——它们都是完整 Runtime/DAG 能力的一个子集。这种基于接口的设计意味着 Arena 不需要引入具体的 Runtime 或 DAG 包，只需要很小的 API 面。任何实现这些接口的类型都可以使用，使 Arena 可以轻松地用 mock 进行测试。
-
-### 3.2 刺杀 Leader — 招牌动作
-
-刺杀 Leader 是 Arena 最具冲击力的演示，一次性证明三种能力：
+`Injector` 依赖两个**接口子集**：`RuntimeProvider`（ares_runtime 的能力子集）和 `DAGProvider`（可变 DAG 的增删能力子集）。基于接口的设计让 arena 不需要引入具体 Runtime/DAG 包，也容易 mock。
 
 ```go
+// internal/ares_arena/injector.go
+// Injector wraps existing ares_runtime/DAG APIs to inject chaos.
+// It does NOT implement recovery; the existing resurrection plugin and
+// failover handle that automatically.
+type Injector struct {
+	ares_runtime RuntimeProvider
+	dag          DAGProvider
+}
+
 func (in *Injector) KillLeader(ctx context.Context) (string, error) {
-    leaderID := ""
-    for _, info := range in.runtime.ListAgents() {
-        if info.Type == "leader" {
-            leaderID = info.ID
-            break
-        }
-    }
-    if leaderID == "" {
-        return "", ErrLeaderNotFound
-    }
-    if err := in.runtime.StopAgent(ctx, leaderID); err != nil {
-        return "", fmt.Errorf("arena: kill leader %s: %w", leaderID, err)
-    }
-    return leaderID, nil
+	leaderID := ""
+	for _, info := range in.ares_runtime.ListAgents() {
+		if info.Type == "leader" { leaderID = info.ID; break }
+	}
+	if leaderID == "" { return "", ErrLeaderNotFound }
+	if err := in.ares_runtime.StopAgent(ctx, leaderID); err != nil {
+		return "", fmt.Errorf("arena: kill leader %s: %w", leaderID, err)
+	}
+	return leaderID, nil
 }
 ```
 
-因果链：
-1. Arena 调用 `StopAgent("leader-1")`
-2. Runtime 标记 Agent 为停止状态
-3. Agent goroutine 退出
-4. `NotifyAgentDead` 被调用
-5. LeaderSupervisor 检测到 Leader 缺失
-6. 故障转移触发：选举 → 检查点恢复 → 事件重放
-7. 新 Leader 在数秒内被推举并运行
+它没有自己实现任何恢复。恢复被**期望**来自 ares_runtime 的 resurrection/failover。`KillLeader` 就是查一个 type=="leader" 的 Agent，然后 `StopAgent` 而已——"新 Leader 由 failover 自动推举"这一步并不在这个进程内实现。
 
----
+`internal/ares_arena/e2e_chaos_recovery_test.go` 里有一个真正的端到端验证：它驱动真正的 `ares_runtime.Manager`，注册带重建 factory 的 worker 池，调用 `Manager.NotifyAgentDead(...)` 模拟批量崩溃，然后轮询 factory 调用次数，断言复活异步发生、Manager 仍跟踪着一个存活的池。规模测到 16/64/128。
 
-## 四、服务层
+### 4.2 十三种动作
 
-### 4.1 动作执行
+`types.go` 定义了 13 种 `ActionType`：
 
-```go
-func (s *Service) Execute(ctx context.Context, action Action) Result {
-    start := time.Now()
-    var err error
+`kill_leader` `kill_agent` `remove_node` `remove_edge` `pause_agent` `resume_agent` `slow_agent` `kill_orchestrator` `network_partition` `tool_timeout` `memory_corrupt` `mcp_disconnect` `llm_failure`
 
-    switch action.Type {
-    case ActionKillLeader:
-        _, err = s.injector.KillLeader(ctx)
-    case ActionKillAgent:
-        err = s.injector.KillAgent(ctx, action.TargetID)
-    // ... 13 种 case
-    }
+`Service.Execute` 用 `switch action.Type` 把动作分发到 `Injector` 对应方法，然后：记录 `Stats`、`MetricsCollector.RecordActionResult`、往 EventStore 发 `arena.*` 事件、失败时往统一 Evidence Store 追加 `kind=failure` 证据、并调用已挂接的 `FlightBridge` / `EvolutionBridge`。
 
-    result := Result{Success: err == nil, Duration: time.Since(start)}
-    s.recordMetrics(action.Type, result.Success, result.Duration)
-    s.emitEvent(ctx, action, result)
-    return result
-}
-```
+### 4.3 场景编排
 
-每个动作结果都会被发射为 EventStore 中的事件，通过 SSE 推送到 Dashboard 前端实时展示。
-
----
-
-## 五、弹性评分
-
-### 5.1 三维评分系统
-
-```mermaid
-graph TB
-    subgraph "弹性评分"
-        direction TB
-        A[可用性<br/>40% 权重]
-        R[恢复<br/>30% 权重]
-        C[一致性<br/>30% 权重]
-    end
-
-    A --> A1[故障成功率]
-    R --> R1[恢复率<br/>维度的 70%]
-    R --> R2[恢复速度<br/>维度的 30%]
-    C --> C1[数据一致性率]
-
-    A1 -.->|公式| FINAL[最终得分<br/>0-100]
-    R1 -.->|公式| FINAL
-    R2 -.->|公式| FINAL
-    C1 -.->|公式| FINAL
-
-    FINAL --> GRADE[等级: A+/A/B/C/D/F]
-```
-
-| 分数范围 | 等级 |
-|---------|------|
-| ≥ 95 | A+ |
-| ≥ 90 | A |
-| ≥ 80 | B |
-| ≥ 70 | C |
-| ≥ 60 | D |
-| < 60 | F |
-
----
-
-## 六、场景编排器
-
-YAML 定义混沌动作的编排序列：
+`scenario.go` 用 YAML 定义动作序列。真实示例在 `examples/arena/`（`leader_assassination.yaml`、`cascading_storm.yaml`）：
 
 ```yaml
-name: leader-failover-storm
+name: leader-assassination-and-recovery
+config:
+  stop_on_error: false
+  parallel_actions: false
+  warmup: 1s
+  cooldown: 1s
 actions:
-  - delay: 0s
-    action:
-      type: kill_leader
-  - delay: 8s
-    action:
-      type: kill_agent
-  - delay: 5s
-    action:
-      type: slow_agent
-      metadata:
-        duration: 8s
+  - delay: 2s
+    action: { type: kill_leader }
+    label: kill-leader
+  - delay: 1s
+    action: { type: kill_agent, target_id: agent-1 }
+    label: kill-agent-1
+  - delay: 3s
+    action: { type: network_partition, target_id: agent-2 }
+    label: partition-agent-2
+  - delay: 1s
+    action: { type: slow_agent, target_id: agent-3, metadata: { delay: 10s } }
+    label: slow-agent-3
 ```
 
-两个内置场景：
-- **`leader_assassination.yaml`**：4 阶段 — 刺杀 Leader → 验证新 Leader → 随机杀 Agent → 负载下减慢 Agent
-- **`cascading_storm.yaml`**：7 阶段 — 网络分区 → 杀死 → 工具超时 → 内存破坏 → MCP 断连 → LLM 故障 → 级联减慢
+`ValidateScenario` 检查名称、至少一个动作、delay 非负、每动作有效性、`max_concurrent`/`timeout` 非负。`RunScenarioReport` 支持 warmup/cooldown、整体 timeout、`stop_on_error`。
+
+> 必须坦率说明：`ScenarioConfig` 里的 `parallel_actions`、`max_concurrent`、以及动作上的 `depends_on`，**代码里明确"配置了但尚未实现"**——`RunScenarioReport` 会打 warn 日志并（待核实后）始终**串行**执行。
+
+### 4.4 生存模式
+
+`survival.go` 的 `Service.RunSurvival` 按配置间隔（默认 30min、每 10s）随机从 13 种动作里挑一个、随机选目标（list 出来的 Agent 或 DAG 节点/边）打进去，记录 `Timeline`。`SurvivalReport` 里没有内置分数样本——旧文那些 `Score: 100.0 (A+)` / `97.3` 之类的实时输出是我在旧文里看到但没有在代码里找到的，这里不放。
 
 ---
 
-## 七、生存模式
+## 五、三维弹性评分
 
-生存模式在配置的持续时间内持续注入随机故障：
-
-```bash
-ares arena survival --addr http://localhost:8080 --duration 30m --interval 10s
-```
-
-实时输出：
-
-```
-Elapsed: 12s         Actions: 1     Score: 100.0 (A+)
-Elapsed: 22s         Actions: 2     Score: 97.3 (A+)
-```
-
-13 种故障类型随机选择目标。Ctrl+C 停止并打印最终报告。
-
----
-
-## 八、Dashboard 集成
-
-### 8.1 前端
-
-Arena 标签页提供：
+`score.go` 的 `ResilienceScore` 是加权三维评分，`gradeFromScore` 用固定阈值映射等级。
 
 ```mermaid
-graph TB
-    subgraph "Arena Dashboard"
-        TOP[顶栏]
-        DAG[DAG 视图\nSVG 实时]
-        SIDE[侧面板]
+flowchart TB
+    subgraph Score["ResilienceScore —— 三维加权（score.go）"]
+        A["可用性 Availability（权重 40%）"]
+        R["恢复 Recovery（权重 30%）"]
+        C["一致性 Consistency（权重 30%）"]
     end
+    A --> A1["base = (total - failed) / total × 100"]
+    R --> R1["恢复速率 ×70% + 恢复速度 ×30%"]
+    R1 --> R2["速度：avg ≤1s→100，≥10s→0，线性插值"]
+    C --> C1["优先用 metrics.DataConsistencyRate，否则启发式"]
+    A1 -.加权求和.-> FIN["Final = A×0.4 + R×0.3 + C×0.3"]
+    R2 -.-> FIN
+    C1 -.-> FIN
+    FIN --> G["grade：≥95 A+ / ≥90 A / ≥80 B / ≥70 C / ≥60 D / 其余 F"]
+```
 
-    subgraph "顶栏"
-        SCORE[评分环 + 等级]
-        STATS[故障/恢复/失败/平均恢复]
-        FAULTS[故障按钮行]
+关于一致性维度的**诚实说明**：`metrics.go` 里 `MetricsSnapshot.DataConsistencyRate` 默认是 0，因为 `RecordConsistency` 已标记 **Deprecated**（`RecordActionResult` 才是现行入口），实际没有源源不断喂数据进来。所以代码路径 `calcConsistency`：
+- 有 `metrics.DataConsistencyRate > 0` 就用它；
+- 否则走**启发式**：把失败数的一半当作"与数据有关"（`dataRelated = max(1, failed/2)`），每单位扣 5 分。
+
+也就是说，第三维"一致性"——除非有人把真实的一致性指标接进 Metrics——默认是一套明说的**估算**，不是实测值。恢复速度阈值（≤1s=100，≥10s=0）也只是这套评分自己的标尺，别当成实测 SLA。
+
+---
+
+## 六、HTTP 与认证
+
+`http.go` 的 `Handler` 注册了约 27 个路由：`/arena/leader/kill`、`/arena/agent/{id}/kill|pause|resume|slow|partition|tool-timeout|memory-corrupt|mcp-disconnect|llm-failure`、`/arena/node/{id}/remove`、`/arena/edge/remove`、`/arena/orchestrator/kill`，以及 `stats/history/stream`（SSE）/`score/metrics`、survival 三件套、flight timeline/diagnostics、scenario run/validate。
+
+arena 暴露的都是破坏性端点（杀 leader、删节点、内存破坏），所以认证默认是 **deny**：
+- 设了 API key（`--api-key` 或 `ARENA_API_KEY`），则所有请求必须带 `X-API-Key` 头（常量时间比较）。
+- 没设 key 且没显式 `--allow-anonymous`，`APIKeyAuthMiddleware` 一律 401——旧文里"打开 Dashboard 点按钮"那种无需鉴权的用法，在真实代码里默认是被拒绝的。`--allow-anonymous` 只能用于本地开发，且注释警告绝不能用于可被网络到达的部署。
+
+---
+
+## 七、飞行记录器与进化桥接
+
+**FlightBridge**（`integration.go`）把每个 arena 动作写成飞行记录器的 timeline 事件，失败动作再补一条 diagnostic 记录（并调用 `flight.SuggestFix`）。这是确定有效的接线：`service.Execute` 在每个动作后调用 `s.bridge.OnActionExecuted`。
+
+**EvolutionBridge**（`evolution_bridge.go`）把 arena 的失败动作翻译成给 evolution Coordinator 的 `PatchProposal`：`ActionRemoveNode → PatchInsertNode`、`ActionKillAgent/KillLeader → PatchReplaceNode`、`ActionSlowAgent/ToolTimeout → PatchChangeScheduler`、基础设施类故障 → `PatchChangeRecoveryStrategy` 等，并按 `chaosPriority` 分级：**priority ≥ 9** 的故障（杀 leader/orchestrator）走 `Coordinator.ApplyEmergency` 立即自愈，其余走 `Coordinator.Submit` 评估。
+
+> （待核实）：`OnActionExecuted` 在失败时确实会构造 proposal 并提交/紧急应用。但 "chaos→Coordinator"，以及"Coordinator 评估的这个 proposal 最终是否会产生真实的运行时/调度变更"，取决于 Coordinator 及其 patch 应用器的接线与行为。在 `arena serve` 这个**独立演练进程**里，它操作的是进程自己的 demo Agent 池与 MutableDAG；这些 patch 是否回灌到真实的生产运行时，我没有在这篇文章覆盖的代码里确认到，存疑，特此标注。
+
+值得一并提的是 `cmd/ares/peer_mode.go` 里那条确定生效的**执行反馈回路**（`aresrecovery`，面向 Kernel 模型）：
+- `ExecutionAttribution.Record/RecordWithMetrics(agentID, capability, success, latency, retries, recovers)` 采集每个 (agent, capability) 的结果。
+- `DeterministicScorer` 是**零 LLM** 的确定性评分：权重 `success 0.70 / latency 0.15 / retries 0.10 / recovers 0.05`，输出恒在 [0,1]，无历史返回中性先验 0.5。它是 GA fitness 的确定性信号，不依赖随机源/LLM。
+- `EvolutionFeedbackAdapter.Apply` 把 Attribution 快照推回 `ConfidenceInjector.SetAgentConfidence / SetCapabilityConfidence`，下一次调度就会看到新置信度——失败多的 Agent 被降权，成功多的被偏好。
+- 变化归因 `ChangeAttributor.Attribute` 用相邻两代 `GenerationSnapshot.BestScore` 的 delta 分配每处变更的影响：有显式 Impact 的用显式值，其余按剩余 delta 均分。
+
+另外 `chaos.go` 里的 `EvolutionAdapter`（`AdaptPopulation(spawn, retire)`）是"运行期自适应"表面：进化决定 population 增减，Kernel 通过现有 spawn/retire 原语执行（"Agent decides; Kernel enforces"）。它的 `tasks` 字段注释说 **当前有意未使用**——调度策略的切换要等未来迭代接到 `taskfabric.Schedule`。所以：population 适配实现了，调度策略适配是"声明了但还没接"。
+
+```mermaid
+flowchart LR
+    subgraph arena["Arena 演练流程（ares_arena）"]
+        IN2["Injector：kill / pause / remove / slow / timeout / corrupt …"]
+        SV["Service.Execute(action)"]
+        M["Stats + MetricsCollector"]
+        EV["EventStore arena.* 事件 + 失败 evidence"]
+        FB["FlightBridge → 飞行记录器"]
+        EB["EvolutionBridge → Coordinator（待核实回灌）"]
+        IN2 --> SV --> M
+        SV --> EV --> FB
+        SV --> EB
     end
-
-    subgraph "侧面板"
-        CARDS[Agent 卡片]
-        LOG[事件日志/时间线]
-    end
-
-    TOP --> SCORE
-    TOP --> STATS
-    TOP --> FAULTS
-    DAG --> SIDE
-    SIDE --> CARDS
-    SIDE --> LOG
-```
-
-**13 个故障按钮**：☠Leader / ⚙Orch / Kill / ✕Node / ✕Edge / ⏸Pause / ▶Resume / 🐌Slow / 🗡Partition / ⏰Timeout / 📚MemCorrupt / 📱MCP DC / 🧠LLM Fail
-
-**事件日志**实时滚动恢复叙事：
-
-```
-10:01:02 ✗ kill_leader → Leader killed
-10:01:04 ✓ kill_leader → New leader elected
-10:01:06 ✓ workflow → Workflow resumed
-```
-
-### 8.2 事后 inspect
-
-```bash
-ares arena inspect --addr http://localhost:8080
-```
-
-```
-═══════════════════════════════════════════════════════
-  Arena Inspection Report
-═══════════════════════════════════════════════════════
-
-  Score:          92.4 (A)
-  Recovery Rate:  92.9%
-  Faults:         32 total, 31 recovered, 1 failed
-  Diagnostics:
-    concurrency_error    3  (37.5%)
-    tool_timeout         2  (25.0%)
+    EV --> SSE["/arena/stream SSE 推流"]
 ```
 
 ---
 
-## 九、CLI 命令速查
+## 八、CLI 命令速查
 
 | 命令 | 说明 |
 |------|------|
-| `ares arena run <scenario.yaml>` | 对远程服务器运行场景 |
-| `ares arena validate <scenario.yaml>` | 本地验证场景文件 |
-| `ares arena list [dir]` | 列出目录中的场景文件 |
-| `ares arena serve [--addr]` | 启动 Arena HTTP 服务器 |
-| `ares arena survival [--addr] [--duration]` | 启动生存模式（实时进度） |
-| `ares arena inspect [--addr]` | 事后分析报告 |
+| `ares arena run <scenario.yaml>` | 对远程/本地 arena 服务器运行场景并打印报告 |
+| `ares arena validate <scenario.yaml>` | 本地校核场景（或 `--remote` 走网络） |
+| `ares arena list [dir]` | 列出目录里的场景文件 |
+| `ares arena serve [--addr] [--api-key]` | 启动 arena 演练服务器（默认 deny 认证） |
+| `ares arena survival [--addr] [--duration] [--interval]` | 启动生存模式并按秒轮询状态 |
+| `ares arena inspect [--addr] [--timeline] [--diagnostics]` | 读取评分/指标/时间线/诊断报告 |
 
 ---
 
-## 十、架构总结
+## 九、结语
 
-### 设计模式
+把这套东西讲透之后，我希望你能记住的不是某个分数，而是两条**写进注释的边界**：
 
-| 模式 | 位置 | 用途 |
-|------|------|------|
-| 外观模式 | `Injector` | 将 Runtime + DAG 包装为统一的混沌接口 |
-| 策略模式 | `ActionType` → `Service.Execute` | 分发 13 种故障类型 |
-| 观察者模式 | SSE 推流 | 实时事件推送至 Dashboard |
-| 装饰器模式 | `FlightBridge` | 用飞行记录增强 Arena 动作 |
-| 组合模式 | `Scenario` | 多个编排动作作为一次运行 |
-| CLI 命令模式 | `cmd/arena/main.go` | 6 个子命令 |
+1. 在 `internal/aresrecovery`：**"Chaos breaks, Recovery fixes."** 破坏和修复是两个独立职责，中间靠一个显式的 `VerifyRecovery()` 验证把两半焊起来。生产里 live 混沌被六重护栏锁得死死的，默认姿态是连生产 Agent 都不碰的 shadow sandbox。
+2. 在 `internal/ares_arena`：**"It does NOT implement recovery."** 它只负责把故障打进去，恢复是 ares_runtime 里既有机制的事，独立于生产之外当演练场。
 
-### Arena 证明的自愈能力
+我没有在这个仓库里看到旧文那种"Score 100.0 (A+)"、"1.4 秒内复活"、"97.3% 恢复率"的数字证据，所以上面一个都没写；一致性维度默认是启发式，`parallel_actions`/`depends_on` 尚未真正实现，`EvolutionBridge` 的回灌效果也标注待核实。
 
-```mermaid
-graph TB
-    subgraph "Arena 证明 ares 是自愈运行时"
-        A[刺杀 Leader] --> LA[Leader 选举 ✓]
-        A --> CK[检查点恢复 ✓]
-        A --> ER[事件重放 ✓]
-
-        B[杀死 Agent] --> AR[自动复活 ✓]
-        B --> SR[状态恢复 ✓]
-        B --> CR[上下文保持 ✓]
-
-        C[删除节点/边] --> DR[DAG 重建 ✓]
-        C --> AP[备选路径 ✓]
-
-        D[工具超时] --> TR[工具重试 ✓]
-        D --> DG[降级处理 ✓]
-
-        E[生存模式] --> FR[故障恢复率 >97% ✓]
-        E --> RT[恢复时间 <2s ✓]
-    end
-```
-
----
-
-## 十一、结语
-
-Arena 是我觉得 ares 最有意思的功能。不是因为技术多牛——是因为它展示了别的框架不太会展示的东西：**系统在被持续破坏的时候能不能活下来。**
-
-13 种故障类型、场景编排、生存模式、实时 Dashboard、Flight Recorder 集成、三维弹性评分……这些东西堆在一起，让 `ares arena run cascading_storm.yaml` 不再是一个测试命令——它是一个"看我系统有多抗造"的 Demo。
-
-有一次我给朋友演示：打开 Dashboard，点击"刺杀 Leader"，Agent 挂了……然后 1.4 秒后自动复活。朋友说："卧槽，还带这样的？"
-
-我心想：**对，就是这样。这就是我花这么多时间做这套系统的原因。**
-
-> "故意破坏，见证自愈。"——这是 ares 最令人印象深刻的 Demo，也是我写这个框架最大的成就感来源。
+> 把"故意破坏，然后自己爬起来"做成可重复、可验证、并且默认不碰生产的过程，这才是这件事真正难的部分。

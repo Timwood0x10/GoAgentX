@@ -1,176 +1,151 @@
-# ares 架构拆解 (XVIII)：知识图谱构建——从 markdown 到 27K 条边（AKG）（0.3.x）
+# ares 架构拆解 (XVIII)：知识图谱构建——从 provider 数据到可查询的图（AKF/AKG）（0.3.x）
 
-第 X 篇讲的是*检索*——怎么找到相关记忆。这篇讲的是*构建*——那些记忆是怎么变成知识图谱的。
-
-AKF 知识图谱（`internal/knowledge/`）是把原始 provider 数据转成可查询图谱的引擎。v0.2.7 发布，v0.2.8 通过公共 `api/knowledge` API 暴露出来。
+> 说明：本文基于实际代码（重点阅读 `internal/knowledge/` 核心类型、`runtime/runtime.go` 的流水线编排、`pipeline.go` 的对象处理、`planner/`、`provider/`、`linker/`、`relation_extract.go`、`quality.go`、`compiler/`、`store/`、`service/adapter.go`、`docs_articles_test.go`）。每个符号、每条流程都是我在这份代码里实际读到的。凡是我拿不准或文档吹的，我会标（待核实），不替它吹。
 
 ---
 
-## 问题：三个 Provider，没有边
+## 一、AKF 的通用对象：三层数据 + 生命周期 + 质量门
 
-三个团队各自建自己的知识库：
+知识图的基本单元是 `KnowledgeObject`（`object.go`）。它有三层数据：
 
-| 团队 | 数据源 | 存储 | 有边吗？ |
-|------|--------|------|----------|
-| Memory | 对话轮次 | PostgreSQL + pgvector | 没有 |
-| Evolution | 策略决策 | 内存 | 没有 |
-| Code | 源文件 | SQLite | 没有 |
+| 层 | 字段 | 用途 |
+|------|------|------|
+| Raw | `Raw []byte` | 源数据原始字节，保留用于再蒸馏 |
+| Normalized | `Normalized` | 清洗后的标准文本，用于 embedding 和匹配 |
+| Summary | `Summary` | 给 LLM 的精简摘要，省 token |
 
-每个团队都有节点。没人有边。当有人问"哪个决策导致了这次代码变更？"，答案需要手动 join 三个存储。
+对象还有几个值得讲的字段：`Type`（`memory/user/project/code/issue/commit/decision/document/tool_result/workflow/runtime/architecture`）、`Namespace`、`Evidence`（溯源来源）、`Representations`（**外置向量**，按模型名→向量 ID 映射，避免换模型时迁移数据）、以及 0.2.9 起加入的生命周期和质量管理：
 
-**坦诚反思**：我们先试了统一 SQL schema。花了两周，破坏了三个集成，还是表达不了"策略 S 取代了策略 T，因为决策 D 选择了方案 A"。当数据本质上是图形状时，关系模型会和你作对。
+- **`Status`**：`candidate → active → superseded → rejected`。空 status 视为 active（兼容旧数据）。
+- **`Quality`**：五维打分——`Extraction / Consistency / Freshness / Usage`，加 `ManualVerified`。质量门 `ComputeFinal` 的权重是 `0.4*Extraction + 0.3*Consistency + 0.2*Freshness + 0.1*Usage`，`DefaultQualityGateConfig` 的 `MinFinalScore=0.55`。
+- **规则式边**：`Relations` 由非 LLM 的 `RelationExtractor` 抽取出来，谓词被限定在 `AllowedPredicates` 里。
+
+`Relation`（`relation.go`）既是图边（`From/To/Name/Score`）又是事实级外联关系（`Predicate/ObjectID/ObjectText`）。内置谓词 `RelDependsOn/calls/causes/fixes/belongs_to/uses/implements/similar_to/generated_by/decided_by/supersedes/learns_from`。`WorkingGraph` 是**任务级认知图**，注释明确写了生命周期 **Build → Consume → Destroy，从不持久化**。
 
 ---
 
-## 设计：Plan → Load → Link → Reduce → Graph
+## 二、流水线：Plan → Discover → Load&Pipeline → Link → Reduce → Graph
 
-`KnowledgeRuntime` 编排一个五阶段 pipeline：
+`KnowledgeRuntime.Execute` 是 AKF 的执行引擎（`runtime/runtime.go`）。它不是我以前吹的“五阶段”，实际是 **六步**：
 
 ```mermaid
 flowchart LR
-    P[Plan] --> L[Load]
+    P[Plan] --> D[Discover]
+    D --> L[Load + Pipeline]
     L --> LI[Link]
     LI --> R[Reduce]
-    R --> G[Graph]
+    R --> G[WorkingGraph]
 ```
 
-### 阶段 1：Plan
+1. **Plan**：`planner.Plan(ctx, goal, budget)` 按目标关键词生成 `KnowledgeRequirement`（need 权重分配 `MaxResults`，预算≈每节点 50 token）。
+2. **Discover**：`discovery.Discover` 用 **IntentMatch 打分 > 0.35 阈值** 挑选 provider，并给每个需求生成查询计划。
+3. **Load + Pipeline**：用 errgroup 并发从多个 provider `Stream`，每个对象过一遍 `KnowledgePipeline`：
+   `Normalizer → EntityMatcher → Validator → Summarizer`（`pipeline.go`）。构造时默认 `DefaultNormalizer{MaxRawBytes:10240}`、`DefaultEntityMatcher{MatchThreshold:0.6}`、`DefaultValidator`、`DefaultSummarizer{MaxSummaryLen:200}`。
+4. **Link**：跑所有 `Linker` 生成边，并按 `(From, To, Name)` 三要素去重。
+5. **Reduce**：跑 `Reducer`（默认 `DefaultReducer`）按 token 预算压缩图。
+6. **Graph**：产出 `*WorkingGraph`（并可选把 insight 证据发到统一 Evidence Store）。
 
-`KnowledgePlanner` 决定*加载什么*。默认 planner 加载所有注册的 provider：
+---
 
-```go
-// internal/knowledge/planner/default.go
-type DefaultPlanner struct{}
+## 三、Planner 与 Provider
 
-func (p *DefaultPlanner) Plan(ctx context.Context, intent Intent) (*Plan, error) {
-    sources := p.discovery.Discover(ctx, intent)
-    return &Plan{Sources: sources}, nil
-}
-```
+`planner/default.go` 的默认 planner 是关键词配需求（`NeedDecision` 恒含，`architecture/code/issue/performance` 按关键词，`history` 兜底）。`provider.Select(intent, 0.35)` 负责挑 provider。
 
-`Intent` 描述 runtime 想要什么（"为这个任务构建一个图"）。planner 把 intent 映射到数据源。
+`internal/knowledge/provider/` 下我数到 **六个** provider（没有 mysql——旧文里那个是错的）：
 
-### 阶段 2：Load
+| Provider | 对象类型倾向 |
+|----------|------|
+| `memory.Provider` | `ObjectMemory` |
+| `evolution.Provider` | `ObjectDecision` |
+| `code.Provider` | `ObjectCode` |
+| `postgres.Provider` | `ObjectDocument` |
+| `store.Provider` | 通用存储 |
+| `vector.Provider` | 向量召回 |
 
-Provider 从它们的后端存储加载原始 `KnowledgeObject`：
+Provider 通过 `Stream(ctx, intent)` 推流对象（旧的 `Load()` 接口规模见 `provider/interface.go`，注册表在 `registry.go`）。
 
-```go
-// internal/knowledge/provider/interface.go
-type Provider interface {
-    Name() string
-    Load(ctx context.Context) ([]*knowledge.KnowledgeObject, error)
-}
-```
+---
 
-六个内置 provider：
+## 四、Linker：边从哪来
 
-| Provider | 数据源 | 对象类型 |
-|----------|--------|----------|
-| `memory.Provider` | 对话轮次 | `ObjectMemory` |
-| `evolution.Provider` | 策略决策 | `ObjectDecision` |
-| `code.Provider` | 源文件 | `ObjectCode` |
-| `mysql.Provider` | MySQL 行 | `ObjectDocument` |
-| `postgres.Provider` | PostgreSQL 行 | `ObjectDocument` |
-| `vector.Provider` | pgvector embedding | `ObjectMemory` |
-
-### 阶段 3：Link
-
-魔法在这里。四个 `Linker` 插件生成边：
+`linker/` 下五个 Linker 我逐个读的：
 
 | Linker | 边类型 | 逻辑 |
 |--------|--------|------|
-| `DecisionLinker` | `decided_by`, `rationale_for` | 对 summary/tag 做关键词打分 |
-| `ArchitectureLinker` | `depends_on`, `implements` | 代码实体 ↔ 架构决策 |
-| `SimilarityLinker` | `similar_to` | token 重叠相似度（默认 ≥ 0.3） |
-| `TimelineLinker` | `supersedes`, `generated_by` | 按 `CreatedAt` 时间排序 |
+| `DefaultLinker` | `belongs_to` | 按共享 tag 成组；`≤64` 成员全对连（O(n²)），`>64` 退化为星型（每成员→代表节点，O(n)）；全图边数上限 5000 |
+| `DecisionLinker` | `decided_by` | 对 summary/tags 里 decision 关键词打分，与共享 tag 对象连边，分值为 `词命中数*0.25` |
+| `ArchitectureLinker` | `depends_on` | code/document/decision 对象 ↔ 架构对象，共享 tag 连边（**不发 implements**，旧文错了） |
+| `SimilarityLinker` | `similar_to` | summary 的 Jaccard token 重叠相似度，默认阈值 `≥0.3` |
+| `TimelineLinker` | `generated_by` / `supersedes` | 同 namespace 按 `CreatedAt` 排序；间隔 ≤2 周→`generated_by`，间隔 >2 周且同类型→`supersedes` |
 
-每个 Linker 独立且可插拔。加一个新关系类型意味着实现 `runtime.Linker` 并注册它——不需要改核心 pipeline。
-
-### 阶段 4：Reduce
-
-`Reducer` 修剪和排序图谱。不剪枝的话，147 个节点的图会爆炸到 50K+ 条边（相似度是 O(n²)）。reducer 应用：
-
-1. **边类型限制**——限制每个节点的 `similar_to` 边数
-2. **分数阈值**——丢掉低于 `MinScore` 的边
-3. **冗余移除**——折叠同类型的平行边
-
-基准测试：**147 个节点，27K 条边，构建耗时 73ms。**
-
-### 阶段 5：Graph
-
-最终的 `KnowledgeGraph` 存在可插拔的 `Store` 里：
-
-| Store | 后端 | 用例 |
-|-------|------|------|
-| `memory.Store` | 内存 map | 测试，小图 |
-| `sqlite.Store` | SQLite | 单节点部署 |
-| `postgres.Store` | PostgreSQL + pgvector | 生产，分布式 |
-
----
-
-## 懒图
-
-不是每个查询都需要完整图。`lazy_graph.go` 按需构建子图：
-
-```go
-// internal/knowledge/runtime/lazy_graph.go
-func (r *KnowledgeRuntime) GetSubgraph(ctx context.Context, rootID string, depth int) (*knowledge.KnowledgeGraph, error)
+```mermaid
+flowchart LR
+    O[KnowledgeObjects] --> D[DefaultLinker belongs_to]
+    O --> DC[DecisionLinker decided_by]
+    O --> AR[ArchitectureLinker depends_on]
+    O --> S[SimilarityLinker similar_to Jaccard>=0.3]
+    O --> T[TimelineLinker generated_by/supersedes]
+    D --> L[(边缘集合)]
+    DC --> L
+    AR --> L
+    S --> L
+    T --> L
 ```
 
-这就是 `agent.Run` 在启用 `WithKnowledge()` 时调用的——它围绕当前任务构建一个小子图，而不是整个语料库。
-
-**坦诚反思**：懒图是个性能 hack，后来变成了架构。最初我们每次都构建完整图。500 个节点时构建时间 2 秒。1000 个时 8 秒。懒图把典型查询带回 ~50ms。
+另外 `relation_extract.go` 的 `RelationExtractor` 走**正则规则**（中英文双语 `fixes/depends_on/calls/belongs_to`），与 Linker 形成互补：Linker 产生图边，Extractor 在写库时同步抽事实级关系。
 
 ---
 
-## 公共 API
+## 五、Reduce 与最终图
 
-v0.2.8 通过 `api/knowledge` 暴露知识图谱：
+`runtime/components.go` 的 `DefaultReducer` 相当直白：按 `budget.ForGraph / 50` 估算可保留节点数（注意**没设预算时不剪枝**，预算太小至少留 1 个）。它按 `Confidence` 降序选节点，但用 `domain:` 前缀 tag 做**域多样性配额**——防止 top-N 全来自同一域而丢掉跨域边。最后只保留两端都被选中的边。
 
-```go
-// api/knowledge/knowledge.go
-type KnowledgeObject struct {
-    ID       string
-    Type     ObjectType
-    Summary  string
-    Tags     []string
-    Payload  map[string]any
-    CreatedAt time.Time
-}
+图的落库是 `internal/knowledge/store/` 下**三个**可插拔 `Store`：
 
-type KnowledgeGraph struct {
-    Objects  []*KnowledgeObject
-    Relations []Relation
-}
-```
+| Store | 后端 |
+|-------|------|
+| `memory.Store` | 内存 map（测试）|
+| `postgres.Store` | PostgreSQL |
+| `sqlite.Store` | SQLite |
 
-外部集成方现在可以构建和查询知识图谱，而无需导入 `internal/`：
-
-```go
-graph, err := runtime.GetSubgraph(ctx, taskID, 2)
-for _, obj := range graph.Objects {
-    fmt.Printf("%s: %s\n", obj.Type, obj.Summary)
-}
-```
+`Store` 负责 `Save/Promote/ListByStatus/HybridSearch` 等（`docs_articles_test.go` 里就看得到这些方法）。这里有 `HybridSearch` 路径 + `store` provider + 独立 `retriever/`、`hybrid.go`、`vector_index.go`、`compiler/`（把图编译成 prompt/markdown/json/xml/tool_schema）。
 
 ---
 
-## Adapter 桥
+## 六、诚实核查：“从 markdown 建 27K 条边”到底在哪
 
-`internal/knowledge/service/adapter.go`（v0.2.8，+126 行）把公共 `api/knowledge` API 桥接到内部知识图谱 runtime。它转换：
+旧文标题叫“从 markdown 到 27K 条边”，正文还有个“147 个节点、27K 条边、73ms 构建”。我把 `internal/knowledge` 翻遍了：**没有任何代码或 benchmark 产出过这三个数字**（linker/pipeline/planner 的 benchmark 都是单组件微基准，不涉及图规模）。
 
-- 公共 `KnowledgeObject` ↔ 内部 `knowledge.KnowledgeObject`
-- 公共 `KnowledgeGraph` ↔ 内部 `knowledge.KnowledgeGraph`
-- 公共查询 API ↔ 内部 `retriever.Retriever`
+真正“从 markdown 建图”的，是 `internal/knowledge/docs_articles_test.go` 里那个**端到端测试** `TestAKG_BuildFromDocsArticles`：
 
-这就是模式：公共 API 在 `api/`，实现在 `internal/`，adapter 在 `internal/<module>/service/adapter.go`。
+- 遍历 `docs/articles/**/*.md`，每篇 markdown 变成一个 `KnowledgeObject`（`Type=document`、`Namespace=articles`，首个 `#` 标题当 `Summary`，正文截断做 `Normalized`）。
+- 用 `RelationExtractor` 抽关系、`DefaultQualityGateConfig`（`MinFinalScore=0.55`）打分、存进 `memory.Store`，`Confidence≥0.55` 的 `Promote` 为 active。
+- 再对几个查询跑 `HybridSearch` 召回验证。
+
+它 `t.Logf` 打印对象数/边数/置信度，但**不做固定边数断言**——边数取决于语料里真的有多少“修复了/依赖/调用/属于”之类模式。所以“27K、147、73ms”这三个数是编的，**我没有证据支撑，统一标（待核实）**：真实情况是——AKG 能从 `docs/articles/**/*.md` 建图，具体边数每次跑都不一样。
+
+顺带说 `internal/ares_skills/indexer.go` 的 `parseFrontMatter`：它会解析每个 skill 目录里 `SKILL.md` 的 `---` YAML 头，产出技能元数据进入技能目录（这是**技能发现**那一路，不是 AKG 的建图管线，别混为一谈）。
 
 ---
 
-## 教训
+## 七、公共 API 与 adapter
 
-AKG 知识图谱是 ares 里最复杂的模块。它有六个子包、四个 Linker、三个 Store、六个 Provider。但核心洞察很简单：**知识是图，不是表。**
+`api/knowledge/`（`knowledge.go`/`service.go`/`doc.go`）把 `internal/knowledge` 的 `KnowledgeObject/Relation/WorkingGraph/KnowledgeStore/Normalizer/EntityMatcher/Validator/Summarizer/KnowledgePipeline` 等**逐个 type alias 到公共包**，供外部集成方导入而不碰 `internal/`。
 
-当你停止对抗图的形状并拥抱它——生成边的 Linker、剪枝的 Reducer、按需构建的懒图——系统变得更简单，而不是更复杂。
+`internal/knowledge/service/adapter.go`（我数的 **112 行**，旧文写 +126 不太准）把公共 `api/knowledge` 桥接到内部 runtime/retriever。
 
-**最好的知识系统是知道自己的数据是什么形状的。** 对 ares 来说，那个形状是图。
+---
+
+## 八、懒加载的真相
+
+旧文讲有个 `lazy_graph.go` + `KnowledgeRuntime.GetSubgraph(ctx, rootID, depth)`，还想出“500 节点 2 秒、1000 节点 8 秒、懒图回到 50ms”。**`lazy_graph.go` 这个文件不存在。**
+
+真实的机制（`runtime/runtime.go` 里写得很清楚）是：`Config.LazyLoading` 会把 `budget.ForGraph` **钳制到 `maxLazyForGraph=2000`**，在 Reduce 之前生效，于是返回的 `WorkingGraph` 更小。注释坦白地写：这**不是**完整的 LazyGraph——`Execute` 依然从所有 provider 加载全部对象，只是最终图被 reducer 剪小了；真要懒加载得把返回类型改成 `*LazyGraph` 并支持 `Expand`（写成 TODO）。
+
+---
+
+## 九、教训
+
+AKF/AKG 的核心不是“有多少条边”，而是这套取舍：**外置向量免迁移、三层数据让检索省钱、Rule-based 抽取保证可解释、质量门 + 生命周期让事实能长大也能被淘汰、Reducer 按预算和域多样性剪图。** 记住这个认知：**知识是图不是表**——但它也得知道自己存了多少，才不至于像我旧文那样，把测试日志的规模当成产品的卖点。
+
+最好的知识系统，是先诚实承认自己数据边界的那一个。

@@ -25,6 +25,7 @@ import (
 	"github.com/Timwood0x10/ares/internal/llm/output"
 	"github.com/Timwood0x10/ares/internal/storage/postgres/repositories"
 	"github.com/Timwood0x10/ares/internal/taskfabric"
+	"github.com/Timwood0x10/ares/internal/workflow/engine"
 )
 
 // peerTaskSeq is a monotonic sequence for peer-mode task IDs (the old tracker
@@ -295,17 +296,62 @@ func createPeerAgents(
 	// The DAG execution gate. Zero value = legacy ReAct behavior (chat
 	// cognition for every peer, L2 machinery test-only).
 	//
-	// The gate MUST stay off until BOTH prerequisites are true: (1) peers
-	// advertise the full capability set the router needs (ares/root,
-	// ares/plan, ares/answer, tool/<name>) instead of a single primary type,
-	// and (2) the per-session graph registry is wired. Flipping Enabled now
-	// yields NO schedulable candidate for any L2 task, so it would break
-	// every peer — do not enable until M2 session wiring + M3 capability
-	// advertisement land.
+	// M3: when Enabled, peers advertise the FULL capability set the L2
+	// router needs (ares/root, ares/plan, ares/answer, tool/<name> for
+	// every bound tool) instead of a single primary type. The session
+	// registry is wired per-peer so the plannerCognition can look up its
+	// L2 graph. Both prerequisites (M2 session wiring + M3 capability
+	// advertisement) now land here.
+	//
+	// TODO(tech-debt): bind Enabled to config so operators can flip it
+	// without code changes. Until then it stays off in production.
 	peerDAGExecution := agentfabric.DAGExecution{}
-	// The router body is stateless (one instance drives many nodes), so it is
-	// built once and shared by every spawned peer.
-	peerRouter := agentfabric.NewRouterCognition(toolBinder, slog.Default())
+	// The router body carries the planner when the gate is open; the
+	// planner needs session-scoped dependencies (registry, fabric reader)
+	// that are constructed here.
+	var peerRouter agentfabric.Cognition
+	var sessionReg *agentfabric.SessionRegistry
+	if peerDAGExecution.Enabled {
+		sessionReg = agentfabric.NewSessionRegistry()
+
+		// M5: read the L1 ToolClass DAG from the evolution components so
+		// the planner can check enabled/budget/prior before growing L2
+		// tool nodes. Nil when no tools are registered (permissive).
+		var l1DAG *engine.MutableDAG
+		if comp.NewEvolution != nil {
+			l1DAG = comp.NewEvolution.ToolClassDAG()
+		}
+
+		planner, err := agentfabric.NewPlannerCognition(agentfabric.PlannerDeps{
+			ChatClient: chatClient, // sub.ChatClient satisfies agentfabric.ChatClient
+			ToolBinder: toolBinder, // sub.ToolBinder satisfies agentfabric.ToolBinder
+			Sessions:   sessionReg,
+			Fabric:     kernel.fabric,
+			L1DAG:      l1DAG,
+			Logger:     slog.Default(),
+		})
+		if err != nil {
+			return nil, nil, fmt.Errorf("peer mode: create planner cognition: %w", err)
+		}
+		peerRouter = agentfabric.NewRouterCognitionWithPlanner(toolBinder, planner, slog.Default())
+	}
+
+	// M3: build the full capability set when the gate is open.
+	// Legacy path declares only the primary type; the L2 path adds
+	// ares/root, ares/plan, ares/answer, and tool/<name> for every
+	// bound tool so the scheduler can route every L2 node type to this
+	// peer.
+	var fullCaps []string
+	if peerDAGExecution.Enabled {
+		fullCaps = []string{
+			"ares/root",
+			"ares/plan",
+			"ares/answer",
+		}
+		for _, name := range toolBinder.ListTools() {
+			fullCaps = append(fullCaps, "tool/"+name)
+		}
+	}
 
 	// C1: configured sub-agents ARE the fabric's dynamic population — each is
 	// spawned WITH its execution body (ChatCognition) and its distilled
@@ -326,9 +372,13 @@ func createPeerAgents(
 		if err != nil {
 			return nil, nil, fmt.Errorf("peer mode: create chat cognition for %q: %w", sa.ID(), err)
 		}
+		caps := []string{string(sa.Type())}
+		if peerDAGExecution.Enabled {
+			caps = fullCaps
+		}
 		if _, err := agents.Spawn(ctx, agentfabric.SpawnSpec{
 			Identity:     sa.ID(),
-			Capabilities: []string{string(sa.Type())},
+			Capabilities: caps,
 			// A1.4: the default execution body is the tool-loop Cognition
 			// moved down into agentfabric — a fabric agent is fully
 			// self-contained (LLM + tools), no sub.Agent wrapper.
@@ -559,6 +609,16 @@ func submitPeerTask(ctx context.Context, kernel *kernelHandle, capability string
 	}
 	taskID := fmt.Sprintf("peer-task-%s-%d", capability, peerTaskSeq.Add(1))
 
+	env := &taskfabric.CheckpointEnvelope{
+		Payload: payload,
+	}
+	// M2: stamp SessionID onto the envelope so the plannerCognition can
+	// look up the per-session L2 graph registry. A session-less task
+	// (no "session_id" in payload) leaves SessionID empty — the legacy
+	// behavior is unchanged.
+	if sid, ok := payload["session_id"].(string); ok && sid != "" {
+		env.SessionID = sid
+	}
 	task := &taskfabric.Task{
 		ID:         taskID,
 		Capability: capability,
@@ -566,9 +626,7 @@ func submitPeerTask(ctx context.Context, kernel *kernelHandle, capability string
 		// agent caller. Agent-created tasks get their Origin from the
 		// create_task syscall's tool context (kernelctx.CallerID).
 		RetryPolicy: taskfabric.RetryPolicy{MaxRetries: 2},
-		Checkpoint: &taskfabric.CheckpointEnvelope{
-			Payload: payload,
-		},
+		Checkpoint:  env,
 	}
 	if err := kernel.fabric.Create(task); err != nil {
 		return "", fmt.Errorf("peer mode: create task: %w", err)

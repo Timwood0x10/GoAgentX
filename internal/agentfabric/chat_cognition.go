@@ -406,7 +406,7 @@ func (c *chatCognition) chatStep(ctx context.Context, st *chatStepState) ([]*mod
 		if budget := agents.ToolBudgetFromParams(st.Params); budget > 0 &&
 			!agents.ToolAllowedByBudget(tc.Function.Name, st.ToolUses, budget) {
 			st.Messages = append(st.Messages, &core.LLMMessage{
-				Role:       "tool",
+				Role:       roleTool,
 				Content:    fmt.Sprintf("tool %s skipped: per-session budget (%d) exhausted", tc.Function.Name, budget),
 				ToolCallID: tc.ID,
 			})
@@ -452,7 +452,7 @@ func (c *chatCognition) chatStep(ctx context.Context, st *chatStepState) ([]*mod
 			ExtraResult: result,
 		}.AsMap())
 		st.Messages = append(st.Messages, &core.LLMMessage{
-			Role:       "tool",
+			Role:       roleTool,
 			Content:    result,
 			ToolCallID: tc.ID,
 		})

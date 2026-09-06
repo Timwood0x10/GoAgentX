@@ -30,6 +30,10 @@ type PlanStep struct {
 	// never supplied by the LLM (same contract as CreateTask). json:"-"
 	// keeps it out of every LLM-facing schema.
 	Origin string `json:"-"`
+	// SessionID scopes this step's task to a session (M2: SessionID 贯通).
+	// Stamped onto the checkpoint envelope so the executor can look up the
+	// per-session L2 graph registry. Empty = session-less (legacy behavior).
+	SessionID string `json:"-"`
 }
 
 // CompilePlan validates a batch of PlanSteps and creates them as READY tasks
@@ -102,10 +106,13 @@ func (f *Fabric) CompilePlan(ctx context.Context, steps []PlanStep) ([]string, e
 			// one retry); a positive value is honored verbatim.
 			RetryPolicy: RetryPolicy{MaxRetries: s.MaxRetries},
 		}
-		if s.Payload != nil {
+		if s.Payload != nil || s.SessionID != "" {
 			env := &CheckpointEnvelope{Payload: s.Payload}
 			if strategyID != "" {
 				env.StrategyID = strategyID
+			}
+			if s.SessionID != "" {
+				env.SessionID = s.SessionID
 			}
 			t.Checkpoint = env
 		}

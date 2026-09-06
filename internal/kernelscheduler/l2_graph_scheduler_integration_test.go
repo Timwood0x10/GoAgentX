@@ -16,6 +16,11 @@ import (
 	resources "github.com/Timwood0x10/ares/internal/tools/resources/core"
 )
 
+// answerBody is the content the hand-written plans put on their terminal
+// answer node, so the assertions exercise the real answer path (content
+// supplied on the node) instead of the no-content fallback.
+const answerBody = "answer: tool chain complete"
+
 // echoBinder is a scripted ToolBinder whose tools echo their args back. It is
 // injected into the session agent's router cognition so the M1 integration
 // test can confirm data actually flowed through the scheduled tool call.
@@ -53,7 +58,7 @@ func TestL2Graph_SchedulerExecutesThreeNodeChain(t *testing.T) {
 	require.NoError(t, err)
 	require.NoError(t, plan.AddToolNode(ctx, "n1", "grep", map[string]any{"query": "x"}, "root"))
 	require.NoError(t, plan.AddToolNode(ctx, "n2", "read", map[string]any{"query": "y"}, "n1"))
-	require.NoError(t, plan.AddToolNode(ctx, "n3", "answer", nil, "n2"))
+	require.NoError(t, plan.AddToolNode(ctx, "n3", "answer", map[string]any{"content": answerBody}, "n2"))
 
 	// 2. Compile the plan into fabric tasks. The batch is PROJECTED from the
 	// plan (not hand-written): step ID = task ID so the graph node and its
@@ -85,7 +90,7 @@ func TestL2Graph_SchedulerExecutesThreeNodeChain(t *testing.T) {
 	// 6. Read each node's execution fact from its fabric envelope by ID join.
 	requireItemContent(t, fabric, "n1", "echo(grep,x)")
 	requireItemContent(t, fabric, "n2", "echo(read,y)")
-	requireItemContent(t, fabric, "n3", "L2 session complete")
+	requireItemContent(t, fabric, "n3", answerBody)
 	require.Equal(t, []string{"grep", "read"}, binder.called,
 		"both tool nodes ran exactly once, in dependency order, through the real scheduler")
 }
@@ -107,19 +112,19 @@ func TestL2Graph_RecompilesIdempotentAfterRestart(t *testing.T) {
 	if err := plan.AddToolNode(context.Background(), "n2", "read", map[string]any{"query": "y"}, "n1"); err != nil {
 		t.Fatalf("add n2: %v", err)
 	}
-	if err := plan.AddToolNode(context.Background(), "n3", "answer", nil, "n2"); err != nil {
+	if err := plan.AddToolNode(context.Background(), "n3", "answer", map[string]any{"content": answerBody}, "n2"); err != nil {
 		t.Fatalf("add n3: %v", err)
 	}
 
 	// First run compiles + completes.
 	first := runChain(t, plan, &echoBinder{})
-	requireItemContent(t, first, "n3", "L2 session complete")
+	requireItemContent(t, first, "n3", answerBody)
 
 	// "Restart": the SAME plan compiles into a FRESH fabric and completes again.
 	again := runChain(t, plan, &echoBinder{})
 	requireItemContent(t, again, "n1", "echo(grep,x)")
 	requireItemContent(t, again, "n2", "echo(read,y)")
-	requireItemContent(t, again, "n3", "L2 session complete")
+	requireItemContent(t, again, "n3", answerBody)
 }
 
 // runChain compiles plan into a fresh fabric, wires one session agent, runs the
@@ -320,14 +325,14 @@ func TestL2Graph_IncrementalEventsDriveSchedulerToCompletion(t *testing.T) {
 
 	require.NoError(t, plan.AddToolNode(ctx, "n1", "grep", map[string]any{"query": "x"}, "root"))
 	require.NoError(t, plan.AddToolNode(ctx, "n2", "read", map[string]any{"query": "y"}, "n1"))
-	require.NoError(t, plan.AddToolNode(ctx, "n3", "answer", nil, "n2"))
+	require.NoError(t, plan.AddToolNode(ctx, "n3", "answer", map[string]any{"content": answerBody}, "n2"))
 
 	waitForTaskState(t, fabric, "n3", taskfabric.StateCompleted, 5*time.Second)
 
 	requireItemContent(t, fabric, "root", "find the answer")
 	requireItemContent(t, fabric, "n1", "echo(grep,x)")
 	requireItemContent(t, fabric, "n2", "echo(read,y)")
-	requireItemContent(t, fabric, "n3", "L2 session complete")
+	requireItemContent(t, fabric, "n3", answerBody)
 	require.ElementsMatch(t, []string{"root", "n1", "n2", "n3"}, fabric.IDs(),
 		"every grown node — admission root included — has exactly one task")
 }
@@ -406,3 +411,56 @@ func waitForAllCompleted(t *testing.T, fabric *taskfabric.Fabric, ids []string, 
 	}
 	t.Fatalf("not all %d tasks completed within %s", len(ids), timeout)
 }
+
+// TestL2Graph_SessionIDCrossesGrowthAndProjection pins the seam the planner
+// depends on and the unit tests bypass: the session id is stamped through
+// AddToolNode's args map, and ProjectStep must lift it onto the PlanStep so
+// Task.SessionID is populated for the NEXT plan quantum.
+//
+// It must cross that seam WITHOUT entering the tool-argument namespace: an
+// arg.-prefixed session id would both vanish from the envelope (breaking the
+// planner's session lookup) and reach CallTool as an undeclared argument,
+// which a strict-schema tool rejects.
+func TestL2Graph_SessionIDCrossesGrowthAndProjection(t *testing.T) {
+	ctx := context.Background()
+	plan, err := agentfabric.NewL2Graph("sess/s1/root", "prompt", nil)
+	require.NoError(t, err)
+	require.NoError(t, plan.AddToolNode(ctx, "n1", "grep",
+		map[string]any{"query": "x", "session_id": "s1"}, "sess/s1/root"))
+
+	step := plan.DAG().StepIndex()["n1"]
+	require.Equal(t, map[string]string{"arg.query": "x", "session_id": "s1"}, step.Metadata,
+		"tool args are namespaced; the session id is envelope plumbing and stays bare")
+
+	ps := planprojection.ProjectStep(step)
+	require.Equal(t, "s1", ps.SessionID, "the session id must reach the task, not be dropped")
+
+	// The executing cognition sees the tool args only.
+	binder := &strictQueryBinder{}
+	cog := agentfabric.NewRouterCognition(binder, slog.Default())
+	task := models.NewTask("n1", "tool/grep", nil)
+	task.Payload = ps.Payload
+	_, err = cog.ExecuteStep(ctx, task)
+	require.NoError(t, err, "session id must not reach CallTool as a tool argument")
+	require.Equal(t, map[string]any{"query": "x"}, binder.got)
+}
+
+// strictQueryBinder rejects any argument key it did not declare, like an MCP
+// tool with additionalProperties:false.
+type strictQueryBinder struct{ got map[string]any }
+
+func (b *strictQueryBinder) CallTool(_ context.Context, name string, args map[string]any) (any, error) {
+	for k := range args {
+		if k != "query" {
+			return nil, fmt.Errorf("strict: tool %s got undeclared arg %q", name, k)
+		}
+	}
+	b.got = args
+	return "ok", nil
+}
+
+func (b *strictQueryBinder) ListTools() []string { return []string{"grep"} }
+
+func (b *strictQueryBinder) IsToolIdempotent(string) bool { return true }
+
+func (b *strictQueryBinder) GetToolSchemas() []resources.ToolSchema { return nil }

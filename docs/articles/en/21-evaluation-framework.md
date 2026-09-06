@@ -1,237 +1,229 @@
 # ares Architecture Deep Dive (XXI): Evaluation Framework — How We Know If an Agent Is Actually Good (0.3.x)
 
-"How do you know your agent improved?" This question haunted v0.2.5. The evolution engine was generating new strategies, the arena was running battles — but we had no objective way to say "strategy A is 12% better than strategy B."
+"How do you know your agent improved?" This question keeps haunting us. The evolution engine generates new strategies and the candidate verification pipeline runs preserved-case regressions — but we need an objective way to say "strategy A is X% better than strategy B."
 
-The evaluation framework (`internal/ares_eval/`, 3,390 lines) is the answer. It's the layer that turns "looks better to me" into reproducible scores.
+The evaluation framework (`internal/ares_eval/`, ~3,000 lines) is part of the answer. It turns "looks better to me" into reproducible scores. **A disclaimer up front: it is far from a general-purpose "evaluate anything" platform.** More precisely it's a small library of "score this agent output" evaluators, plus a regression gate that actually compares strategies. This article covers only what really exists in the code.
 
 ---
 
 ## The Problem: Vibes-Based Evaluation
 
-Early ares had three evaluation paths, all broken:
+Early ares evaluation was mostly manual and gut-driven, and all of it was broken:
 
 | Path | Method | Problem |
 |------|--------|---------|
 | Manual | "Read the output, does it look right?" | Not scalable, heavily biased |
-| Unit tests | Hardcoded expected outputs | Fragile, LLM output varies |
-| Token counting | "More tokens = more thorough" | GPT-4o-mini at 500 tokens beats GPT-4 at 2000 |
+| Exact match | Output must equal expected text | Fragile, LLM verbosity varies |
+| Token counting | "More tokens = more thorough" | Length ≠ quality (inferred from code comments; no measurement to cite, mark 待核实) |
 
-We tried building a custom scoring rubric. It worked for a week, then someone asked "how do you compare a 7/10 on task X with a 8/10 on task Y?" The answer: you can't, unless you have a framework.
-
-**Honest reflection**: We considered using an existing eval framework (promptfoo, langchain eval). They're great for single-model evaluation. But ares needed *comparative* evaluation — is strategy A better than strategy B on the same task? That's a different problem.
+Before describing anything, we did the honest thing: we inventoried **what the code actually contains** instead of dressing it up as a grand three-layer design.
 
 ---
 
-## The Design: Three Layers
+## The Real Structure: Three Components
+
+The actual `internal/ares_eval/` is a plain pipeline — **no "Comparison layer", no "concurrent Runner layer"** as often drawn in docs:
 
 ```mermaid
 graph TD
-    L[Loader] --> R[Runner]
-    R --> EV[Evaluator]
-    EV --> LJ[LLMJudge]
-    EV --> DJ[DimensionJudge]
-    EV --> CO[Comparison]
-    R --> RE[Report]
+    L[Loader.Load / LoadDir] --> R[AgentTestRunner.RunSuite]
+    R --> E{EvaluatorRegistry}
+    R --> G[ReportGenerator.GenerateMarkdown/JSON]
+    E --> EM[ExactMatchEvaluator]
+    E --> KP[KeywordPresenceEvaluator]
+    E --> TU[ToolUsageEvaluator]
+    E --> LJ[LLMJudgeEvaluator]
+    LJ --> SA[Scale: 1-10 / 1-5 / pass-fail]
+    LJ -.WithDimensionAveraging.-> DA[4-dim mean: correctness 0-3, completeness 0-3, efficiency 0-2, safety 0-2]
+    DA -.optional.-> EB[DimensionJudgeBridge]
+    EB -.-> ES[(evidence store: KindDimensionEval)]
 ```
 
-### Layer 1: Test Cases (`loader.go`, `types.go`)
+### Component 1: Loader (`loader.go`)
+
+`Loader` loads suites from YAML via `Load(path)` and `LoadDir(dir)`. It includes `validateSuitePath`, which rejects suite paths that traverse into system directories (etc/proc/sys/dev/boot/root). Test-case fields live in `types.go` — note they are **not** the `Expected/Category/Difficulty` shape from older blog posts:
 
 ```go
 // internal/ares_eval/types.go
 type TestCase struct {
-    ID          string
-    Input       string
-    Expected    string  // optional reference answer
-    Category    string  // "reasoning", "coding", "chat", etc.
-    Difficulty  string  // "easy", "medium", "hard"
-    Metadata    map[string]any
+    ID             string
+    Name           string
+    Input          string
+    ExpectedOutput string   // optional reference answer
+    ExpectedTools  []string // tools the agent is expected to use
+    Timeout        Duration // supports "30s" / "1m30s", default 30s
+    Metadata       map[string]interface{}
+    Tags           []string // selective execution
 }
 
 type TestResult struct {
-    TestCaseID string
-    Output     string
-    Scores     []EvalScore
-    Duration   time.Duration
-    Error      error
+    TestCaseID   string
+    ActualOutput string
+    ToolsUsed    []string
+    Duration     time.Duration
+    TokensUsed   int
+    Error        string
+    Metrics      map[string]float64
+    Timestamp    time.Time
 }
 
 type EvalScore struct {
-    EvaluatorName string
-    Score         float64
-    MaxScore      float64
-    Reasoning     string
+    Metric  string  // "exact_match", "keyword_presence", "tool_usage", "llm_judge"
+    Score   float64 // always normalized to [0,1]
+    Details string
 }
 ```
 
-Test cases are loaded from YAML or JSON:
+Example suite:
 
 ```yaml
-- id: reasoning_01
-  input: "If A > B and B > C, what's the relationship between A and C?"
-  expected: "A > C"
-  category: reasoning
-  difficulty: easy
+name: basic
+description: smoke tests
+test_cases:
+  - id: reasoning_01
+    input: "If A > B and B > C, what's the relationship between A and C?"
+    expected_output: "A > C"
+  - id: tool_call_01
+    input: "please build this project for me"
+    expected_tools: ["shell"]
+    timeout: "60s"
 ```
 
-### Layer 2: Evaluators (`evaluator.go`, `llm_judge.go`, `dimension_judge.go`)
+### Component 2: Runner (`runner.go`, `agent_runner.go`)
 
-The core interface:
+`runner.go` only defines interfaces — **there is no `Runner` struct and no `RunAll`/`RunScenario`** as claimed in older posts:
+
+```go
+// internal/ares_eval/runner.go
+type TestRunner interface {
+    RunSuite(ctx context.Context, suite TestSuite) ([]TestResult, error)
+    RunSingle(ctx context.Context, testCase TestCase) (TestResult, error)
+}
+
+type AgentExecutor interface {
+    Execute(ctx context.Context, input string) (output string, toolsUsed []string, tokensUsed int, err error)
+}
+```
+
+`AgentTestRunner` (`agent_runner.go`) drives an `AgentExecutor`, runs each case under a per-case timeout context, and records `Duration/TokensUsed/ToolsUsed`. It holds an optional `EvaluatorRegistry`; `RunAndEvaluate(ctx, suite, evaluatorName)` resolves an evaluator by name and scores every result. **This path is currently serial — there is no concurrent runner here.** Concurrency appears instead as batched scoring inside the evolution regression gate (below).
+
+### Component 3: Evaluators (`evaluator.go`, `llm_judge.go`, `dimension_judge.go`)
+
+The core interface promises exactly one thing (`Name()` is an extra method on implementations, not part of the interface):
 
 ```go
 // internal/ares_eval/evaluator.go
 type Evaluator interface {
-    Name() string
-    Evaluate(ctx context.Context, tc TestCase, result TestResult) ([]EvalScore, error)
+    Evaluate(ctx context.Context, testCase TestCase, result TestResult) ([]EvalScore, error)
 }
 ```
 
-Three built-in evaluators:
+Built-in evaluators:
+
+- `ExactMatchEvaluator`: `actual == expected` → 1.0, else 0.0. Gives 1.0 when `ExpectedOutput` is empty.
+- `KeywordPresenceEvaluator`: score = fraction of keywords present.
+- `ToolUsageEvaluator`: score = fraction of expected tools actually used.
+- `LLMJudgeEvaluator`: LLM-as-judge (below).
+
+`EvaluatorRegistry` (`NewEvaluatorRegistry` / `Register(name, eval)` / `Get` / `Names`) provides thread-safe named registration.
 
 #### LLMJudgeEvaluator
 
-Uses an LLM-as-judge to score outputs. Supports three scales:
+Three scales are supported:
 
 ```go
 // internal/ares_eval/llm_judge.go
 const (
-    ScaleOneToTen  ScaleType = iota + 1  // 1-10 scoring
-    ScaleOneToFive                       // 1-5 scoring
+    ScaleOneToTen  ScaleType = iota + 1 // 1-10
+    ScaleOneToFive                       // 1-5
     ScalePassFail                        // binary pass/fail
 )
 ```
 
-The judge prompt (simplified):
+By default it uses the Chinese scoring prompt `DefaultJudgePromptCN` (`prompts.go`), grading four dimensions for a total of 0–10, and expects JSON `{"score": N, "reason": "..."}`. `Evaluate` normalizes to `[0,1]` (`score / maxScore`) and uses `extractJudgeJSON` for robust parsing of markdown-fenced or raw JSON.
 
-```
-You are evaluating an AI assistant's response.
+**Honest reflection**: LLM-as-judge bias toward verbose, fluent output is real, but the code carries **no length-penalty prompt and no calibration against human scores**. Those are genuine TODOs, not shipped features. There is also no cache layer; cost control lives elsewhere (see the regression gate).
 
-Task: {input}
-Expected: {expected}
-Actual: {output}
+#### Dimension averaging (`dimension_judge.go`)
 
-Score the response on a scale of 1-10:
-- 10: Perfect, matches or exceeds expected
-- 7-9: Good, minor issues
-- 4-6: Partial, missing key elements
-- 1-3: Poor, wrong or irrelevant
+Note: **there is no standalone `DimensionJudgeEvaluator` type.** Dimension scoring is a path on `LLMJudgeEvaluator` enabled via `WithDimensionAveraging()` — the LLM scores four independent dimensions and we average them to lower variance:
 
-Respond with JSON: {"score": N, "reasoning": "..."}
-```
+| Dimension | Max |
+|------|------|
+| correctness | 3 |
+| completeness | 3 |
+| efficiency | 2 |
+| safety | 2 |
 
-**Honest reflection**: LLM-as-judge has a known bias — it prefers longer, more verbose responses. We added a length penalty to the judge prompt, but it's a band-aid. The "real" fix is calibrating the judge against human evaluations, which we haven't done yet.
+It returns JSON `{"correctness":0-3,"completeness":0-3,"efficiency":0-2,"safety":0-2,"reason":"..."}`, normalized-averaged into metric `llm_judge_dimension_avg`.
 
-#### DimensionJudgeEvaluator
+The diagnosis can be persisted into the universal evidence store (`KindDimensionEval`) via the optional `DimensionJudgeBridge.Emit` in `evidence_bridge.go`, so the evolution `Diagnoser` consumes real failure evidence instead of a single scalar (a continuation of the Ch.8 verification theme).
 
-Scores across multiple dimensions:
+### Reporting (`report.go`)
 
-```go
-// internal/ares_eval/dimension_judge.go
-type Dimension struct {
-    Name      string  // "accuracy", "completeness", "clarity"
-    Weight    float64
-    MaxScore  float64
-}
-```
-
-Each dimension gets its own score, then a weighted aggregate. This is what the evolution engine uses for fitness evaluation.
-
-### Layer 3: Runner and Comparison (`runner.go`, `comparison.go`, `concurrent_runner.go`)
-
-```go
-// internal/ares_eval/runner.go
-type Runner struct {
-    evaluators []Evaluator
-    loader     *Loader
-}
-
-func (r *Runner) RunAll(ctx context.Context) (*Report, error)
-func (r *Runner) RunScenario(ctx context.Context, scenario string) (*Report, error)
-```
-
-The **comparison** layer is where the magic happens:
-
-```go
-// internal/ares_eval/comparison.go
-type Comparison struct {
-    Baseline    *Report
-    Candidate   *Report
-    Improvements []ScoreDelta
-    Regressions   []ScoreDelta
-}
-```
-
-This lets us say:
-
-```
-Strategy A (baseline):  average score 7.2/10
-Strategy B (candidate): average score 8.1/10
-Improvement: +12.5%
-```
-
-The `concurrent_runner.go` runs test cases in parallel, cutting evaluation time from 30 minutes to 3 minutes on a 100-case suite.
+`ReportGenerator.GenerateMarkdown/GenerateJSON` produce suite-level stats (total/passed/failed/duration/tokens) plus per-metric average/min/max. `RunEvaluation` is a convenience that chains Load → Run → Evaluate.
 
 ---
 
-## Integration with Evolution
+## The Two Real Integration Points with Evolution
 
-The evaluation framework is the fitness function for the GA engine (Article XI):
+### Integration A: bootstrap registers the evaluator (`ares_bootstrap/provide_evolution.go`)
+
+There is **no** `SetupEvaluators` with `WithMaxRetries` or a multi-evaluator register as in older posts. The real thing:
 
 ```go
-// internal/ares_bootstrap/bootstrap.go (simplified)
-func SetupEvaluators(llmClient *llm.Client, registry *eval.EvaluatorRegistry) error {
-    judge, err := eval.NewLLMJudgeEvaluator(llmClient,
-        eval.WithScale(eval.ScaleOneToTen),
-        eval.WithMaxRetries(3),
+// internal/ares_bootstrap/provide_evolution.go (simplified)
+func setupEvaluators(llmClient ares_eval.LLMClient) (*ares_eval.EvaluatorRegistry, error) {
+    judge, err := ares_eval.NewLLMJudgeEvaluator(llmClient,
+        ares_eval.WithChinesePrompt(),
+        ares_eval.WithScale(ares_eval.ScaleOneToTen),
     )
     if err != nil {
-        return err
+        return nil, err
     }
-    registry.Register(judge)
-
-    dimJudge, err := eval.NewDimensionJudgeEvaluator(llmClient,
-        eval.WithDimensions(defaultDimensions),
-    )
-    if err != nil {
-        return err
+    registry := ares_eval.NewEvaluatorRegistry()
+    if err := registry.Register("llm_judge", judge); err != nil {
+        return nil, err
     }
-    registry.Register(dimJudge)
-
-    return nil
+    return registry, nil
 }
 ```
 
-When evolution runs, it:
-1. Generates a new strategy (via mutation)
-2. Runs it through the agent
-3. Evaluates the output with `LLMJudgeEvaluator`
-4. Uses the score as fitness for selection
+This registry is exposed as `EvolutionComponents.EvaluatorRegistry` for downstream use.
 
-**Honest reflection**: The LLM judge is expensive — each evaluation is an LLM call. For a 100-case suite with 10 strategies per generation, that's 1000 LLM calls per generation. We added caching (same input → same score) and a "fast mode" that only evaluates 10 random cases. But the fundamental cost remains.
+### Integration B: Gate-3 preserved-case regression (`evolution/candidate_regression.go`, `gate3_orchestrator.go`)
+
+This is where "does strategy A beat strategy B?" actually lands — **not in `ares_eval`**, but in the third gate of candidate verification. `CandidateRegressionChecker` compares the stable old instructions against the candidate's diff over the same preserved-case suite, scoring each with an `ares_arena.Scorer`, then runs a significance test. Defaults are hard-coded:
+
+| Item | Default |
+|------|------|
+| `baselineRuns` / `compareRuns` | 5 |
+| `minWinRate` | 0.55 |
+| `timeout` | 30s |
+| Significance | p < 0.05 (Welch's t-test, `Confident`) |
+
+```mermaid
+graph TD
+    C[Candidate to verify] --> K{Kind == Instruction?}
+    K -->|no| SKIP[skip this gate]
+    K -->|yes| ST[profileStore.GetStable target role]
+    ST -->|no baseline| SKIP2[skip]
+    ST -->|ok| T[RegressionTester.Run]
+    S[LLMArenaScorer scores 0..1] --> T
+    T --> R[RegressionResult: OldAvg/NewAvg/PValue/WinRate]
+    R --> D{Confident AND NewAvg < OldAvg?}
+    D -->|yes| REJ[regression detected, reject candidate]
+    D -->|no| PASS[pass Gate 3]
+```
+
+The scoring model is `LLMArenaScorer` in `ares_evolution/service/llm_arena_scorer.go`: two LLM calls — first have the model execute the instructions on a preserved case, then grade the output on `[0,1]`. It also implements `ScoreBatch`, collapsing a whole regression run into two batched calls (batch execute + batch grade), which drastically cuts request counts for rate-limited providers — a real, verifiable cost optimization. `gate3_orchestrator.go` provides `BuildRegressionGate3`/`LoadRegressionGate3` to wire it up; the latter builds a `FailoverClient` (primary provider + fallbacks) when `llm.fallbacks` is configured, so one provider's quota exhaustion doesn't take down the whole gate, and uses a more lenient circuit breaker (8 failures / 15s) to accommodate the scorer's exponential-backoff retries.
+
+**Honest reflection**: the older claim of "1000 LLM calls per generation, plus caching and a random-10 fast mode" **matches no code or constant** — I dropped it. The real cost controls are batch scoring and failover coordination. (That claim is marked unverified; no corresponding implementation exists.)
 
 ---
 
-## The Service Layer
+## An Honest Wrap-up
 
-`internal/ares_eval/service/` exposes the evaluation framework via HTTP:
+`internal/ares_eval/` is not an ambitious "agent evaluation platform". It's a small scoring library: Loader + Runner + evaluators + report, plus a `DimensionJudgeBridge` that streams dimension diagnoses into the evidence store. "Comparison" is genuinely answered by the Gate-3 preserved-case regression with its statistical significance test — not by a `Comparison` struct. The `concurrent_runner.go`, `comparison.go`, and the HTTP service layer (`/eval/run` endpoints) from older posts **do not exist in the code**, and this article drops them.
 
-```
-service/
-├── handler.go       # HTTP handlers
-├── router.go        # Route registration
-├── service.go       # Business logic
-├── repository.go    # Result persistence
-└── types.go         # API types
-```
-
-Endpoints:
-- `POST /eval/run` — Run an evaluation suite
-- `GET /eval/results/{id}` — Get results
-- `POST /eval/compare` — Compare two runs
-
----
-
-## Lessons
-
-The evaluation framework is the most undervalued module in ares. Nobody asks "how do you evaluate?" in a demo. But without it, evolution is just random mutation — no fitness function, no selection pressure, no improvement.
-
-**The best evaluation framework is the one that makes "is it better?" a question with a numerical answer.** Vibes don't scale. Reproducible scores do.
+**The best evaluation framework is the one that makes "is it better?" a question with a numerical answer.** Vibes don't scale. Reproducible scores do — but only when those scores come from code you can actually point to.

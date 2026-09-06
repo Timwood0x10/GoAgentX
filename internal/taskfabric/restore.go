@@ -53,6 +53,12 @@ const (
 	// envelope (Task.Checkpoint), which restoreCheckpoint already folds back
 	// wholesale — no dedicated Task field, no extra fold branch.
 	restoreKeyStrategyID = "strategy_id"
+	// restoreKeySessionID rides on EVERY persisted event (same reasoning as
+	// StrategyID): the session scope must survive a restart so the L2 graph
+	// registry can re-associate resumed tasks with their session. The value
+	// also lives inside the checkpoint envelope, but riding it on every event
+	// ensures it is visible to event subscribers without decoding checkpoints.
+	restoreKeySessionID = "session_id"
 )
 
 // RestoreFromStore rebuilds the in-memory task set from the attached event

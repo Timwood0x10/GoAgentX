@@ -1,563 +1,264 @@
-# ares 架构深度解析（六）：安全与可观测性 — 纵深防御与透明追踪（0.3.x）
+# ares 架构深度解析（六）：安全与可观测性 — 认证、鉴权、脱敏与调度可观测（0.3.x）
 
-> 0.3.x 更新：包路径从 `internal/security/` → `internal/ares_security/`，`internal/observability/` → `internal/ares_observability/`。安全模块与 Agent Fabric 的 spawn/kill/recover 生命周期深度集成。Scheduling Observatory 记录调度决策。
+> 0.3.x 说明：本文完全基于当前 `internal/ares_security/` 与 `internal/ares_observability/` 的真实实现改写。早期版本的 `SafeLogger` / `LogTracer` / 限流工厂 / 优雅关闭四段状态机等内容在当前代码中**不再存在**，本文不再复述，只写现在真实存在的东西。
 
-> Agent 越强大，搞破坏的能力也越强。你给 Agent 装了代码执行器、文件读写、网络请求——然后它被 prompt injection 骗了……
-> 我在设计工具系统的时候就一直在想一个问题：**怎么让 Agent 输出敏感信息时不翻车？**
-> 答案是：别等到翻车再处理。从日志输出那一步就开始脱敏。
+> 一个 Agent 能做的事越危险，越需要在"它把事做出来之前"就先想清楚：谁来用它？它能碰什么？它吐出来的东西会不会泄密？以及——它在运行时的每一步，我们到底能不能看见？
 
 ---
 
-## 一、为什么安全不能是事后加的
+## 一、这次聊什么，以及"真实存在"这件事
 
-给 Agent 装工具就像给 teenager 车钥匙——他能去的地方很多，但你不能保证他不闯祸。
+先说结论，别被标题带偏：当前代码库里的安全与可观测性，不是一篇夸夸其谈的"纵深防御白皮书"，而是一组**小而清晰、还在被守卫着每个 HTTP 边界**的模块。
 
-我见过太多 AI 项目上线后翻车的案例：Agent 在日志里把用户的 API Key 打印出来了、prompt 里不小心带上了数据库密码、LLM 响应里泄露了手机号……这些问题一旦发生，不是"下次注意"就能解决的——合规审计追着你跑。
+- 安全侧：`internal/ares_security/` — **JWT 认证 + RBAC 角色权限 + 请求中间件 + 审计日志 + 敏感信息脱敏**，共 5 个文件。
+- 可观测侧：`internal/ares_observability/` — **Tracer 接口（OTel / Noop 两套实现）+ Metrics（OTel / Prometheus 两套）+ 每会话成本跟踪**。
+- 调度可观测：`internal/kernelscheduler/decision_recorder.go` 的 **Scheduling Observatory**，以及 `internal/introspect/` 的运行态面板。
 
-所以我在设计 ares 的基础设施时，把安全和可观测性放在了一起考虑。不是"先做功能再做安全"，而是**从第一天就把它们设计进系统里**。
+我把上一版文章里"当前代码里没有"的东西都删掉了。下面每一行符号，都在对应文件里找得到。
 
-这篇文章聊四个模块：**安全（脱敏）**、**可观测性（追踪）**、**限流**和**优雅关闭**。它们不直接面向用户，但没有它们，你把 Agent 放到生产环境就是裸奔。
+核心文件清单（真实路径）：
 
-核心文件清单：
-
-| 模块 | 文件路径 |
-|------|----------|
-| 安全（脱敏） | `internal/ares_security/sanitizer.go`（0.2.x: `internal/security/`） |
-| 可观测性（Tracer） | `internal/ares_observability/tracer.go`、`noop.go`、`log.go`（0.2.x: `internal/observability/`） |
-| 限流（Limiter） | `internal/ares_ratelimit/` 目录下源文件（0.2.x: `internal/ratelimit/`） |
-| 优雅关闭 | `internal/ares_shutdown/` 目录下四个源文件 |
-| 中间件模式 | `internal/dashboard/api.go`、`internal/arena/http.go` |
-| 端到端集成 | `internal/workflow/graph/graph.go`、`.../executor.go` |
-| API 层集成 | `api/service/workflow/service.go` |
-
----
-
-## 二、安全模块：基于正则的敏感信息脱敏
-
-安全模块的核心设计思路是 **"字段类型 + 正则检测 → 针对性脱敏策略"**，而非简单的全局字符串替换。它提供了两重防御：
-
-### 2.1 SensitiveFieldType — 用字符串常量而非 iota 做类型标识
-
-与常见的 iota 枚举不同，ares 使用字符串常量来定义敏感字段类型：
-
-```go
-const (
-    SensitiveFieldTypeAPIKey       SensitiveFieldType = "api_key"
-    SensitiveFieldTypePassword     SensitiveFieldType = "password"
-    SensitiveFieldTypeEmail        SensitiveFieldType = "email"
-    SensitiveFieldTypePhone        SensitiveFieldType = "phone"
-    SensitiveFieldTypeCreditCard   SensitiveFieldType = "credit_card"
-    SensitiveFieldTypeSSN          SensitiveFieldType = "ssn"
-)
-```
-
-这种设计的优势在于：字符串常量天然支持序列化（JSON/YAML 配置可直接引用），且便于在运行时通过反射或字符串匹配动态识别字段类型。
-
-### 2.2 双层检测机制
-
-Sanitizer 的工作流程分为两层：
-
-**第一层：按字段名匹配。** 对于结构化的 JSON 输入（如 LLM 请求/响应），Sanitizer 遍历字段名，通过 `getFieldType()` 方法将字段名映射到 `SensitiveFieldType`。例如字段名包含 "key" 或 "token" 就归类为 APIKey。
-
-**第二层：按正则匹配。** 对于非结构化的文本或 JSON 无法覆盖的场景，Sanitizer 维护了一组预编译的正则模式，对文本内容进行全面扫描：
-
-```go
-type Sanitizer struct {
-    patterns []sanitizePattern
-}
-
-type sanitizePattern struct {
-    pattern *regexp.Regexp
-    mask    func(string) string
-}
-```
-
-每种敏感类型对应不同的掩码策略。以关键的 `maskAPIKey` 为例：
-
-```go
-func (s *Sanitizer) maskAPIKey(input string) string {
-    if len(input) <= 8 {
-        return strings.Repeat("*", len(input))
-    }
-    return input[:4] + strings.Repeat("*", len(input)-8) + input[len(input)-4:]
-}
-```
-
-这种"保留首尾各 4 字符，中间用 `*` 替换"的策略，既掩盖了敏感内容，又保留了 API Key 的格式特征，便于调试时区分不同的 Key。
-
-其他掩码策略：
-
-- **密码（Password）**：完全用 `*` 替换
-- **邮箱（Email）**：保留域名（`@` 之后），用户名部分首尾各 1 字符 + `***`
-- **手机号（Phone）**：保留前 3 位和后 4 位，中间用 `****` 替换
-- **信用卡号（CreditCard）**：保留末 4 位
-- **SSN**：保留末 4 位
-
-### 2.3 SafeLogger — 安全的日志包装器
-
-`SafeLogger` 是 Sanitizer 的一个优雅的应用层包装：
-
-```go
-type SafeLogger struct {
-    sanitizer *Sanitizer
-    logger    func(string)
-}
-```
-
-它将任何 `func(string)` 类型的日志函数包装为自动脱敏的版本，所有输出日志在写出前自动经过 Sanitizer 处理。这种设计使得安全模块可以透明地嵌入已有的日志体系，无需修改日志消费者的代码。
-
-### 2.4 包级便捷函数
-
-```go
-func SanitizeLog(logger func(string), message string) {
-    s := &Sanitizer{}
-    s.SafeLogger(logger).Output(message)
-}
-```
-
-`SanitizeLog()` 是一个"开箱即用"的一键脱敏函数，适用于脚本或简单场景，无需提前构造 Sanitizer 实例。
-
-### 2.5 一个让我后背发凉的教训
-
-说实话，第一版 Sanitizer 并不完善。
-
-最初我只对结构化 JSON 输入做了字段名匹配——API Key 脱了、密码脱了，但 LLM 响应的 `content` 字段里如果包含了手机号或邮箱，直接原样输出。我想当然地认为："LLM 返回的内容，应该不会有敏感信息吧？"
-
-直到运维同事跑来找我，说日志系统里搜到了完整的手机号——不是脱敏后的 `138****5678`，是明文的 `13812345678`。排查下来发现：第一版的正则检测层只配置了对 JSON key 的匹配规则，没有针对文本内容的全量扫描。`content` 字段里用户说的手机号，从 LLM 响应的往返过程中一路都是明文，日志里也照写不误。
-
-幸好发现得早，日志只在测试环境保留了两天。但这件事让我彻底改了对"脱敏"的看法：**敏感信息可能出现在任何字段里，不限于你预判的那些。** 这也是为什么后来的 Sanitizer 一定要有两层检测——字段名匹配兜不住的时候，正则全量扫描兜底。
+| 模块 | 文件路径 | 关键符号（已核实） |
+|------|----------|--------------------|
+| JWT | `internal/ares_security/jwt.go` | `SignJWT`、`VerifyJWT`、`ErrInvalidToken`、`ErrTokenExpired`、`ErrTokenTooEarly` |
+| RBAC | `internal/ares_security/rbac.go` | `Role`、`Permission`、`ParseRole`、`AllowRole`、`HasPermission` |
+| 中间件 | `internal/ares_security/middleware.go` | `AuthMiddleware`、`NewAuthMiddleware`、`WithAudit`、`Principal`、`FromContext`、`Verify` |
+| 审计 | `internal/ares_security/audit.go` | `AuditLogger`、`NewAuditLogger`、`Auth`、`Action` |
+| 脱敏 | `internal/ares_security/sanitizer.go` | `Sanitizer`、`Sanitize`、`SanitizeJSON`、`SanitizeOptions`、`SensitivePattern` |
+| Tracer 接口 | `internal/ares_observability/tracer.go` | `Tracer`、`LLMCall`、`ToolCall`、`AgentStep`、`AgentError` |
+| Noop 实现 | `internal/ares_observability/noop.go` | `NoopTracer`、`NewNoopTracer` |
+| OTel 实现 | `internal/ares_observability/otel_tracer.go` | `OTelTracer`、`NewOTelTracer`、`WithExporter`、`WithSampler`、`WithMetricReader` |
+| Metrics | `internal/ares_observability/metrics.go` | `Metrics`、`NewMetrics`、`RecordLLMCall`、`RecordToolCall`、`RecordAgentStepDuration`、`RecordAgentError` |
+| Prometheus | `internal/ares_observability/prometheus.go` | `PrometheusMetrics`、`NewPrometheusMetrics`、`MetricsHTTPHandler`、`RegisterMetricsRouter` |
+| 调度可观测 | `internal/kernelscheduler/decision_recorder.go` | `DecisionRecorder`、`ScheduleDecision`、`CandidateScore`、`snapshot`/`Record` |
+| 运行态面板 | `internal/introspect/` | `Dashboard`、`Store`、`Collector`、`Handler`、`Sink` |
+| LLM 侧脱敏接线 | `internal/llm/client.go` + `internal/ares_bootstrap/provide_llm.go` | `WithSanitizer` |
 
 ---
 
-## 三、可观测性模块：Tracer 接口与两套实现
+## 二、安全模块：不要去造一个"看起来很酷但没人敢用"的机制
 
-ares 的可观测性采用经典的**观察者模式**：定义抽象的 `Tracer` 接口，提供 `NoopTracer` 和 `LogTracer` 两种实现。
+先泼一盆冷水。老版本文章里我写了 `SafeLogger`、字段名 + 正则双层检测、包级 `SanitizeLog`。**这些在当前代码里都不存在了。** 现在的 `ares_security` 候选名录分成两块：认证（JWT/RBAC/中间件/审计）和脱敏（Sanitizer）。
 
-### 3.1 Tracer 接口定义
+### 2.1 JWT：手写的 HS256，只信任签名过的版本
+
+`jwt.go` 从头实现了一个 HS256 JWT，刻意不用第三方库（设计约束：优先标准库）。
+
+```go
+func SignJWT(secret []byte, subject, role string, ttl time.Duration, now time.Time) (string, error)
+func VerifyJWT(secret []byte, token string, now time.Time) (subject, role string, err error)
+```
+
+几个我在代码里核实过的关键细节：
+
+1. **常量时间比较**：`decodeSigned` 里用 `hmac.Equal(sig, expected)` 校验签名——不是 `==`，避免时序侧信道。
+2. **先验签、后信内容**：签名对不上直接返回 `ErrInvalidToken`，payload 里的任何字段都不会被信任。
+3. **三个哨兵错误**：`ErrInvalidToken`（畸形/错签/缺 claims）、`ErrTokenExpired`（已过期）、`ErrTokenTooEarly`（`iat` 在未来）。调用方要区分过期时用 `errors.Is(err, ErrTokenExpired)`。
+4. **token 只带三个 claim**：`sub`（主体）、`role`（角色）、`exp`（过期 Unix 秒），另有 `iat`。
+
+```mermaid
+flowchart LR
+    A[Bearer token] --> B{split "." count != 3}
+    B -- yes --> E1[ErrInvalidToken]
+    B -- no --> C[hmac.Equal 验签]
+    C -- fail --> E1
+    C -- ok --> D{exp 已过?}
+    D -- yes --> E2[ErrTokenExpired]
+    D -- no --> F{iat 在未来?}
+    F -- yes --> E3[ErrTokenTooEarly]
+    F -- no --> G[校验 sub/role 非空]
+    G -- 通过 --> H["返回 subject, role"]
+```
+
+### 2.2 RBAC：静态的角色→权限矩阵，默认拒绝
+
+`rbac.go` 定义了三个角色、三个权限，以及一个静态矩阵 `rolePermissions`：
+
+| 角色（`Role`） | `PermRead` | `PermWrite` | `PermAdmin` |
+|----------------|:---:|:---:|:---:|
+| `RoleAdmin` ("admin") | ✅ | ✅ | ✅ |
+| `RoleOperator` ("operator") | ✅ | ✅ | ❌ |
+| `RoleAgent` ("agent") | ✅ | ❌ | ❌ |
+
+- `ParseRole(s)` 会把字符串小写、去空白后再匹配，匹配不到返回 `ErrUnknownRole`——攻击者不能用 token 铸造一个系统不认识的角色。
+- `AllowRole(role, perm)` / `HasPermission(role, perm)` 走同一个 `rolePermissions` 矩阵，**空角色直接返回 false（默认拒绝）**。
+
+### 2.3 中间件：Bearer + 验签 + 角色检查，一次到位
+
+`middleware.go` 的 `AuthMiddleware` 是"所有受保护路由的唯一强制点"：
+
+```go
+type AuthMiddleware struct {
+    secret  []byte      // HS256 密钥；nil 时全部拒绝(401)
+    require Permission   // 该路由要求的最低权限
+    audit   *AuditLogger // 模块化审计，nil 关闭
+    now     func() time.Time
+}
+```
+
+流程（`authenticate`）：
+1. 从 `Authorization: Bearer ` 头取 token——**只认 `Bearer ` 前缀**，其它 scheme 一律视为缺失，防 token 走私。
+2. `VerifyJWT` 验签 + 查过期。
+3. `ParseRole` 解析角色（未知 → 403）。
+4. `AllowRole(role, m.require)` 权限门（不足 → 403）。
+5. 通过后把 `Principal{Subject, Role}` 注入请求 `context`，下游用 `FromContext` 读取。
+
+两个值得强调的工程点：
+- **secret 为 nil = deny-all**。注释里写得很明确：nil 时每个请求都 401，避免"为了开 JWT 反而打开一个破坏性端点"。
+- **每次判定都审计**（`m.auditAuth`），无论放行还是拒绝。
+
+### 2.4 审计：不记 token，只记"谁、做了什么、成没成"
+
+`audit.go` 的 `AuditLogger` 是对 `*slog.Logger` 的薄封装，固定一组结构化字段。关键设计：**token 本身永不进日志**，只记解码后的身份与决策。
+
+- `Auth(decision, subject, role, method, path, status)` — 记录认证放行/拒绝。
+- `Action(action, subject, target, ok)` — 记录破坏性/特权动作（杀 Agent、调 MCP 工具等"谁改了什么"）。
+
+### 2.5 脱敏：`Sanitizer` —— 正则检测 + 针对性掩码
+
+`sanitizer.go` 的 `Sanitizer` 用一组 `SensitivePattern` 正则去扫文本，每种 `SensitiveFieldType` 配一个掩码函数。已核实的类型常量：
+
+```go
+SensitiveFieldTypeAPIKey / Password / Token / Email / Phone / SSN / CreditCard / PersonalInfo
+```
+
+> ⚠️ **这里要如实说明**：`SensitiveFieldTypePersonalInfo` 常量存在，但 `defaultSensitivePatterns()` 里**没有**为它注册正则——这是"常量存在但无默认规则"的留白，使用时别假设它开箱即用。（待核实：是否有其它调用方补充该型规则。）
+
+两个入口：
+- `Sanitize(input string)`：对一段文本顺序跑所有正则并替换为掩码。
+- `SanitizeJSON(jsonStr string)`：先 `json.Decoder` + `UseNumber()` 解析，**递归**只对 string 值做脱敏，再重新序列化——避免对整段 JSON 字符串跑正则把引号/花括号打坏。其它类型如 json.Number 会被 `maybeMaskNumeric` 检查数字串（但若没命中则原样返回，保持数字类型不退化）。
+
+掩码函数：`maskAPIKey`、`maskPassword`、`maskToken`、`maskEmail`、`maskPhone`、`maskCreditCard`、`maskSSN`，以及底层 `maskString(s, preserveLength)`（保留首尾 N 字符，中间用 `*` 填充）。配套 `SanitizeOptions` 可调 `MaskChar`、`KeepLength`、`PreserveLengthFor`。
+
+脱敏在 LLM 调用链上的落点（`internal/llm/client.go`）：
+
+```go
+func WithSanitizer(s *ares_security.Sanitizer) Option {
+    return func(c *Client) { c.sanitizer = s }
+}
+```
+
+生产装配在 `internal/ares_bootstrap/provide_llm.go`：
+
+```go
+client, err := llm.NewClient(llmCfg, llm.WithCallbacks(reg), llm.WithSanitizer(ares_security.NewSanitizer()))
+```
+
+即：**发往 provider 的 live 请求原样发出，但在被 tracer/event store 记录前先过 `Sanitizer`**，防止密钥落进日志和 trace。
+
+---
+
+## 三、可观测性模块：一个 `Tracer` 接口，两套后端
+
+`tracer.go` 定义接口：
 
 ```go
 type Tracer interface {
-    RecordLLMCall(ctx context.Context, call *LLMCall)
-    RecordToolCall(ctx context.Context, call *ToolCall)
-    RecordAgentStep(ctx context.Context, step *AgentStep)
-    RecordError(ctx context.Context, err *AgentError)
-    GetTraceID(ctx context.Context) string
-    WithTrace(ctx context.Context) context.Context
+    RecordLLMCall(ctx, call *LLMCall)
+    RecordToolCall(ctx, call *ToolCall)
+    RecordAgentStep(ctx, step *AgentStep)
+    RecordError(ctx, err *AgentError)
+    GetTraceID(ctx) string
+    WithTrace(ctx) context.Context
 }
 ```
 
-这个接口覆盖了 Agent 执行过程中的四个关键观测点：
-1. **LLM 调用**（`RecordLLMCall`）：记录模型、prompt、response、token 用量和耗时
-2. **工具调用**（`RecordToolCall`）：记录工具名、输入、输出和耗时
-3. **Agent 步骤**（`RecordAgentStep`）：记录每个节点的执行阶段
-4. **错误**（`RecordError`）：记录错误类型和消息
+数据结构 `LLMCall` / `ToolCall` / `AgentStep` / `AgentError` 都带 `TraceID` 字段，让 trace 能把一次执行串起来。
 
-### 3.2 NoopTracer — 零开销的默认实现
+### 3.1 `NoopTracer`：trace ID 还是要有，记录是不做的
 
-```go
-type NoopTracer struct{}
+`noop.go` 的 `NoopTracer` 四个 `Record*` 全是空实现，但 `WithTrace` 会在 context 里塞一个自增 `trace-N` 的 trace ID（`atomic.AddUint64`），`GetTraceID` 能读回来。也就是说即使不开可观测性，trace 传播的约定也不会崩。
 
-var traceCounter uint64
+### 3.2 `OTelTracer`：真实的 OpenTelemetry 后端
 
-func (t *NoopTracer) generateTraceID() string {
-    id := atomic.AddUint64(&traceCounter, 1)
-    return fmt.Sprintf("trace-%d", id)
-}
-```
+`otel_tracer.go` 的 `OTelTracer` 实现 `Tracer`，每个调用点开一个 span：
 
-`NoopTracer` 是 Graph 构造函数的默认 tracer（见 `NewGraph()`）。它的 `Record*` 方法均为空实现，但 `generateTraceID()` 使用 `atomic.AddUint64` 生成自增 trace ID，并非完全的"零分配"（`fmt.Sprintf` 有少量堆分配）。`WithTrace` 方法会检查上下文中是否已有 trace ID，避免重复生成。
+| 方法 | span 名 | 主要属性 |
+|------|---------|----------|
+| `RecordLLMCall` | `llm.call` | `llm.model`、`llm.tokens_used`、`llm.duration_ms`、`llm.has_error` |
+| `RecordToolCall` | `tool.call` | `tool.name`、`tool.duration_ms`、`tool.has_error` |
+| `RecordAgentStep` | `agent.step` | `agent.id`、`agent.step_name`、`agent.duration_ms` |
+| `RecordError` | `agent.error` | `agent.id`、`error.type`、`error.message` |
 
-### 3.3 LogTracer — 基于 slog 的结构化日志实现
+配套 options：`WithExporter`（默认 `stdouttrace.New()`）、`WithSampler`（默认 `AlwaysSample`）、`WithMetricReader`（默认手动 reader）。还有 `Shutdown`（`errors.Join` 两个 provider 的关闭错误）、`Provider` / `MeterProvider` / `Metrics` 访问器。OTel 里还带了 OTel 侧的 `Metrics`（见下）。
 
-```go
-type LogTracer struct {
-    logger *slog.Logger
-}
-```
+### 3.3 Metrics：`ares_*` 前缀的 OTel 计数器/直方图
 
-`LogTracer` 将 Tracer 的每个事件点映射为一条结构化日志记录。例如 `RecordLLMCall`：
+`metrics.go` 的 `Metrics` 定义了一组受管 instrument：
 
-```go
-func (t *LogTracer) RecordLLMCall(ctx context.Context, call *LLMCall) {
-    if call.Error != nil {
-        t.logger.ErrorContext(ctx, "llm call failed",
-            "trace_id", call.TraceID,
-            "model", call.Model,
-            "prompt_len", len(call.Prompt),
-            "response_len", len(call.Response),
-            "tokens", call.TokensUsed,
-            "duration_ms", call.Duration.Milliseconds(),
-            "error", call.Error,
-        )
-    } else {
-        t.logger.InfoContext(ctx, "llm call completed",
-            "trace_id", call.TraceID,
-            // ... same fields ...
-        )
-    }
-}
-```
+| instrument | 名称 | 类型 |
+|-----------|------|------|
+| `llmCallsTotal` | `ares_llm_calls_total` | Int64Counter |
+| `toolCallsTotal` | `ares_tool_calls_total` | Int64Counter |
+| `agentErrorsTotal` | `ares_agent_errors_total` | Int64Counter |
+| `llmCallDuration` | `ares_llm_call_duration_seconds` | Float64Histogram（桶 0.1…60s） |
+| `agentStepDuration` | `ares_agent_step_duration_seconds` | Float64Histogram |
+| `toolCallDuration` | `ares_tool_call_duration_seconds` | Float64Histogram |
 
-关键设计要点：
-- **成功/失败分支**：失败时使用 `ErrorContext` 记录，成功时使用 `InfoContext`
-- **结构化属性**：所有字段以 key-value 对形式传入，方便日志收集系统（如 Loki、Datadog）解析
-- **`slog.Logger` 注入**：LogTracer 不负责创建 logger，而是接收外部注入，符合依赖反转原则
+记录方法 `RecordLLMCall` / `RecordToolCall` / `RecordAgentStepDuration` / `RecordAgentError` 都会带 label（`model`/`tool_name`/`agent_id` 等）和 `has_error`。
+
+### 3.4 Prometheus：`ARES_*` 前缀的另一套后端
+
+`prometheus.go` 的 `PrometheusMetrics` 用 `prometheus/client_golang` 注册了一批 `ARES_*` 指标，核心有：
+
+- 计数器：`ARES_llm_calls_total{model,status}`、`ARES_tool_calls_total{tool,status}`、`ARES_agent_errors_total{agent,phase}`
+- 直方图：`ARES_llm_call_duration_seconds{model}`、`ARES_agent_step_duration_seconds{phase}`
+- 仪表：`ARES_active_agents`、`ARES_llm_tokens_total{model,direction}`
+- 摘要：`ARES_cost_usd_total{model}`（**只按 model 标，不按 session 标**——注释明确说 session 无界会撑爆 registry，每会话明细走 `CostTracker`，见 `cost.go`）
+- 外加一整套 `ARES_evolution_*`（deploy/guardrail/shadow/promote/rollback/gate-reject/shadow_win_rate/generation/DAG version/compile count 等），属于演进循环的可观测面。
+
+对外暴露：`MetricsHTTPHandler()` 返回 `/metrics` 的 `promhttp` handler，`RegisterMetricsRouter(mux)` 负责把它挂到 `GET /metrics`。
+
+> **一个坑，代码里专门处理过**：Prometheus collector 重复注册会返回 `AlreadyRegisteredError`。`NewPrometheusMetrics` 用 `cachedMetrics` 缓存首个成功实例，重复初始化返回缓存实例，避免"记到一个根本没注册的 vector 上"。
+
+### 3.5 成本跟踪 `CostTracker`
+
+`cost.go` 提供按模型 + 按 session 的 `CostTracker`，弥补 Prometheus 侧不按 session 标号化导致的明细缺失。这是把"花了多少钱"从指标里拆出去、单独管理的明确设计。（具体方法名建议后续撰写时核对 `cost_test.go`，本文只确认它存在。）
 
 ---
 
-## 四、限流模块：三种算法 + 工厂模式
+## 四、调度可观测：Scheduling Observatory
 
-限流模块提供了三个内置算法，并通过工厂模式支持扩展。
+调度器为什么要"可观测"？因为一个任务被分给某个 Agent 可能是多个因素（能力覆盖、负载、经验置信度、优先级）共同作用的结果。`decision_recorder.go` 在**每次 `Schedule` 调用时记录一条决策**，存进一个**有界环形缓冲（`maxRecordedDecisions = 200`）**，面板据此渲染"为什么分给它"。
 
-### 4.1 Limiter 接口与 Factory
+已核实的数据结构：
 
-```go
-type Limiter interface {
-    Allow() bool
-    Wait(ctx context.Context) error
-    Reset()
-    Rate() float64
-}
+- `ScheduleDecision`：`TaskID`、`Capability`、`Candidates`（按分数降序）、`Winner`、`Epoch`（Acquire 给的 fencing token）、`Time`、`Err`（失败如 `ErrNoCapableCandidate` 时 `Winner`/`Epoch` 为零，成功时省略）。
+- `CandidateScore`：`AgentID`、`Capabilities`、`Overlap`、`Load`、`Confidence`、`PriorityBoost`、`Score`。
+- `DecisionRecorder`：`Record`（追加并淘汰最旧）、`Snapshot`（**返回副本、新到旧**，锁保护）、`scoreCandidates`（复用 `taskfabric.ScoreBreakdown` 一次性算出分数**及其分解**，让面板渲染的分解与调度器实际排序依据不可能漂移）。
 
-type Factory struct {
-    constructors map[string]func(config map[string]any) (Limiter, error)
-}
+```mermaid
+flowchart LR
+    S[Schedule 调用] --> RC{DecisionRecorder.Record}
+    RC --> RB[有界环形缓冲 ≤ 200 条]
+    RB --> SNAP[Snapshot 副本, 新到旧]
+    SNAP --> P[introspect 面板 / dashboard.md §7]
 ```
-
-`Factory` 采用注册-创建模式，通过 `Register(name, constructor)` 注册限流器构造器，通过 `Create(name, config)` 按名创建。`DefaultFactory` 是包级全局单例，预注册了三种内置限流器。
-
-### 4.2 TokenBucketLimiter — 令牌桶算法
-
-```go
-type TokenBucketLimiter struct {
-    rate       float64
-    burst      int
-    tokens     float64
-    lastCheck  time.Time
-    mu         sync.Mutex
-}
-```
-
-核心逻辑在 `Allow()` 中：每次调用时先根据 `time.Since(lastCheck).Seconds() * rate` 计算应补充的令牌数，再判断是否放行。`Wait()` 实现为 busy-loop + `time.After(waitTime)`，其中 waitTime = `float64(time.Second) / rate`。支持 `SetRate()` 和 `SetBurst()` 运行时动态调整参数。
-
-### 4.3 SlidingWindowLimiter — 滑动窗口算法
-
-```go
-type SlidingWindowLimiter struct {
-    rate       int
-    windowSize time.Duration
-    requests   []time.Time
-    mu         sync.Mutex
-}
-```
-
-基于时间戳数组实现：每次请求将当前时间追加到切片尾部，`cleanup()` 移除窗口外的过期请求。`Allow()` 判断 `len(l.requests) < l.rate`，`Wait()` 则计算到最早请求过期的时间：`waitTime = l.windowSize - time.Since(oldest)`。支持 `ResetAt(t time.Time)` 实现定时重置。
-
-### 4.4 SemaphoreLimiter — 信号量限流
-
-```go
-type SemaphoreLimiter struct {
-    slots chan struct{}
-}
-```
-
-channel 信号量实现：`Acquire()` 从 channel 读取，`Release()` 写回。`WeightedSemaphoreLimiter` 是加权版本，使用 `sync.Cond` + `context.AfterFunc` 实现取消传播，支持按不同 key 分配权重配额（如按 API Key 分配）。
-
-### 4.5 三种算法的选型对比
-
-这三种限流算法各有适用场景：令牌桶算法适合应对突发流量，滑动窗口算法能够精确控制时间窗口内的请求总数，信号量算法则擅长限制并发数而非请求速率。在实际生产环境中，Graph 执行器的入口使用令牌桶最为常见，因为 Agent 的工作流天然存在"突发式"特征——多个节点可能同时到达就绪队列，需要短时间内的突发放行能力。需要特别注意的是，限流失败时调用方必须处理 `Wait()` 返回的 context 取消错误，否则可能导致请求堆积和 goroutine 泄露。
 
 ---
 
-## 五、优雅关闭模块：四阶段状态机
+## 五、运行态面板：`internal/introspect/`
 
-优雅关闭模块是系统容错的最后一道防线，其设计确保进程在任何情况下都能有序退出。
+`introspect` 包是"单进程可观测 ARES 运行时"的读模型壳：
 
-### 5.1 Manager — 四阶段执行
+- `Dashboard`：`NewDashboard` 组装整套真实运行时（LLM 适配器、failover client、tool registry、fabrics、调度器、chaos observer、panel collector、HTTP handler），`Run` 启动，`Submit` 派发任务。默认监听 `:5606`，路由 `/introspect`、`/introspect/`、`/api/v1/introspect/`。
+- `Store`：保存**最新**一帧 `Snapshot`（`atomic.Pointer`），活动时间线是有界环形（`maxTimelineEntries = 300`）。注释强调 O(1) 内存是有意设计——**历史在事件日志/归档里，不在面板里**。
+- `Collector` / `Sources`：每 2 秒从 `Sources`（Kernel / Fabric / Agents / Chaos / Collab / Tasks / Decisions）拉取一帧 `Snapshot`。nil 的 source 会渲染为空而非 panic。
+- `Handler`：提供嵌入的 SPA 页面（`web/panel.html`，`//go:embed`）+ JSON 读 API（`/api/v1/introspect/*`）。
 
-```go
-const (
-    PhasePreShutdown Phase = iota // 0
-    PhaseGraceful                 // 1
-    PhaseForce                    // 2
-    PhaseDone                     // 3
-)
-```
+> 🔒 **安全边界（真实写在代码注释里）**：introspect 的 `Handler` **不做任何认证/授权**，`/api/v1/introspect/eventstream` 会返回带完整 payload（任务输入、checkpoint）的原始事件。它只面向可信运维——**别绑到公网地址**，要么留在 localhost/内网，要么放到会强制认证的反向代理后面。这条责任写得很清楚："Callers wiring this into a mux own that boundary."
 
-每个阶段的执行逻辑：
-
-```go
-func (m *Manager) executePhase(ctx context.Context, phase Phase) []CallbackResult {
-    var wg sync.WaitGroup
-    results := make([]CallbackResult, 0, len(callbacks))
-    resultsMu := sync.Mutex{}
-
-    for _, cb := range callbacks {
-        wg.Add(1)
-        go func(cb RegisteredCallback) {
-            defer wg.Done()
-            defer func() { // panic recovery
-                if rec := recover(); rec != nil { ... }
-            }()
-            // Execute with per-callback timeout
-            cbCtx, cancel := context.WithTimeout(ctx, cb.timeout)
-            defer cancel()
-            err := cb.fn(cbCtx)
-            // ...
-        }(cb)
-    }
-    wg.Wait()
-    return results
-}
-```
-
-每个回调在独立的 goroutine 中执行，拥有自己的超时上下文。panic recovery 确保单个回调崩溃不会影响整体关闭流程。整个阶段还有一个 5 秒的硬超时兜底。
-
-### 5.2 PhaseExecutor — 带指数退避的重试状态机
-
-```go
-type PhaseExecutor struct {
-    phase    Phase
-    state    ExecutorState
-    retry    int
-    maxRetry int
-    rollback func()
-}
-```
-
-PhaseExecutor 的状态转换：`Pending → Running → Completed / Failed`。重试机制使用指数退避：
-
-```go
-backoff = time.Duration(1 << uint(attempt)) * time.Second
-```
-
-注意：当 attempt 达到 30 时，`1 << uint(30)` 会产生约 10.7 亿秒的溢出（约 34 年），因此在循环中 attempt 会被 cap 到 29（与 `1<<30` 相除保护一致）。
-
-### 5.3 CallbackRegistry — 带优先级的回调注册
-
-回调通过 `map[Phase][]RegisteredCallback` 按阶段组织，使用冒泡排序按优先级降序执行。`CallbackChain` 支持串行链式和并行批处理两种执行模式。
-
-### 5.4 SignalHandler — 信号监听
-
-```go
-type SignalHandler struct {
-    signals []os.Signal
-    ch      chan os.Signal
-}
-```
-
-集成标准库 `os/signal`，监听 `SIGINT`、`SIGTERM`、`os.Interrupt`。提供 `WaitForSignal()` 和 `WaitForContextOrSignal()` 两种阻塞等待方式。
-
-### 5.5 关闭流程的完整时序
-
-一个典型的优雅关闭流程如下：首先系统接收到 SIGINT 或 SIGTERM 信号，SignalHandler 将信号转发到 Manager。Manager 进入 PhasePreShutdown 阶段，执行所有预关闭回调（如断开数据库连接、发送心跳停止信号）。随后进入 PhaseGraceful 阶段，每个回调拥有独立的超时上下文，并以 goroutine 并发执行。如果所有回调在超时前完成，Manager 直接进入 PhaseDone；如果某些回调超时，Manager 进入 PhaseForce 阶段，强制执行剩余回调并记录超时信息。最终进入 PhaseDone 阶段，系统完成退出。这种分级保护机制的核心思想是"先礼貌请求、再强制要求"，确保在任何情况下系统都能以可预测的方式退出，不会因为某个回调卡死而导致进程残留。
+另外，`ProvideObservability`（`internal/ares_bootstrap/provide_observability.go`）把演进轨迹 M3-1、人类反馈 M3-2、跨 Fabric span M4-1 三个真实数据面直连到 `introspect.ControlServer`。
 
 ---
 
-## 六、中间件模式：CORS 与 panic 恢复
+## 六、架构观察
 
-### 6.1 Dashboard 的 withCORS 中间件
-
-```go
-func withCORS(next http.Handler) http.Handler {
-    return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-        w.Header().Set("Access-Control-Allow-Origin", "*")
-        w.Header().Set("Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS")
-        w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
-        if r.Method == http.MethodOptions {
-            w.WriteHeader(http.StatusOK)
-            return
-        }
-        next.ServeHTTP(w, r)
-    })
-}
-```
-
-支持通配符 CORS，对 OPTIONS 预检请求直接返回 200。
-
-### 6.2 统一的 withRecovery 中间件
-
-```go
-func withRecovery(next http.Handler) http.Handler {
-    return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-        defer func() {
-            if rec := recover(); rec != nil {
-                slog.Error("api: panic recovered", "path", r.URL.Path, "recover", rec)
-                writeJSON(w, http.StatusInternalServerError, errResp("internal server error"))
-            }
-        }()
-        next.ServeHTTP(w, r)
-    })
-}
-```
-
-Arena 模块也有其独立的 `RecoverMiddleware`，行为类似但使用独立的 `slog` 实例。
-
-### 6.3 中间件链式组合
-
-```go
-func (a *APIv2) Handler() http.Handler {
-    mux := http.NewServeMux()
-    // ... 注册所有路由 ...
-    return withRecovery(withCORS(mux))
-}
-```
-
-这种洋葱圈风格的中间件组合确保了所有请求路径都经过 CORS 和 panic 恢复的保护。
+- **安全 = 认证 + 授权 + 审计 + 脱敏四条线，彼此独立**：JWT/RBAC 管"你是谁、你能碰什么"，`AuditLogger` 管"谁改了什么"，`Sanitizer` 管"记录里不留敏感明文"。它们可以各自启用/关闭。
+- **可观测 = 接口 + 双后端**：业务/LLM 层只依赖 `Tracer` 接口，OTel 与 Noop 可替换；指标侧 OTel 与 Prometheus 命名前缀不同（`ares_*` vs `ARES_*`），是两套并行的数据出口。
+- **脱敏发生在"记录前"而非"发送前"**：给 provider 的请求原样走，只有进入 trace/event store 前才脱敏——这是"既要能 debug 又不能泄密"之间的取舍。
+- **可观测组件自己也有安全边界**：introspect 面板明确"无认证、只给可信运维"。可观测基础设施从来不等于默认公开。
 
 ---
 
-## 七、端到端集成：从 Graph Service 到 LLM Client
-
-这四个模块并非孤立存在，它们在 Graph 执行引擎中紧密协作。以下是完整的调用链：
-
-### 7.1 API 层的注入入口
-
-在 `api/service/workflow/service.go` 的 `Service.Execute()` 中：
-
-```go
-func (s *Service) Execute(ctx context.Context, g *wfgraph.Graph, request *ExecuteRequest) (*ExecuteResponse, error) {
-    // 注入 Tracer 和 Limiter
-    if s.tracer != nil {
-        g.SetTracer(s.tracer)
-    }
-    if s.limiter != nil {
-        g.SetLimiter(s.limiter)
-    }
-    // 创建 State → 执行 Graph
-    result, err := g.Execute(ctx, state)
-}
-```
-
-`Service` 的构造函数中，如果 `config.Tracer` 为 nil，默认使用 `observability.NewNoopTracer()`，确保可观测性永远是启用状态。
-
-### 7.2 Graph 执行器中的观测点
-
-在 `internal/workflow/graph/executor.go` 的 `Graph.Execute()` 中，观测点贯穿整个执行流程：
-
-**步骤 1：限流检查**
-```go
-if g.limiter != nil {
-    if err := g.limiter.Wait(ctx); err != nil {
-        return nil, errors.Wrap(err, "rate limit")
-    }
-}
-```
-
-**步骤 2：每个节点执行前后记录 AgentStep**
-```go
-g.tracer.RecordAgentStep(ctx, &observability.AgentStep{
-    TraceID:  g.tracer.GetTraceID(ctx),
-    AgentID:  nodeID,
-    StepName: "execute",
-})
-// ... 执行节点 ...
-g.tracer.RecordAgentStep(ctx, &observability.AgentStep{
-    TraceID:  g.tracer.GetTraceID(ctx),
-    AgentID:  nodeID,
-    StepName: "execute",
-    Duration: time.Since(nodeStart),
-})
-```
-
-**步骤 3：失败时记录 Error**
-```go
-if err != nil {
-    g.tracer.RecordError(ctx, &observability.AgentError{
-        TraceID:   g.tracer.GetTraceID(ctx),
-        AgentID:   nodeID,
-        ErrorType: "execution_error",
-        Message:   err.Error(),
-    })
-}
-```
-
-**步骤 4：Graph 执行完毕后记录 ToolCall**
-```go
-if g.tracer != nil {
-    g.tracer.RecordToolCall(ctx, &observability.ToolCall{
-        TraceID:  g.tracer.GetTraceID(ctx),
-        ToolName: g.id,
-        Input:    state.ToParams(),
-        Output:   state.ToParams(),
-        Duration: time.Since(startTime),
-    })
-}
-```
-
-### 7.3 LLM Client 中的观测点
-
-`internal/llm/client.go` 中，`recordLLMCall()` 是一个内部方法，在 `Generate()` 和 `GenerateStream()` 中均被调用：
-
-```go
-func (c *Client) recordLLMCall(ctx context.Context, prompt, response string, tokens int, start time.Time, err error) {
-    if c.tracer == nil {
-        return
-    }
-    c.tracer.RecordLLMCall(ctx, &observability.LLMCall{
-        TraceID:    c.tracer.GetTraceID(ctx),
-        Model:      c.config.Model,
-        Prompt:     prompt,
-        Response:   response,
-        TokensUsed: tokens,
-        Duration:   time.Since(start),
-        Error:      err,
-    })
-}
-```
-
-对于流式调用（`GenerateStream`），`recordLLMCall` 在流结束后异步调用，goroutine 中累积完整 response 后统一记录。
-
----
-
-## 八、架构观察与最佳实践
-
-### 8.1 构造函数 panic 模式 — 失败即崩溃
-
-Graph 模块的构造函数在检测到非法参数时直接 panic（如 `NewGraph("")`、`NewGraphWithTracer("id", nil)`）。代码注释明确说明：
-
-> "This is intentional as it indicates a programming error in the calling code. These methods are used during workflow graph initialization (startup phase), and invalid parameters represent fatal startup failures."
-
-这是 Go 社区中"失败即崩溃"（Fail-Fast）理念的体现：启动时的编程错误越早暴露越好，不应返回 error 让调用方自行处理。
-
-### 8.2 分层防御的设计哲学
-
-- **安全模块**独立于整个执行管线，任何日志输出前自动脱敏，属于"纵深防御"的最后一层
-- **可观测性模块**以接口方式注入 Graph 和 LLM Client，属于"透明追踪"的基础设施
-- **限流模块**在 Graph 执行入口处拦截（`Execute` 方法第一行），不做精细化的每个节点限流
-- **优雅关闭模块**完全独立，通过 `SignalHandler` 监听系统信号触发，不与业务逻辑耦合
-
-### 8.3 模块间的耦合度分析
-
-值得关注的是，这四个模块虽然都影响 Graph 的执行行为，但它们之间的耦合度极低。安全模块完全独立，不对 Graph 或 LLM Client 产生任何代码级的侵入；可观测性模块通过 Tracer 接口与 Graph 和 LLM Client 保持松耦合，可以通过 `SetTracer()` 随时替换实现；限流模块同样通过接口与 Graph 耦合，且与可观测性毫无关系——限流成功与否不产生观测事件；优雅关闭模块则完全游离于业务执行路径之外，只在进程生命周期结束时介入。这种"各自为政"的设计使得每个模块都可以独立测试、独立替换甚至独立移除，极大地降低了系统的维护复杂度。
-
-### 8.4 默认安全 vs 显式配置
-
-- `NewGraph()` 默认使用 `NoopTracer`，可观测性默认开启（即使只是空实现）
-- `NewService()` 中如果 `config.Tracer` 为 nil，也默认使用 `NoopTracer`
-- 限流器默认 nil，不做限流 —— 需要显式配置
-- 安全模块没有全局默认实例，需要调用方自行构造
-
-这种"默认安全"的设计确保了即使在没有配追踪器的情况下，Tracer 的调用代码永远不会 panic（因为默认是 NoopTracer 的非 nil 实例）。这是一种值得借鉴的 Go 语言惯用法——对于可选的接口依赖，提供非 nil 的默认实现（noop），既避免了调用方每次使用前都判 nil，又保留了未来切换为真实实现的能力。相反，限流和安全模块没有默认实现，是因为它们是"按需启用"的：不是每个部署环境都需要限流，也不是每段日志都需要脱敏，让调用方按需选择才是更好的设计。
-
-### 8.5 从 Arena 看安全与可观测性的"反向"应用
-
-有意思的是，Arena 模块（混沌工程测试框架）同时使用了安全模块和可观测性模块提供的模式，但目的完全相反：可观测性的 Tracer 接口被 Arena 用来记录故障注入事件和恢复过程，帮助分析系统的容错行为；而安全模块的中间件模式（RecoverMiddleware）被 Arena 用来捕获故障注入过程中可能发生的预期内 panic，确保 Arena 的核心循环不会被单个 Agent 的崩溃所影响。Arena 的 28 个路由处理函数全部通过 RecoverMiddleware 保护，这体现了"安全"与"可观测性"在混沌工程场景下的独特协同：可观测性让人看到故障，安全让人承受故障。
-
----
-
-## 九、总结
-
-四个模块，各管一摊：
-- **安全模块**：正则+字段名双重检测，日志输出前自动脱敏
-- **可观测性模块**：Tracer 接口解耦了"记什么"和"怎么记"
-- **限流模块**：工厂模式，三种算法随便换
-- **优雅关闭模块**：四阶段状态机 + 指数退避，任何场景都能有序退出
-
-说实话，这四个模块不是最"酷"的部分——它们是最"不酷但必须有"的部分。没有脱敏，被合规追着跑；没有限流，被突发流量冲垮；没有优雅关闭，进程退出留下一堆孤儿资源。
-
-但它们在代码里待着，你基本感觉不到它们的存在。这才是基础设施该有的样子——**在你需要的时候它就在那里，不需要的时候它也不烦你。**
-
----
-
-*下一篇预告：运行时与生命周期——Agent 怎么出生、怎么死、怎么复活。我管这个叫"秽土转生"机制*
+*本篇预告：安全加固（十二）—— 工具信任门（Tool Trust）、身份来源不可伪造，以及招架层（Sanitizer）如何在 LLM 调用链上兜底。*

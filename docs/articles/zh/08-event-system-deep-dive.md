@@ -1,65 +1,58 @@
-# ares 架构深度解析（八）：事件系统 — 状态恢复与审计追踪的事件溯源基石（0.3.x）
+# ares 架构深度解析（八）：事件系统 — 追加式事件日志、压缩归档与任务生命周期（0.3.x）
 
-> 0.3.x 更新：事件类型升级为完整 Task 生命周期（Created/Ready/Acquired/Started/Yielded/Checkpointed/Preempted/Released/Completed/Failed/Expired/Stolen）。EventStore 与 Task Fabric 深度集成，Task 生命周期事件直接驱动调度（Task completed → 依赖变 Ready）。
+> 0.3.x 更新：`internal/taskfabric` 引入完整 Task 生命周期事件（created/ready/acquired/started/yielded/checkpointed/preempted/released/completed/failed/expired/stolen）。Task Fabric 把每次状态迁移追加到内存日志，并在挂了 `EventStore` 时写进持久层，方便跨重启重建 Scheduler / Task / Lease 状态。注意：所谓"事件直接驱动调度"是过度宣传——调度器是能力+优先级的 work-stealing 打分，不是"task.completed → 依赖变 Ready"的事件驱动 dispatch。
 
-> Agent 启动是个事件、任务分配是个事件、工具调用是个事件、LLM 返回是个事件、Agent 挂了也是个事件。
-> 我当时就在想：**如果我把 Agent 干的每一件事都记下来，是不是就能在它挂了之后完全重建它的状态？**
-> 答案是能。这就是 Event Sourcing 在 ares 里的玩法。
+> Agent 启动是个事件、任务状态迁移是个事件、工具调用是个事件、LLM 返回是个事件、Agent 挂了也会留下一个事件。
+> 我当时的想法：如果我把每一种状态变更都记成一条只追加的记录，是不是就能在进程挂了之后，把发生过的事情重放回来？
+> 答案是：能重建一部分。但要诚实地说——它**不能**重建全部（见后文"它做不到什么"）。
 
 ---
 
-## 一、为什么非要记每一件事
+## 一、为什么记事件
 
-最早我做 Agent 的时候，状态管理是用一个全局 struct 搞的。Agent 干到哪一步了、处理了什么数据、出了什么错——全塞在一个大 map 里。看起来简单，但问题来了——
+我最早做 Agent 时状态就是用内存 struct 存。干到哪一步、处理了什么、报了什么错，全在进程里。进程一挂，什么证据都没有：没有记录、没法回放、没法审计这一步到底是不是越权调的某个工具。
 
-我记得印象最深的一次：一个 Agent 在生产环境跑了一整个下午，处理了 30 多个用户请求，每个请求都涉及多轮对话和工具调用。突然进程挂了——oom killed，日志里只留下一行 "signal: killed"。
-
-所有状态全部丢失。
-
-没有 checkpoint，没有任何恢复手段，没有任何办法知道它死之前正在处理什么。用户来问："Agent 怎么不回我了？"我说："它失忆了。"那一刻我意识到：状态不持久化，Agent 就是个一次性的消耗品——用完就丢，丢了就找不回来。
-
-说白了，全局 map 的方式有三个硬伤：
-
-1. Agent 挂了，map 没了，状态丢了
-2. 想查 Agent 五分钟前干了什么——没记录
-3. 想审计 Agent 有没有越权调用工具——没日志
-
-后来我研究了一下 Event Sourcing（事件溯源），发现它的思路完全相反：**不存当前状态，存状态变更的每一次操作。当前状态？重放事件自己算。**
-
-这个模式在金融系统里用了很多年，但在 Agent 框架里用得不多。我当时就想：既然没人做，那就我来做。
+于是我想到了 Event Sourcing：**不存当前状态，存每一次变更操作。想要当前状态？把事件流重放一遍自己算。**
 
 ```mermaid
 graph LR
     subgraph "传统方式（状态存储）"
-        S1[当前状态] -->|更新| S2[新状态]
+        S1[当前状态] -->|UPDATE| S2[新状态]
     end
 
-    subgraph "事件溯源"
-        E1[事件 1] --> E2[事件 2]
-        E2 --> E3[事件 3]
-        E3 -->|重放| STATE[推导状态]
+    subgraph "追加式事件日志"
+        E1[Event 1] --> E2[Event 2]
+        E2 --> E3[Event 3]
+        E3 -->|REPLAY| STATE[推导状态]
     end
 ```
 
-这种架构提供了三个关键保障：
-- **完整的审计轨迹**：每次状态变更都有时间戳和载荷记录
-- **时间旅行查询**：系统可以回答"在 T 时刻状态是什么？"
-- **状态重建**：任何 Agent 的状态都可以通过重放其事件流从零重建
+但这个设计真正能给你的，需要先讲清楚**它做不到什么**——避免读者对着标题产生不切实际的期待：
 
-核心文件：
+- ✅ **审计轨迹**：每次状态变更都有时间戳、类型、来源模块（`module_name`）和载荷。
+- ✅ **回放**：按流把事件升序读回来，`ares_flight` 的 ReplaySession 可以逐步回放、跳转。
+- ✅ **跨重启重建**：`taskfabric` 能从持久事件里重建任务集（`RestoreFromStore`）。
+- ⚠️ **它不做**：事件日志本身不承担"精确重放每一步工具调用副作用"的责任——它记录发生了什么，不保证外部世界可回放。
+- ⚠️ **它不做**：`taskfabric` 里只有少数生命周期事件会落持久层（见第六章）；大多数状态迁移是"仅观测"的，重启后靠重新编译 DAG 而非重放这些事件来重建拓扑。
+
+核心文件（本次讲解只涉及灰显之外、标记 ✅ 的文件，其余见对应文章）：
 
 | 文件 | 用途 |
 |------|------|
-| `internal/ares_events/types.go` | Event 模型、EventStore 接口 |
-| `internal/ares_events/memory_store.go` | 内存版 EventStore |
-| `internal/ares_events/pg_store.go` | PostgreSQL 版 EventStore |
-| `internal/ares_events/compactor.go` | 事件压缩为摘要 |
-| `internal/ares_events/trim_store.go` | 压缩后删除旧事件 |
+| `internal/ares_events/types.go` | Event 模型、EventType 枚举、ReadOptions / EventFilter、哨兵错误 |
+| `internal/ares_events/store.go` | EventStore / EventAppender 接口 + `Emit` helper |
+| `internal/ares_events/memory_store.go` | 内存实现 `MemoryEventStore`（含订阅、裁剪） |
+| `internal/ares_events/pg_store.go` | PostgreSQL 实现 `PostgresEventStore` |
+| `internal/ares_events/compactor.go` | 压缩器：把旧事件聚合为摘要 |
+| `internal/ares_events/summary.go` | EventSummary 模型 + SummaryRepository 接口 + CompactionConfig |
 | `internal/ares_events/compactable_store.go` | 自动压缩的 EventStore 包装器 |
-| `internal/ares_events/summary.go` | EventSummary 模型 + CompactionConfig |
-| `internal/ares_events/summary_repository.go` | PgSummaryRepository |
-| `internal/ares_events/memory_summary_repo.go` | 内存版 SummaryRepository |
-| `internal/ares_flight/replay.go` | ReplaySession 逐步重放 |
+| `internal/ares_events/trim_store.go` | `TrimAwareStore`：压缩后裁剪旧事件 |
+| `internal/ares_events/archive_hook.go` | `ArchiveSink`：round 归档钩子 |
+| `internal/ares_events/tool_events.go` | 工具完成事件统一载荷键 |
+| `internal/taskfabric/events.go` | Task 生命周期 EventType + TaskEvent |
+| `internal/taskfabric/fabric.go` | 事件记录 / 持久化 / 恢复逻辑 |
+| `internal/ares_flight/replay.go` | ReplaySession 逐步重放（见系列第 16 篇） |
+| `internal/ares_skills/outcome_recorder.go` | SkillOutcomeRecorder：只读订阅者 |
 
 ---
 
@@ -67,7 +60,7 @@ graph LR
 
 ### 2.1 事件结构
 
-`internal/ares_events/types.go` 定义了基础类型：
+`internal/ares_events/types.go` 定义：
 
 ```go
 type Event struct {
@@ -82,29 +75,47 @@ type Event struct {
 }
 ```
 
-每个事件属于一个**流**（由 `StreamID` 标识）。流是某个实体的只追加事件序列——通常是一个 Agent。`Version` 字段支持乐观并发控制，`Type` 字段用于路由和重放分类。`ModuleName` 字段记录哪个子系统发出了这个事件——"runtime"、"workflow"、"memory" 等。这听起来理所当然，直到你回放事件流时发现分不清 `step.started` 是工作流引擎发的还是插件总线发的。没有它，你得从 payload 结构反推来源。有了它，你直接知道。
+事件属于一个**流**（`StreamID`）——某个实体的只追加序列，通常是一个任务或 agent。`Version` 在 append 时由存储分配并递增（乐观并发控制）。`ModuleName` 记录是哪个子系统发出的（例如 `taskfabric`），回放时你能直接知道来源，而不是从 payload 反推。`Type` 用于路由和分类。
 
-### 2.2 事件类型
+同文件的辅助能力：`VerifyStreamIntegrity` 校验一段事件流版本连续无空洞；`StreamHash` 给整条流算一个确定性哈希用于检测静默损坏；哨兵错误包括 `ErrVersionConflict`、`ErrStreamNotFound`、`ErrEventStoreClosed`、`ErrEventIntegrity`、`ErrSummaryNotFound`。
+
+### 2.2 事件类型（ares_events 侧）
+
+`ares_events.EventType` 是一个字符串别名，枚举覆盖系统各处事件：
 
 ```go
-const (
-    EventAgentStarted        EventType = "agent.started"
-    EventAgentStopped        EventType = "agent.stopped"
-    EventAgentFailed         EventType = "agent.failed"
-    EventTaskCreated         EventType = "task.created"
-    EventTaskAssigned        EventType = "task.assigned"
-    EventTaskCompleted       EventType = "task.completed"
-    EventTaskFailed          EventType = "task.failed"
-    EventMessageAdded        EventType = "message.added"
-    EventLLMCall             EventType = "llm.call"
-    EventToolCall            EventType = "tool.call"
-    EventSessionCreated      EventType = "session.created"
-    EventFailoverTriggered   EventType = "failover.triggered"
-    EventFailoverCompleted   EventType = "failover.completed"
-)
+// 节选
+EventAgentStarted      = "agent.started"
+EventTaskCreated       = "task.created"
+EventTaskCompleted     = "task.completed"
+EventTaskFailed        = "task.failed"
+EventSessionCreated    = "session.created"
+EventMessageAdded      = "message.added"
+EventMemoryDistilled   = "memory.distilled"
+EventLLMCall           = "llm.call"
+EventToolCallStarted   = "tool.call.started"
+EventToolCallCompleted = "tool.call.completed"
+// Task 生命周期（taskfabric 发布）
+EventTaskReady       = "task.ready"
+EventTaskAcquired    = "task.acquired"
+EventTaskStarted     = "task.started"
+EventTaskYielded     = "task.yielded"
+EventTaskCheckpointed= "task.checkpointed"
+EventTaskPreempted   = "task.preempted"
+EventTaskReleased    = "task.released"
+EventTaskExpired     = "task.expired"
+EventTaskStolen      = "task.stolen"
+// Leader-sub 协作
+EventSubTaskScheduled = "sub_task.scheduled"
+EventSubTaskStarted   = "sub_task.started"
+EventSubTaskResult    = "sub_task.result"
+EventSubAgentFailed   = "sub_agent.failed"
+// 其他：step.* / handoff / memory.finalize / discovery.* / component.failed
 ```
 
 ### 2.3 EventStore 接口
+
+`internal/ares_events/store.go`：
 
 ```go
 type EventStore interface {
@@ -116,306 +127,290 @@ type EventStore interface {
 }
 ```
 
+关键语义（两个实现一致）：
+
+- `Append(expectedVersion)`：`>0` 必须等于流当前版本，否则返回 `ErrVersionConflict`；`<=0` 表示"自动接在当前版本后追加，不做冲突检查"。两个实现都用**事务/锁**实现，PGC/内存双实现。
+- `ReadOptions`：`FromVersion`（含）、`Limit`（0 表示不限）、`Direction`（Ascending/Descending）、`Since`。
+- 辅助接口 `EventAppender` 只是 `Append` 一个方法的窄接口，供 `Emit` 使用；`Emit(ctx, store, streamID, type, moduleName, payload)` 是唯一的规范发布入口，失败只记一条 warning 并返回 false。
+
+---
+
+## 三、两类存储实现
+
+两个实现都满足同一套接口，语义尽量对齐，但实现路径不同：
+
 ```mermaid
 classDiagram
     class EventStore {
         <<interface>>
         +Append(ctx, streamID, events, expectedVersion) error
-        +Read(ctx, streamID, opts) []Event
-        +ReadAll(ctx, opts) []Event
-        +Subscribe(ctx, filter) <-chan Event
+        +Read(ctx, streamID, opts) []*Event
+        +ReadAll(ctx, opts) []*Event
+        +Subscribe(ctx, filter) <-chan *Event
         +StreamVersion(ctx, streamID) int64
     }
 
     class MemoryEventStore {
-        -streams map[string][]Event
-        +Append()
-        +Read()
+        -mu sync.RWMutex
+        -events []*Event
+        -streams map[string][]*Event
+        -versions map[string]int64
+        -subscribers []subscription
+        -dropped atomic.Int64
     }
 
     class PostgresEventStore {
         -pool *Pool
-        +Append()
-        +Read()
-    }
-
-    class CompactableEventStore {
-        +Append()
-        +Read()
-        +ForceCompact()
     }
 
     EventStore <|-- MemoryEventStore
     EventStore <|-- PostgresEventStore
-    EventStore <|-- CompactableEventStore
-    CompactableEventStore o-- Compactor
-    Compactor o-- SummaryRepository
 ```
-
-关键语义：
-- `Append` 使用 `expectedVersion` 实现乐观并发控制：`0` 要求 stream 为空，`-1` 跳过检查，正值必须匹配
-- `Read` 通过 `ReadOptions` 支持 `FromVersion`、`Limit`、`Direction`（升序/降序）
-- `Subscribe` 返回匹配过滤器的事件 channel，context 取消时关闭
-
----
-
-## 三、存储实现
 
 ### 3.1 MemoryEventStore
 
-`internal/ares_events/memory_store.go` 提供了内存实现，主要用于测试和演示模式：
+`memory_store.go`。加锁 → 版本校验 → 为每个非 nil 事件分配递增 `Version`（nil 事件跳过，不占版本号）→ 写入 `events`（扁平）和 `streams`（按流）→ 通知订阅者。发布给订阅者的是**克隆副本**（B19），因为你下发的 `*Event` 指针和内部存储共享，订阅者若改动会与并发 Read/Append 竞争。
 
-```go
-type MemoryEventStore struct {
-    mu      sync.RWMutex
-    streams map[string][]*Event
-    events  []*Event
-    version int64
-}
-```
+`Subscribe` 的 channel 容量是 **64**；`notifySubscribers` 是**非阻塞发送**——缓冲区满了就静默丢弃并累计到 `dropped` 计数器（`Stats()` 暴露 `dropped_events`，仅用于监控数据丢失，不会阻塞写路径）。订阅者 context 被取消或 store `Close()` 时，订阅 channel 会被关闭并清理。
 
-`Append` 方法执行加锁 → 版本校验 → 分配序号 → 写入流存储和扁平存储 → 通知订阅者。`Subscribe` 创建容量为 100 的缓冲 channel，新事件广播到所有 channel，缓冲区满时丢弃（非阻塞发送）。
+`MemoryEventStore` 还实现了 `TrimBefore`，让压缩后的裁剪在内存半边也能工作——否则长驻进程里内存无界增长。
 
 ### 3.2 PostgresEventStore
 
-`internal/ares_events/pg_store.go` 提供生产级 PostgreSQL 实现：
+`pg_store.go`。`Append` 用一个事务：`SELECT MAX(version) WHERE stream_id = $1` 读当前版本 → 乐观并发检查 → 逐条 `INSERT INTO events (id, stream_id, type, payload, metadata, version, created_at)`。并发的唯一键冲突（PG 错误码 `23505`）会被翻译成 `ErrVersionConflict`。
 
-```sql
-INSERT INTO events (id, stream_id, type, payload, metadata, version, created_at, timestamp)
-VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
-ON CONFLICT (stream_id, version) DO NOTHING
-```
+`Subscribe` 没有用 LISTEN/NOTIFY，而是**每 1 秒 poll 一次**（`defaultEventReadLimit = 100` 的滑动窗口），用 `delivered` id 集合去重（上限 `maxDeliveredIDs = 8192`，溢出后重置集合——最多可能重投旧事件，绝不丢新事件）。这是把"订阅"简化成了"定时查询"，代价是实时性只有秒级。
 
-`ON CONFLICT DO NOTHING` 提供了幂等追加——同一事件因客户端重试而被重复插入时，第二次会被静默忽略。这对"至少一次"投递语义至关重要。
+两个实现的 `Emit` 路径、`ReadOptions` 语义、`expectedVersion` 语义保持一致。
 
 ---
 
-## 四、事件压缩管线
+## 四、压缩与归档管线
 
-没有压缩的情况下，事件存储会无限增长。ares 的 Compactor 通过将旧事件汇总为紧凑摘要来解决这个问题。
+不压缩，事件会无限增长。`Compactor` 把旧事件聚合成紧凑的 `EventSummary`，存进 `SummaryRepository`（关系库），再把原始事件从热存储里裁剪掉。
 
-### 4.1 CompactionConfig
+### 4.1 CompactionConfig 默认值
 
 ```go
-type CompactionConfig struct {
-    Threshold              int           // 触发压缩的事件数（默认 500）
-    KeepRecent             int           // 保留的原始事件数（默认 100）
-    MaxSummariesPerStream  int           // 每流最大摘要数
-    SummaryTTL             time.Duration // 摘要保留时长（默认 30 天）
-    EnableTrimming         bool          // 压缩后是否删除原始事件
+func DefaultCompactionConfig() CompactionConfig {
+    return CompactionConfig{
+        Threshold:             500,          // 流超过该事件数触发压缩
+        KeepRecent:            100,          // 压缩后保留的最新原始事件数
+        MaxSummariesPerStream: 50,           // 每条流最多摘要数
+        SummaryTTL:            30 * 24 * time.Hour, // 30 天
+        EnableTrimming:        true,         // 压缩后删除已合并的原始事件
+    }
 }
 ```
 
-默认行为：当流超过 500 个事件时，将最旧的 400 个压缩为摘要，保留最新的 100 个作为原始事件。
+`CompactableEventStore` 是带自动压缩的**包装器**（`compactable_store.go`）：它内嵌 `EventStore`，重写 `Append`，在写入后异步检查是否需要压缩。
 
-### 4.2 压缩管线
+### 4.2 自动触发 + 防抖
+
+`Append` 只做同步写入，真正的压缩工作**异步**跑（每个事件批次触发一个 goroutine，用 store 自身的生命周期 context `lctx` 而不是调用方 context，避免短请求导致的取消——每次运行仍有 `compactionTimeout = 30s` 上限）：
+
+- `maybeCompact` 先读 `StreamVersion`，**防抖**：只有 `version - lastChecked >= threshold/4`（`compactionCheckDivisor = 4`）才真正检查，避免热流上每次 append 都做 I/O。
+- 超阈值就调 `compactor.CheckAndCompact`。
+- `Key` 路径全程靠 `lastChecked` map 记录上次检查的版本。
+
+### 4.3 压缩流程
 
 ```mermaid
 graph TD
-    A[流超过阈值] --> B[读取全部事件\n升序排列]
-    B --> C{在 KeepRecent 处分割}
-    C -->|候选事件| D[构建 EventSummary\n规则聚合]
-    C -->|最近事件| E[保留在原始存储]
-    D --> F[保存摘要到\nSummaryRepository]
-    F --> G{启用裁剪?}
-    G -->|是| H[TrimBefore\n删除旧事件]
-    G -->|否| I[保留原始事件]
-    H --> J[✓ 压缩完成]
-    I --> J
+    A[Append 写入热存储] --> B{命中 terminator<br/>task.completed/failed?}
+    B -->|是| C[DrainPendingRounds<br/>归档本轮 round]
+    B -->|否| D[直接进入压缩检查]
+    C --> D
+    D --> E{version-lastCheck >= threshold/4 ?}
+    E -->|否| Z[防抖跳过]
+    E -->|是| F[CheckAndCompact]
+    F --> G{version <= Threshold ?}
+    G -->|是| Z
+    G -->|否| H[Read 全部事件 升序]
+    H --> I[候选 = 除最近 KeepRecent 之外]
+    I --> J[buildSummary<br/>规则聚合]
+    J --> K[repo.Save 摘要]
+    K --> L{EnableTrimming 且挂 trimStore ?}
+    L -->|是| M[TrimBefore 裁剪原始事件]
+    L -->|否| Z
 ```
 
-### 4.3 DefaultSummarizer
+核心点：压缩**先落摘要、后裁剪**。裁剪的边界是摘要的 `EndVersion`——保证被剪掉的每个事件都已经进了摘要，不会丢数据。`Compactor` 还暴露 `ForceCompact`（无论如何都压）和 `CleanupOldSummaries`（按 `SummaryTTL` 删除过期摘要）。
 
-规则摘要器无需 LLM 调用即可生成简明的英文摘要：
+### 4.4 DefaultSummarizer：规则式摘要
+
+`EventSummarizer` 是个函数类型（`func([]*Event) string`），默认 `DefaultSummarizer` 是纯规则的，不调 LLM。它统计事件数、去重收集 `task.created` 的任务 ID 与 `llm.call` / `tool.call.*` 里的工具名、截取用户请求、按 `task.failed` / `task.completed` 判定 outcome（`failed` / `partial` / `completed` / `active`），输出形如：
 
 ```
-Agent agent-1 ran 3 task(s) [task-42, task-43, task-44],
-called 5 tool(s) [search, book, weather, calculator, email],
-emitted 23 events over 3m12s,
-bound to user request: "Plan a trip to Tokyo",
-result: completed
+Agent stream-1, ran 1 task(s) [task-42], called 2 tool(s) [search, calculator], emitted 6 events, duration 1s, bound to user request: "Plan a trip to Tokyo", result: completed
 ```
 
-### 4.4 读取的摘要回退机制
+（工具列表截断到 5 个、任务列表到 3 个、请求片段到 120 字符、错误最多 3 条——都有硬上限，防止摘要失控。）
 
-如果原始事件已被裁剪，`Read` 会自动回退到摘要：
+### 4.5 读取时的摘要回退
+
+如果热存储里的原始事件已被裁剪，`CompactableEventStore.Read` 会回退：底层 `Read` 返回空 → 查 `SummaryRepository` → 把摘要转成合成的 `"event.summary"` 事件返回。这让 ReplaySession 在压缩后仍不会直接崩掉，但请注意这是**降级**：你拿到的是摘要，不是原始事件。
+
+### 4.6 ArchiveSink：round 归档
+
+`compactable_store.go` 通过 `WithArchiveSink(sink)` 挂一个 `ArchiveSink`（`archive_hook.go`，函数类型）。它的职责在**压缩之前**把"一轮任务"（从上一个终端事件到 `task.completed`/`task.failed`）的记录归档，确保这些原始事件在被压缩裁剪**之前**已经留下一份 durable 副本，专门给上下文压缩策略用。
+
+归档也是在 `task.completed`/`task.failed` 终态命中或压缩前，由 `drainPendingRounds` 分页扫描（每页 500，最多 1000 轮）完成；sink 失败是 best-effort，只记日志，绝不阻断 append 或压缩。
+
+---
+
+## 五、Task Fabric：任务生命周期事件
+
+`internal/taskfabric/events.go` 定义了一个**独立于** `ares_events` 的 `EventType` 枚举：
 
 ```go
-func (s *CompactableEventStore) Read(ctx context.Context, streamID string, opts ReadOptions) ([]*Event, error) {
-    events, err := s.EventStore.Read(ctx, streamID, opts)
-    if err != nil {
-        return nil, err
-    }
-    if len(events) > 0 {
-        return events, nil
-    }
-
-    summaries, summaryErr := s.compactor.repo.FindByStreamID(ctx, streamID)
-    if summaryErr != nil || len(summaries) == 0 {
-        return events, nil
-    }
-
-    synthetic := make([]*Event, 0, len(summaries))
-    for _, sum := range summaries {
-        synthetic = append(synthetic, &Event{
-            Type: EventType("event.summary"),
-            Payload: map[string]any{
-                "summary_text": sum.SummaryText,
-                "event_count":  sum.EventCount,
-                "outcome":      sum.Outcome,
-            },
-        })
-    }
-    return synthetic, nil
-}
+const (
+    EventTaskCreated      EventType = "task.created"
+    EventTaskReady        EventType = "task.ready"
+    EventTaskAcquired     EventType = "task.acquired"
+    EventTaskStarted      EventType = "task.started"
+    EventTaskYielded      EventType = "task.yielded"
+    EventTaskCheckpointed EventType = "task.checkpointed"
+    EventTaskPreempted    EventType = "task.preempted"
+    EventTaskReleased     EventType = "task.released"
+    EventTaskCompleted    EventType = "task.completed"
+    EventTaskFailed       EventType = "task.failed"
+    EventTaskExpired      EventType = "task.expired"
+    EventTaskStolen       EventType = "task.stolen"
+    EventTaskUpdated      EventType = "task.updated" // 仅观测，不落盘
+)
 ```
+
+`TaskEvent` 是那条**内存日志**里的不可变记录：`{Type, TaskID, AgentID, Origin, State, Checkpoint, At}`。fabric 每个状态迁移都会 `append` 进内存日志（`f.events`，有上限 `maxInMemoryEvents`）。
+
+### 5.1 状态迁移 → 事件 映射
+
+```mermaid
+stateDiagram-v2
+    [*] --> Ready: Create -> task.created (持久)
+    Ready --> Leased: Acquire -> task.acquired (仅观测) + task.ready (仅观测)
+    Leased --> Running: Start -> task.started (仅观测)
+    Running --> Suspended: Yield -> task.yielded (仅观测) / Checkpoint -> task.checkpointed (持久)
+    Suspended --> Leased: Release/Resume -> task.released (仅观测)
+    Running --> Done: Complete -> task.completed (持久)
+    Running --> Done: Fail -> task.failed (持久)
+    Leased --> Done: Expire -> task.expired (持久)
+    Leased --> Done: Steal -> task.stolen (仅观测) / Preempt -> task.preempted (仅观测)
+    Done --> [*]
+```
+
+> 这张图是"状态迁移 → 事件"的**意图示意**，标注了每个事件是否落持久层。具体每个迁移跑在哪个函数里、准确的状态集合，请以 `internal/taskfabric` 的 state machine 为准，本文只陈述事件这一侧的事实（含持久与否），不展开全部状态机细节。
+
+### 5.2 哪些落盘，哪些不落盘
+
+fabric 把事件记进内存日志，**只有当挂了 `EventStore` 时**（`WithEventStore`）才会往持久层写，并且不是每个事件都写。`isMustPersistEvent` 决定：
+
+```go
+// 必须持久（恢复/重放正确性依赖它们）
+TaskCreated, TaskCheckpointed, TaskCompleted, TaskFailed, TaskExpired
+
+// 仅观测（丰富轨迹，但重建状态不依赖）
+TaskReady, TaskAcquired, TaskStarted, TaskYielded,
+TaskPreempted, TaskReleased, TaskStolen
+```
+
+机制：`recordLocked` 在持锁时构建内存事件 + 一个 `pendingAppend`（不碰 I/O）；解锁后 `flushAppends` 再把 durable 写入**锁外**执行，并通过 `flushCond` + 单调 `seq` 保证并发 fabric 调用落盘顺序与记录顺序一致（N7），避免按流版本倒挂。每一个持久事件都带上 `module_name: "taskfabric"`，payload 里包括 `task_id / agent_id / origin / epoch / strategy_id / session_id`；**must-persist** 事件额外携带完整恢复字段（capability / priority / dependencies / deadline / retry / created_at / checkpoint JSON）——`RestoreFromStore` 正是靠这些字段 `foldRestoreEvent` 把任务折叠回来。
+
+持久写失败：must-persist 事件会记 `Error` 日志（可检测到内存与事件日志的 divergence），观测事件则静默 best-effort。进程内的状态机始终是权威，append 失败不会回滚迁移。
+
+### 5.3 EventTaskUpdated：增量重写，只观测不落盘
+
+`taskfabric` 的增量编译器在改一个任务的调度形态（`Dependencies`）或 payload 时，会记一条 `EventTaskUpdated`。但这条事件**特意不落盘**（`events.go` 注释明说 "BY DESIGN"）：
+
+- 它不在 `isMustPersistEvent` 里；
+- 它在 `taskEventType` 映射里**没有对应项**（映射返回 `""`，fabric 永不 publish）。
+
+原因：这些是**原位重写**（`SetDependencies` 一句话搬动一个任务，而不是重新编译整批）。重启后拓扑是**重新编译 live DAG** 重建的，而不是回放这些重写事件。把它纳入跨重启协议属于协议变更，不是编译器变更。这一点值得你留意——如果期望"事件日志是全部真相"，`EventTaskUpdated` 会打破这个预期。
 
 ---
 
-## 五、ReplaySession
+## 六、它做不到什么（诚实清单）
 
-`internal/ares_flight/replay.go` 提供了任务的逐步事件重放：
+1. **不是每个生命周期事件都落盘**。Ready/Started/Yielded/Stolen 等是仅观测的；`EventTaskUpdated` 压根不进持久层。跨重启重建依赖 must-persist 那五类 + 重新编译 DAG。
+2. **Postgres 订阅是 1 秒轮询**，不是实时推送。Realtime 想推给 Dashboard，得自己叠加 SSE（事件层本身不提供）。
+3. **只记"发生什么"，不保证"可重放副作用"**。工具调用副作用（发邮件、写库）发生后，事件只是事后记录，不会替你撤销或重放外部效果。
+4. **压缩后的读回退是降级**：拿到 `event.summary` 合成事件，不是原始事件。要原始事件得靠归档/裁剪前的副本。
+5. **写路径不阻塞**：压缩、归档都是异步 best-effort，失败只记日志；`dropped_events` 计数器只暴露给监控，不保证不丢。
+
+---
+
+## 七、重放与恢复
+
+### 7.1 ReplaySession
+
+`internal/ares_flight/replay.go` 的 `NewReplaySession(ctx, eventStore, taskID)` 把某个任务的流升序读进来做逐步回放。详见系列第 16 篇（Flight Recorder），这里只提它的存在与依赖。
+
+### 7.2 Task Fabric 跨重启重建
 
 ```mermaid
 sequenceDiagram
-    participant User as 用户
-    participant RS as ReplaySession
-    participant Store as EventStore
+    participant F as Fabric
+    participant ES as EventStore (Postgres)
+    participant R as Scheduler
 
-    User->>RS: NewReplaySession(task-42)
-    RS->>Store: Read(task-42, ascending)
-    Store-->>RS: [Event 1, Event 2, ..., Event N]
-
-    loop 逐步重放
-        User->>RS: Step()
-        RS->>RS: currentIdx++
-        RS-->>User: ReplayStep{EventType, Payload}
+    Note over F: 启动
+    F->>F: WithEventStore(store)
+    F->>ES: ReadAll / 按流读事件
+    ES-->>F: task.* 事件流
+    loop 每条事件
+        F->>F: foldRestoreEvent(payload)
+        F->>F: 重建 Task / Lease / 调度状态
     end
-
-    User->>RS: StepTo(5)
-    RS->>RS: currentIdx = 5
-    RS-->>User: ReplayStep at index 5
-
-    User->>RS: Summary()
-    RS-->>User: ReplaySummary{TotalSteps, Duration, Agents}
+    F-->>R: RESTORE 后的 ReadyTasks 可被调度
 ```
 
-核心方法：
-- `Step()`：前进一个事件，返回该步
-- `StepTo(n)`：跳转到指定步骤
-- `Summary()`：返回概述（总步数、耗时、Agent ID 列表、事件类型分布）
-- `Reset()`：回到起始位置
+### 7.3 与"Agent 复活"的关系
+
+Agent 复活（两阶段恢复、快照优先、事件流回退降级）是**第 7 篇**（Runtime / Resurrection）的主题：`internal/ares_runtime/recovery.go` 的 `RecoverSnapshotOrEvents()` 先快照后事件流，`event_recovery.go` 从事件流重建 RecoveryState。事件系统在这里扮演的是"回退数据源"角色——**这属于 ares_runtime 对事件的消费**，不是事件系统自身的能力，别归错账。
 
 ---
 
-## 六、存储实现对比
-
-| 特性 | MemoryEventStore | PostgresEventStore |
-|------|-----------------|-------------------|
-| 持久化 | 无（进程级） | 是（表存储） |
-| 并发控制 | 互斥锁 | `ON CONFLICT DO NOTHING` |
-| 订阅 | buffered channel + subscriber map | LISTEN/NOTIFY 或轮询 |
-| 适用场景 | 测试、演示、单进程 | 生产环境、分布式部署 |
-
----
-
-## 七、集成 Agent 复活
-
-事件系统深度集成到 Runtime 的复活管线中：
-
-```mermaid
-sequenceDiagram
-    participant RT as Runtime
-    participant ES as EventStore
-    participant SA as StatefulAgent
-
-    RT->>RT: NotifyAgentDead(agent-1)
-    RT->>RT: factory() 创建新实例
-    RT->>ES: Read(agent-1, ascending)
-    ES-->>RT: [Event 1, ..., Event N]
-
-    Note over RT,SA: 阶段 A：重建操作状态
-
-    RT->>SA: RestoreState({session, tasks, ...})
-    RT->>SA: ReplayEvents([Event 1, ..., Event N])
-
-    Note over RT,SA: 阶段 B：重建认知状态
-
-    RT->>MM: GetLatestSessionForLeader()
-    MM-->>RT: session-42
-    RT->>MM: GetMessages(session-42)
-    MM-->>RT: [Message 1, ..., Message M]
-    RT->>SA: 注入认知状态
-
-    Note over RT,SA: Agent 已完全恢复
-    RT->>RT: StartAgent 新实例
-```
-
-双阶段恢复确保：
-- **操作状态**（任务、会话、执行状态）从事件流重建
-- **认知状态**（对话历史、记忆）从 MemoryManager 恢复
-- **每个阶段独立可恢复**——部分恢复优于完全不恢复
-
----
-
-## 八、架构总结
-
-### 设计模式
+## 八、设计模式总结
 
 | 模式 | 位置 | 用途 |
 |------|------|------|
-| 事件溯源 | `types.go` | 不可变只追加日志 |
-| 乐观并发控制 | `Append(expectedVersion)` | 并发写入冲突检测 |
-| CQRS | EventStore(写) + SummaryRepository(读) | 写优化原始存储 + 读优化摘要 |
-| 观察者模式 | `Subscribe(channel)` | 实时事件流推送 |
-| 策略模式 | `Summarizer` 函数类型 | 可插拔摘要生成（规则或 LLM） |
-| 装饰器模式 | `CompactableEventStore` 包装 `EventStore` | 透明压缩，API 不变 |
-| 防抖 | `lastChecked` 映射 | 避免冗余压缩检查 |
+| 追加式事件日志 | `types.go` | 不可变只追加记录（含流内版本） |
+| 乐观并发控制 | `Append(expectedVersion)` | `>0` 必须匹配当前版本，冲突返回 `ErrVersionConflict` |
+| CQRS（衰减版） | EventStore（写/热存储）+ SummaryRepository（摘要） | 压缩后读取回退摘要 |
+| 观察者 / 订阅 | `Subscribe(EventFilter)` | 内存：非阻塞广播；PG：1 秒轮询推送 |
+| 策略 | `EventSummarizer` 函数类型 | 可插拔摘要（默认规则式） |
+| 装饰器 | `CompactableEventStore` 包装 `EventStore` | 透明自动压缩，Append 接口不变 |
+| 防抖 | `lastChecked` map + `threshold/4` | 减少热流上的重复压缩检查 |
+| 双写解耦 | `recordLocked`（持锁）+ `flushAppends`（锁外） | 事件持久写不阻塞 fabric 状态机 |
 
 ### 关键数据流
 
 ```mermaid
 graph TB
-    subgraph "写入路径"
-        C[客户端] -->|Append| CES[CompactableEventStore]
-        CES -->|1. 写入| ES[EventStore]
-        CES -->|2. 后台| CP[Compactor]
-        CP -->|3. 汇总| SR[SummaryRepository]
-        CP -->|4. 可选裁剪| TS[TrimStore]
+    subgraph "写路径"
+        F[taskfabric\nrecordLocked] -->|pendingAppend| FE[flushAppends 锁外序化]
+        FE -->|Append| CES[CompactableEventStore]
+        CES -->|写热存储| ES[EventStore]
+        CES -->|异步| CP[Compactor]
+        CP -->|buildSummary| SR[(SummaryRepository)]
+        CP -->|可选裁剪| TS[TrimBefore]
     end
 
-    subgraph "读取路径"
-        RS[ReplaySession] -->|Read| CES
-        CES -->|有事件?| ES
-        CES -->|空? 回退| SR
-    end
-
-    subgraph "订阅推送"
-        DV[Dashboard] -->|Subscribe| CES
-        CES -->|SSE| DV
+    subgraph "读路径"
+        FL[ReplaySession / describe] -->|Read| CES
+        CES -->|有原始事件?| ES
+        CES -->|空? 回退摘要| SR
     end
 ```
 
 ---
 
-## 九、SkillOutcomeRecorder：事件流的 skill 反馈闭环（0.3.0 新增）
+## 九、结尾
 
-`internal/ares_skills/outcome_recorder.go` 的 `SkillOutcomeRecorder` 是 `EventSubTaskResult` 事件流的一个**只读观察者**（零侵入，不改变任务执行）：它订阅现有事件流（与 dispatcher 同款 `Subscribe(EventFilter{Types: [EventSubTaskResult]})`），从 payload 提取 `task.UsedExperienceID`（planner 经 `WithExperienceLocator` 预填的 skill ID）+ `success`，调用 `catalog.Experience().Record(skillID, pattern, rate)` 写入先验（成功=1.0，失败=0.0），闭环回到 `skill_experience` 工具查询（design §11）。
+Event Sourcing 的核心价值不是"跑得飞快"，而是**出事之后能拿到一份按顺序排列的、谁在什么时候干了什么的记录**，并且这份记录能支撑重放和跨重启重建。它也有一堆边界——不是每个事件都落盘、订阅是秒级轮询、外部副作用不可重放。这些边界我在这篇里照实写了，因为它们才是真实系统里你会踩到的坑。
 
-安全契约（照搬 FeedbackRecorder 降级范式）：nil catalog/store 离线 no-op；记录失败仅日志（`LastErr()` 暴露调试）；单事件 panic 被 `recover`，绝不拖垮消费 goroutine。`task_pattern` 用**精确任务描述**派生——planner 创建 task 时把原始输入存入 `task.Payload["task_desc"]`，`skillTaskPattern` 以精确描述优先（trim 后），无精确描述时回退 `task.AgentType` 粗粒度（如 `agent_top`）。精确描述让 `BestMatch` 的双向子串匹配命中率显著提升；pattern 统一截断到 **256 runes**（`capPatternLength`，rune 安全不切断 UTF-8），既防止超长输入膨胀 experience.json，也避免完整用户输入明文落盘。
-
-## 十、结语
-
-Event Sourcing + CQRS + 可插拔存储 + 自动压缩——这套方案在企业级系统里并不新鲜，但放在 Agent 框架里，我觉得是个挺有意思的尝试。
-
-最爽的一次体验是什么？有一个 Agent 在处理一个复杂的工作流时跑崩了——多轮对话里调了 search 工具，LLM 返回异常，后续工具全部报错。搁以前，我大概率只能望着日志猜：是 prompt 问题？是 LLM 抽风？还是工具传参错了？猜完改，改完再跑，跑完再看——循环个三四次才能定位。
-
-但那次我打开 Dashboard，找到那个 Agent 的事件流，从头一步步回放。看到第 7 个事件的时候我笑了——Agent 在 `tool.call:7` 里调的 search 接口返回了空结果，然后它没做空值检查就把空结果直接拼到了下一个 LLM 调用的 prompt 里。不是 bug 有多复杂，而是我**看到了 bug 的完整因果链**——不是猜，是亲眼看到的。
-
-那一刻我感觉自己不是在 debug——是在看黑匣子飞行记录。
-
-**这就是事件系统的价值：它不是让你跑得更快，是让你在出事之后知道为什么出事。**
+**事件系统不让你跑得更快，它让你在出事之后，知道该查哪里、能查到什么。**
 
 ---
 
-*下一篇预告：Arena / 故障注入——这可能是 ares 最"颠"的功能。你可以从 Dashboard 上点一个按钮，暗杀正在工作的 Agent，然后看着它秽土转生。*
+*下一篇预告：Arena / 故障注入——你可能从 Dashboard 上一个按钮"暗杀"正在工作的 Agent，然后看它秽土转生。那是对"状态系统到底能恢复到多完整"最直接的压力测试。*

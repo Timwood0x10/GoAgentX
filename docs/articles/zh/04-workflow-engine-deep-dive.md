@@ -1,611 +1,55 @@
-# ares 架构深度解析（四）：工作流引擎 -- ares 世界的 ReAct，从 DAG 到动态响应式编排（0.3.x）
+# ares 架构深度解析（四）：工作流引擎 —— DAG 即事实，事件驱动的响应式编译（0.3.x）
 
 > 最早写工作流的时候，我用的是硬编码——if step1 done then step2, if step2 done then step3……
-> 后来需求越来越多、逻辑越来越绕，代码变成了一坨 spaghetti。
-> 我当时就一个想法：**工作流不应该写死在代码里。它应该像乐高一样——随时可以拼、可以拆、可以换。**
-> 于是就有了两套工作流系统。你没看错，两套。因为我试了第一种发现不够用，又搞了第二种。
+> 后来需求越来越多，我意识到一个朴素但重要的事实：**图是事实（The graph is the source of truth），执行只是投影。**
+> 所以 0.3.x 我把重点从"怎么跑 DAG"挪到了"DAG 一旦在运行时变了，怎么把它带来的变化投影到任务集合上"。
 >
-> 0.3.x 更新：DAG 直接作为调度源。Task A completed → B ready / C ready → Scheduler，不需要 Leader 分发。Task Fabric 持有持久任务意图 + DAG 依赖 + 租约 + 检查点。Execution Quantum 边界 yield，Agent 死了从检查点恢复。
+> 这篇我复盘了五份代码：`workflow/engine/types.go`、`mutable_dag.go`、`graph_events.go`、`dag_patcher.go`，以及 `planprojection/coordinator.go`。
+> 只讲我在代码里真实看到的符号和逻辑。看不到的，我不吹。
 
-## 〇、0.3.x 的新角色：Task Fabric
+## 〇、先承认一件事：这篇讲的范围
 
-在深入两套工作流系统之前，先说 0.3.x 的核心变化。
+写这篇之前我把范围卡得很死，就四个模块：
 
-0.2.x 中，工作流引擎的 DAG 定义了任务依赖，DynamicExecutor 按拓扑序执行，但**调度本身是由 Leader 分发的**——Leader 决定哪个 Sub 干哪个任务。
+1. **`types.go`** —— `Step` / `Workflow` / `DAG` 的类型定义
+2. **`mutable_dag.go`** —— 线程安全的可变 DAG（`MutableDAG`）
+3. **`graph_events.go`** —— 变更事件的发布-订阅（`GraphEventHub`）与事件序号
+4. **`dag_patcher.go`** —— 把结构 patch 直接打到活拓扑上的 `DAGPatchExecutor`
+5. **`coordinator.go`** —— 把图的项目化（projection）编译成 taskfabric 任务的 `CompileCoordinator`
 
-0.3.x 改了这个。DAG 直接作为调度源：
+一句话概括这条链路：**运行时改动 MutableDAG → 每次都发一个 GraphEvent → 增量编译器把它投影成一条任务变更 → 任务集合与图收敛。**
 
-```mermaid
-graph LR
-    A["Task A<br/>State: Completed"] --> B["Task B<br/>State: Ready"]
-    A --> C["Task C<br/>State: Ready"]
-    B --> D["Task D<br/>State: Pending"]
-    C --> D
-    B -.->|"ReadyTasks()"| S["Kernel Scheduler"]
-    C -.->|"ReadyTasks()"| S
-    S -->|"Acquire"| E["Agent E"]
-```
+## 一、Step：工作流的最小单元
 
-核心在 `internal/taskfabric/dag.go`：
+### 1.1 Step 与 Workflow
 
-```go
-// ReadyTasks returns the ids of every task whose dependencies are satisfied
-// and that is currently READY — the scheduler's work source. No leader
-// decides "B is done, now run C"; the completed states make C ready.
-func (f *Fabric) ReadyTasks() []string {
-    // 遍历所有 task，State == Ready 且 deps 全部 Completed
-}
-```
-
-**没有 Leader 决定"B 做完了，现在轮到 C"**——Task 的 Completed 状态让 C 变 Ready，Scheduler 从 ReadyTasks 里拿。这是 0.3.x 的核心哲学：**Agents are not orchestrated. They are scheduled.**
-
-Task Fabric 的核心原语（`internal/taskfabric/fabric.go`）：
-
-| 原语 | 说明 |
-|------|------|
-| `Create(task)` | 创建持久任务意图，携带 capability/state/lease/checkpoint |
-| `Acquire(taskID, agentID)` | Agent 竞争获取 task 的 lease（CAS 所有权，非 Leader 分发） |
-| `Release(taskID, agentID, epoch)` | 释放 lease，所有操作携带 fencing token（epoch） |
-| `Yield(taskID, checkpoint)` | 在 Execution Quantum 边界 yield，检查点落盘 |
-| `Checkpoint(taskID, data)` | 持久化进度到 Task.Checkpoint |
-| `Steal(taskID)` | Work stealing：从过期的 lease holder 偷走 task |
-| `Preempt(taskID)` | 协作式抢占（不是 OS 硬抢占） |
-
-Task 的状态机（`internal/taskfabric/state.go`）：
-
-```
-Created → Ready → Acquired → Started → Yielded → Suspended → (re-acquire) → Started ...
-                                       ↓          ↓
-                                   Completed   Completed
-                                       ↓          ↓
-                                   Released   Released
-                                       ↓
-                                      Failed (if retry exhausted)
-```
-
-关键设计：**Agent 死亡 ≠ Task 死亡**。Agent 是一次性的，Task 是持久的。Agent 在 Execution Quantum 边界 yield 时检查点已落盘，即使 Agent 死了，Task Fabric 从检查点恢复进度，新 Agent 被创建后继续执行。
-
-**坦诚反思**：Task Fabric 替代了 0.2.x 中 Leader 的调度角色。这个替代不是简单的"换个实现"——Leader 的同步语义（Leader 知道每个 Sub 在干什么）和 Task Fabric 的异步语义（Task 状态驱动调度，没有中央协调者）有本质区别。迁移期用了双轨调度（PolicyFlag）+ shadow 模式验证等价性。
-
-## 一、为什么会有两套工作流？
-
-我先交代一下背景。最早我只写了一套——就是那个基于配置文件的 Workflow Engine。想法很简单：用 YAML 定义任务之间的依赖关系，引擎自动拓扑排序、并行执行、重试、超时……听起来很完美对吧？
-
-但用了一段时间发现一个问题：**配置驱动的灵活性不够**。有些场景我需要用代码动态加减节点、根据条件选边、甚至运行时修改拓扑结构。YAML 文件搞不定这些。
-
-所以我写了第二套——Graph System。这次换成 Fluent Builder API，可以在 Go 代码里直接构建工作流图。条件边、可插拔调度器、运行时拓扑变更……都安排上了。
-
-于是现在项目里就有了两套工作流系统：
-
-1. **Workflow Engine** (`internal/workflow/engine/`) —— 配置驱动的 DAG，强类型，热重载，Human-in-the-Loop。适合运维同学用 YAML 定义的工作流。
-2. **Graph System** (`internal/workflow/graph/`) —— 代码驱动的图编排，Fluent Builder，条件边，可插拔调度器。适合开发同学在代码里灵活编排。
-
-两套系统并行存在，各自服务不同的用户群体。代码量确实翻了一倍，但避免了"一刀切"抽象带来的折衷。值不值？我觉得值。
-
-## 二、Workflow Engine：配置驱动的 DAG 执行器
-
-### 2.1 核心类型体系
-
-Workflow Engine 的核心类型定义在 `internal/workflow/engine/types.go` 中。整个系统的数据流路径为：
-
-```
-配置文件 (YAML/JSON) --> WorkflowLoader --> Workflow + Step --> DAG --> Executor --> WorkflowResult
-```
-
-**Workflow 定义：**
-
-```go
-type Workflow struct {
-    ID          string            `json:"id"`
-    Name        string            `json:"name"`
-    Version     string            `json:"version"`
-    Description string            `json:"description"`
-    Steps       []*Step           `json:"steps"`
-    Variables   map[string]string `json:"variables,omitempty"`
-    Metadata    map[string]string `json:"metadata,omitempty"`
-    CreatedAt   time.Time         `json:"created_at"`
-    UpdatedAt   time.Time         `json:"updated_at"`
-}
-```
-
-**Step 定义 -- 工作流的最小执行单元：**
+`Step` 定义在 `internal/workflow/engine/types.go`。我读到的字段：
 
 ```go
 type Step struct {
-    ID          string            `json:"id"`
-    Name        string            `json:"name"`
-    AgentType   string            `json:"agent_type"`
-    Input       string            `json:"input"`
-    DependsOn   []string          `json:"depends_on"`
-    Timeout     time.Duration     `json:"timeout"`
-    RetryPolicy *RetryPolicy      `json:"retry_policy,omitempty"`
-    Interrupt   *InterruptConfig  `json:"interrupt,omitempty"`
-    Status      StepStatus        `json:"status"`
-    Output      string            `json:"output,omitempty"`
-    Error       string            `json:"error,omitempty"`
-    StartedAt   time.Time         `json:"started_at,omitempty"`
-    FinishedAt  time.Time         `json:"finished_at,omitempty"`
-    Metadata    map[string]string `json:"metadata,omitempty"`
+    ID             string            `json:"id"`
+    Name           string            `json:"name"`
+    AgentType      string            `json:"agent_type"`
+    Input          string            `json:"input"`
+    DependsOn      []string          `json:"depends_on"`
+    Timeout        time.Duration     `json:"timeout"`
+    RetryPolicy    *RetryPolicy      `json:"retry_policy,omitempty"`
+    RecoveryPolicy *RecoveryPolicy   `json:"recovery_policy,omitempty"`
+    Interrupt      *InterruptConfig  `json:"interrupt,omitempty"`
+    Status         StepStatus        `json:"status"`
+    Output         string            `json:"output,omitempty"`
+    Error          string            `json:"error,omitempty"`
+    StartedAt      time.Time         `json:"started_at,omitempty"`
+    FinishedAt     time.Time         `json:"finished_at,omitempty"`
+    Metadata       map[string]string `json:"metadata,omitempty"`
 }
 ```
 
-每个 Step 包含五个关键维度：
-- **依赖关系** (`DependsOn`)：声明式地表达前置步骤
-- **重试策略** (`RetryPolicy`)：指数退避重试
-- **人为干预** (`Interrupt`)：HITL 支持
-- **超时控制** (`Timeout`)：单步超时保护
-- **模板变量** (`Input`)：通过 `{{.input}}` 和 `{{.step_id}}` 引用上游输出
-
-**DAG 数据结构：**
-
-```go
-type DAG struct {
-    Nodes map[string]*DAGNode
-    Edges map[string][]string
-}
-
-type DAGNode struct {
-    StepID    string
-    InDegree  int
-    OutDegree int
-}
-```
-
-DAG 的构建函数 `NewDAG()` 执行三项关键校验：
-1. **重复 ID 检测**（H4 fix）：防止静默覆盖
-2. **依赖有效性校验**：所有 `DependsOn` 引用的 Step 必须存在
-3. **循环检测**：使用 DFS 递归栈算法
-
-```go
-func NewDAG(steps []*Step) (*DAG, error) {
-    dag := &DAG{
-        Nodes: make(map[string]*DAGNode),
-        Edges: make(map[string][]string),
-    }
-    for _, step := range steps {
-        if _, exists := dag.Nodes[step.ID]; exists {
-            return nil, fmt.Errorf("duplicate step ID %q: %w", step.ID, ErrDuplicateID)
-        }
-        // ... 构建节点和边
-    }
-    if dag.hasCycle() {
-        return nil, ErrCycleDetected
-    }
-    return dag, nil
-}
-```
-
-拓扑排序使用经典的 Kahn 算法（BFS 入度法）：
-
-```go
-func (d *DAG) GetExecutionOrder() ([]string, error) {
-    inDegree := make(map[string]int)
-    for node := range d.Nodes {
-        inDegree[node] = d.Nodes[node].InDegree
-    }
-    queue := make([]string, 0)
-    for node, degree := range inDegree {
-        if degree == 0 {
-            queue = append(queue, node)
-        }
-    }
-    // ... BFS 遍历
-    if len(result) != len(d.Nodes) {
-        return nil, ErrCycleDetected
-    }
-    return result, nil
-}
-```
-
-### 2.2 Executor：并发执行的调度核心
-
-Executor 的实现位于 `internal/workflow/engine/executor.go`，是整个引擎最复杂的部分。其并发模型可以概括为：
-
-```
-拓扑排序结果 --> 信号量限并发 --> errgroup 管理协程 --> stepDone 通道防死锁
-```
-
-**Executor 结构：**
-
-```go
-type Executor struct {
-    registry    *AgentRegistry
-    maxParallel int
-    stepTimeout time.Duration
-    hitlHandler InterruptHandler
-    hitlStore   InterruptStore
-}
-```
-
-**核心执行流程：**
-
-`runSteps()` 方法维护一个 `stepIndex` 指针遍历拓扑排序结果，对每个 Step 执行以下逻辑：
-
-1. **依赖检查**：调用 `canExecute()` 检查所有前置 Step 是否已完成
-2. **死锁检测**：如果依赖未满足但 Step 已处理过，启动 5 秒定时器；超时时报告死锁
-3. **信号量获取**：通过 `sem <- struct{}{}` 限制并发数
-4. **Panic 保护**：defer 中 recover panic 并在 `wg.Done()` 之前发送结果（C6 fix）
-5. **结果收集**：主协程通过 `resultChan` 收集结果，遇到失败立即终止
-
-这里有一个精妙的设计细节：**`stepDone` 通道**（H3 fix）。原始实现使用 `wg.Wait()` 等待所有协程完成，但 `wg.Wait()` 会阻塞直到所有协程结束，导致调度循环无法及时响应。改用带缓冲的 `stepDone` 通道后，每个协程完成时发送信号，调度循环立即重新检查依赖：
-
-```go
-// H3 fix: 使用 stepDone 通道替代 wg.Wait()
-stepDone := make(chan struct{}, 1)
-
-// 依赖不满足时的等待逻辑
-select {
-case <-stepDone:
-    // 某个协程完成了，重新检查依赖
-    continue
-case <-deadlockTimer.C:
-    // 超时：报告死锁
-    errChan <- fmt.Errorf("workflow deadlock detected: step %s...", stepID)
-    return
-}
-```
-
-**模板变量解析：**
-
-`resolveInput()` 方法实现了两层变量替换：
-- `{{.input}}` 替换为工作流的初始输入
-- `{{.step_id}}` 替换为特定 Step 的完整输出
-
-```go
-func (e *Executor) replaceTemplateVariables(input, initialInput string, completed map[string]bool, outputStore *OutputStore) string {
-    result := input
-    result = strings.ReplaceAll(result, "{{.input}}", initialInput)
-    for stepID := range completed {
-        if output, exists := outputStore.Get(stepID); exists {
-            replacements[fmt.Sprintf("{{.%s}}", stepID)] = output.Output
-        }
-    }
-    // ... 应用替换
-}
-```
-
-### 2.3 重试策略：指数退避
-
-`executeWithRetry()` 实现了带指数退避的重试逻辑。关键细节：`MaxAttempts` 最小值为 1（M5 fix），防止配置为 0 时跳过执行：
-
-```go
-func (e *Executor) executeWithRetry(ctx context.Context, step *Step, input string) (string, error) {
-    maxAttempts := 1
-    initialDelay := time.Second
-    if step.RetryPolicy != nil {
-        maxAttempts = step.RetryPolicy.MaxAttempts
-        initialDelay = step.RetryPolicy.InitialDelay
-    }
-    if maxAttempts < 1 {  // M5 fix
-        maxAttempts = 1
-    }
-    // ... 重试循环
-    if step.RetryPolicy != nil {
-        delay = time.Duration(float64(delay) * step.RetryPolicy.BackoffMultiplier)
-        if delay > step.RetryPolicy.MaxDelay {
-            delay = step.RetryPolicy.MaxDelay
-        }
-    }
-}
-```
-
-**默认常量**（`internal/workflow/engine/constants.go`）：
-
-```go
-const (
-    DefaultMaxParallel       = 10
-    DefaultStepTimeout       = 10 * time.Second
-    DefaultInitialDelay      = 10 * time.Millisecond
-    DefaultMaxDelay          = 100 * time.Millisecond
-    DefaultRetryAttempts     = 3
-    DefaultWorkflowTimeout   = 5 * time.Minute
-    DefaultMaxWorkflowSize   = 100
-    DefaultMaxDependencies   = 10
-)
-```
-
-## 三、Human-in-the-Loop (HITL)：人为干预机制
-
-HITL 是 Workflow Engine 区别于 Graph System 的核心特性之一。其设计围绕三个抽象展开：
-
-1. **InterruptConfig** -- Step 上的声明式配置，标记需要人为审批
-2. **InterruptHandler** -- 阻塞式回调函数，等待人类决策
-3. **InterruptStore** -- 持久化中断状态，支持崩溃恢复
-
-实现文件：`internal/workflow/engine/hitl.go`
-
-```go
-type InterruptHandler func(ctx context.Context, point *InterruptPoint) (*InterruptResult, error)
-
-type InterruptStore interface {
-    Save(ctx context.Context, executionID string, point *InterruptPoint) error
-    Load(ctx context.Context, executionID string, stepID string) (*InterruptResult, error)
-    Delete(ctx context.Context, executionID string, stepID string) error
-    ListPending(ctx context.Context, executionID string) ([]*InterruptPoint, error)
-    SaveResult(ctx context.Context, executionID string, stepID string, result *InterruptResult) error
-}
-```
-
-`MemoryInterruptStore` 是内存实现，使用双层 map（`executionID -> stepID -> point`），并通过 `sync.RWMutex` 保证线程安全。生产环境可以替换为 Redis 或数据库实现。
-
-HITL 集成到执行流程的路径：
-
-```
-executeStep()
-  --> handleInterrupt()
-    --> hitlStore.Save()           // 持久化中断点
-    --> hitlHandler(ctx, point)    // 阻塞等待人类决策
-    --> hitlStore.Delete()         // 审批通过后清理
-```
-
-当人类拒绝时，Step 状态被置为 `StepStatusSkipped`，工作流继续执行剩余步骤，而不是整体失败。
-
-## 四、MutableDAG 与 DynamicExecutor：运行时拓扑变更
-
-这是 Workflow Engine 最强大的能力：**在执行过程中动态修改 DAG 拓扑**。
-
-### 4.1 MutableDAG：线程安全的可变 DAG
-
-实现文件：`internal/workflow/engine/mutable_dag.go`
-
-MutableDAG 通过 `sync.RWMutex` 保护内部 DAG，并提供以下操作：
-
-- `AddNode()` -- 添加节点，自动校验依赖有效性和循环
-- `RemoveNode()` -- 删除节点，检查是否有其他节点依赖它
-- `ReplaceNode()` -- 替换节点，原子迁移边（见下文详解）
-- `AddEdge()` / `RemoveEdge()` -- 添加/删除边，增量循环检测
-- `Snapshot()` -- 原子深度拷贝当前拓扑
-- `Version()` -- 单调递增的版本计数器，用于检测变更
-
-**增量循环检测**使用 BFS 算法：
-
-```go
-func (m *MutableDAG) wouldCreateCycle(from, to string) bool {
-    visited := make(map[string]bool)
-    queue := []string{to}
-    for len(queue) > 0 {
-        current := queue[0]
-        queue = queue[1:]
-        if current == from { return true }
-        if visited[current] { continue }
-        visited[current] = true
-        for _, neighbor := range m.dag.Edges[current] {
-            if !visited[neighbor] {
-                queue = append(queue, neighbor)
-            }
-        }
-    }
-    return false
-}
-```
-
-**回滚机制**：`AddNode()` 在检测到无效依赖或循环时，会回滚所有已添加的边和节点：
-
-```go
-delete(m.dag.Nodes, step.ID)
-for _, e := range addedEdges {
-    m.removeEdgeFromSlice(e.from, e.to)
-    m.dag.Nodes[e.from].OutDegree--
-    m.dag.Nodes[e.to].InDegree--
-}
-```
-
-### 4.2 ReplaceNode：原子的边迁移
-
-`ReplaceNode` 是 MutableDAG 最复杂的操作。它不是简单的"删旧加新"，而需要在保持 DAG 完整性和拓扑合法性的前提下，迁移旧节点的所有入边和出边到新节点。
-
-```mermaid
-graph TD
-    subgraph "替换前"
-        A1[上游] --> OLD[旧节点]
-        OLD --> B1[下游1]
-        OLD --> B2[下游2]
-    end
-    subgraph "替换后"
-        A1 --> NEW[新节点]
-        NEW --> B1
-        NEW --> B2
-    end
-```
-
-核心处理两种场景：
-
-**场景一：相同 ID（原地替换）**——新节点使用和旧节点相同的 ID。这意味着所有边不需要迁移，因为边关联的是 ID，而不是对象引用。只需更新 `steps` map 中的 Step 指针。
-
-**场景二：不同 ID（边迁移）**——新节点 ID 不同，需要：
-1. 收集旧节点的所有入边（`GetInboundEdges`）和出边（`GetChildren`）
-2. 为每个入边调用 `AddEdge(from, newID)`，为每个出边调用 `AddEdge(newID, to)`
-3. 调用 `RemoveNode(oldID)` 删除旧节点
-
-**模拟环检测**：在真实修改之前，构建一个**模拟邻接表**，在新图上运行 DFS 环检测。只有模拟通过后才会执行实际修改：
-
-```go
-func (m *MutableDAG) hasCycleInAdjList(adjList map[string][]string) bool {
-    const (
-        white = 0 // 未访问
-        gray  = 1 // 正在访问（在当前递归栈中）
-        black = 2 // 已完成
-    )
-    color := make(map[string]int)
-    for node := range adjList { color[node] = white }
-
-    var dfs func(node string) bool
-    dfs = func(node string) bool {
-        color[node] = gray
-        for _, neighbor := range adjList[node] {
-            switch color[neighbor] {
-            case gray: return true       // 反向边 → 有环
-            case white:
-                if dfs(neighbor) { return true }
-            }
-        }
-        color[node] = black
-        return false
-    }
-
-    for node := range adjList {
-        if color[node] == white && dfs(node) { return true }
-    }
-    return false
-}
-```
-
-模拟完成后，`recalculateDegrees` 重新计算所有节点的入度和出度，确保拓扑排序的度信息与新的图结构一致。替换操作会触发一个 `ChangeReplaceNode` 类型的 `GraphEvent`，供事件订阅者（如流式 API）感知拓扑变更。
-
-### 4.3 GraphEventHub：变更事件的发布-订阅
-
-`GraphEventHub` 实现了中介者模式，提供 DAG 变更的 pub/sub 机制。每个订阅者获得一个带缓冲（64 事件）的 channel，非阻塞发布：
-
-```go
-type GraphEventHub struct {
-    mu          sync.RWMutex
-    subscribers map[string]chan GraphEvent
-    nextID      int
-}
-
-func (h *GraphEventHub) Publish(event GraphEvent) {
-    h.mu.RLock()
-    defer h.mu.RUnlock()
-    for _, ch := range h.subscribers {
-        select {
-        case ch <- event:
-        default:  // 缓冲区满时丢弃
-        }
-    }
-}
-```
-
-这一机制被 API 层的流式执行（`ExecuteStream`）利用：通过订阅 MutableDAG 的变更事件，将 Step 状态实时推送给客户端。
-
-### 4.4 DynamicExecutor：两种应用模式
-
-实现文件：`internal/workflow/engine/dynamic_executor.go`
-
-DynamicExecutor 提供两种变更生效模式：
-
-- **`ApplyAtCheckpoint`**：每个 Step 完成后重新计算执行顺序
-- **`ApplyImmediate`**：每个 Step 启动前重新计算执行顺序
-
-```go
-type ApplyMode int
-const (
-    ApplyAtCheckpoint ApplyMode = iota
-    ApplyImmediate
-)
-```
-
-**`recomputeOrder()`** 方法负责对比版本号并重新计算执行顺序。注意，它不再是简单的"追加新 Step"，而是**直接替换整个顺序**——因为 Recovery 场景下新节点可能依赖旧拓扑中不存在的依赖关系，追加无法保证拓扑合法性：
-
-```go
-func (e *DynamicExecutor) recomputeOrder(
-    mutableDAG *MutableDAG, lastVersion *uint64,
-    currentOrder *[]string, completed, processed map[string]bool,
-    mu *sync.Mutex,
-) {
-    mu.Lock()
-    defer mu.Unlock()
-    currentVersion := mutableDAG.Version()
-    if *lastVersion == currentVersion { return }
-    newOrder, err := mutableDAG.GetExecutionOrder()
-    // ...
-    *lastVersion = currentVersion
-    *currentOrder = newOrder  // 直接替换，而非追加
-}
-```
-
-M9 fix 确保了 `recomputeOrder` 的原子性：在 mutex 保护下完成版本检查和更新，防止并发调用重复追加。
-
-### 4.5 Step 结果收集的挑战
-
-DynamicExecutor 的结果收集比 Executor 复杂得多，因为 DAG 可以在执行过程中扩展，导致预期的结果数量动态变化：
-
-```go
-for {
-    mu.Lock()
-    expectedResults := len(*currentOrder)
-    mu.Unlock()
-    if collected >= expectedResults {
-        select {
-        case result, ok := <-resultChan:
-            // 处理结果
-        default:
-            mu.Lock()
-            newExpected := len(*currentOrder)
-            mu.Unlock()
-            if collected >= newExpected { break }
-            continue  // DAG 扩展了，继续收集
-        }
-    }
-    // ... 主 select 循环
-}
-```
-
-当 Step 在 DAG 中不存在时（H2 fix），发送 `StepStatusSkipped` 的哨兵结果防止收集循环挂起：
-
-```go
-if step == nil {
-    mu.Lock()
-    processed[stepID] = true
-    mu.Unlock()
-    resultChan <- &StepResult{StepID: stepID, Status: StepStatusSkipped}
-    stepIndex++
-    continue
-}
-```
-
-## 五、节点级故障自愈：从 ReAct 到动态演进的 Runtime
-
-> 传统的 ReAct 是微观的、线性的。模型"思考"然后"行动"，再思考再行动——一个死循环走到黑。
-> 在 ares 里，我们不写死循环。我们为智能体提供可以自由演进的 DAG 运行时。
-> 如果你的 Agent 挂了，Runtime 能够带着刚才的认知记忆，在图上稳住肉身。
-
-### 5.1 从 ReAct 的死循环到 Dynamic DAG
-
-如果你用过 LangChain 时代的 Agent，ReAct 的典型模式是这样的：
-
-```
-Thought → Action → Observation → Thought → Action → ...
-```
-
-一个 while 循环，每次迭代输出一段字符串，要么是 Thought，要么是 Action。Agent 的状态？靠堆 prompt 实现。Agent 挂了？重启从头来过。你要在中途插入一个人工审批？不好意思，不支持。
-
-这就是传统 ReAct 的三条死穴：
-
-1. **脆弱单线**：一条路径走到黑，一个环节出错就全盘重来
-2. **僵化拓扑**：每一步的"下一步"是在 LlM 输出里自描述的，框架无法感知和控制
-3. **无状态恢复**：没有事件溯源，没有 checkpoint，挂了就是真挂了
-
-ares 的选择是：**把 ReAct 的微观循环升级为宏观的、动态演进的分布式 Runtime**。
-
-模型不再通过字符串来约定"下一步做什么"，而是通过 MutableDAG 来直接操作 DAG 拓扑。Thought 和 Action 不再是 while 循环里的字符串，而是 Dynamic DAG 上的 Node 和 Edge。
-
-```mermaid
-graph LR
-    subgraph "传统 ReAct（线性循环）"
-        A1[Thought] --> A2[Action]
-        A2 --> A3[Observation]
-        A3 --> A4[Thought]
-        A4 --> A5[Action]
-        A5 --> A6[...]
-    end
-    subgraph "Dynamic DAG（拓扑演进）"
-        B1[Node_A] --> B2[Node_B]
-        B1 --> B3[Node_C]
-        B2 --> B4[Node_D]
-        B3 --> B5[Node_E]
-        B4 -.->|ReplaceNode| B6[Node_F_Recovered]
-        B5 --> B7[Node_G]
-    end
-```
-
-这个转变带来的直接好处：
-- **拓扑可见**：DAG 的结构就是 Agent 的逻辑，可观察、可审计
-- **动态干预**：可以在执行中插入节点、替换节点、甚至挂载 Recovery
-- **事件溯源**：每一次拓扑变更都是 Event Sourcing 的记录，可以重放和审计
-
-### 5.2 节点级故障抽象
-
-有了 MutableDAG 的动态替换能力，就可以设计一套节点级的故障恢复机制：
+几个我用代码确认的细节：
+
+- **`Output` 字段是"保留"的**。代码注释写得很直白：`Output` 现在生产代码没有任何地方在写（L2 session 图保持它为空），执行事实都放在 taskfabric 的任务信封（envelope）里；前驱 step 的输出是通过 join 信封读到的，**不是读这个字段**。所以别一看到 `Step.Output` 就以为执行结果存在这儿——真相在任务里。
+- **恢复策略是一等公民**。`RecoveryPolicy` 带 `Strategy` / `MaxAttempts` / `ReplacementAgent` / `Backoff`，而 `RecoveryStrategy` 就三个值：`retry`、`replace_node`、`fail_fast`。注意代码里 `replace_node` 是"替换节点"，这才是 `ReplaceNode` 能挂到恢复链路上的原因。
+- 状态枚举：`StepStatus` 是 `pending / running / completed / failed / skipped`；`WorkflowStatus` 是 `pending / running / completed / failed / cancelled`。
 
 ```go
 type RecoveryStrategy string
@@ -615,449 +59,315 @@ const (
     RecoveryReplaceNode RecoveryStrategy = "replace_node"
     RecoveryFailFast    RecoveryStrategy = "fail_fast"
 )
+```
 
-type RecoveryPolicy struct {
-    Strategy         RecoveryStrategy
-    MaxAttempts      int
-    ReplacementAgent string
+### 1.2 DAG 与 NewDAG
+
+`DAG` 就是经典的节点+邻接表：
+
+```go
+type DAG struct {
+    Nodes map[string]*DAGNode        // 节点（按 step ID）
+    Edges map[string][]string        // 邻接表：src -> targets
+}
+
+type DAGNode struct {
+    StepID    string
+    Metadata  map[string]string      // 见 1.3
+    InDegree  int
+    OutDegree int
 }
 ```
 
-三种策略的含义：
+`NewDAG(steps []*Step) (*DAG, error)` 的顺序校验，我逐行核对过：
 
-| 策略 | 行为 | 典型场景 |
-|------|------|----------|
-| `RecoveryRetry` | 重试原 Step（全量） | 临时性故障（超时、限流） |
-| `RecoveryReplaceNode` | 用新 Step 替换失败的节点 | 逻辑性故障（换模型、换工具） |
-| `RecoveryFailFast` | 不恢复，让工作流失败 | 不可恢复的错误（认证失败、参数错误） |
+1. **ID 规范化 + 去重**：`strings.TrimSpace(step.ID)`，空 ID 直接报错；重复 ID 返回 `ErrDuplicateID`（代码注释称 "H4 fix"，防止静默覆盖）。
+2. **依赖合法性与去重**：`DependsOn` 逐个 `TrimSpace`、去重；引用不存在的节点返回 `ErrInvalidDependency`。
+3. **环检测**：`hasCycle()` 用带"递归栈"（`recStack`）的 DFS 做有向图判环，有环返回 `ErrCycleDetected`。
+4. **拓扑排序**：`GetExecutionOrder()` 是标准的 Kahn 算法（BFS 入度消减）；如果结果数量不等于节点数，返回 `ErrCycleDetected`。
 
-> **0.3.x 演进说明**：早期设计里的 `StepRecoveryHandler` 回调接口（引擎在步骤失败时回调改图）在 0.3.x 中已删除——引擎没有执行器，回调永远等不到触发方；真实的节点替换由 `recovery_patcher` 直接改写 `Step.RecoveryPolicy.Strategy`，跨执行体的恢复闭环则归属 Kernel（见 5.3）。`RecoveryDecision` / `StepFailure` 一并移除。
+哨兵错误全部集中在 `types.go`：`ErrInvalidDependency`、`ErrCycleDetected`、`ErrDuplicateID`，还有 HITL 相关的一批 `ErrInterrupt*`。
 
-### 5.3 恢复闭环的真实归属：Kernel 恢复循环
+### 1.3 DAGNode.Metadata —— 让"只改元数据"这件事变可见
 
-0.3.x 的步骤恢复不再走"回调改图"，而是 Kernel 侧的事件驱动闭环——恢复的是**任务**（durable intent），不是 agent（disposable cognition）：
+这是我读代码时觉得最值得讲的一个设计。`DAGNode` 除了 `StepID` 和入度/出度，还带一份 `Metadata`，而它是**构建或 patch 时从所属 Step 的 map 快照过来的**（代码里叫 Y1 方案C / C4）。
 
-```mermaid
-sequenceDiagram
-    participant S as Kernel Scheduler
-    participant K as runKernelRecoveryLoop
-    participant F as Agent Fabric
-    participant T as Task Fabric
+为什么要有这个副本？注释解释得很清楚：以前 `DAGNode` 只带度数，一个只改了 `Step.Metadata` 的 父→子 变更会产出 **0 个 patch**——进化系统看到的是"没有拓扑变化"，于是"改元数据"这个算子永远选不中。保留一份 per-node 快照，让 WorkflowDiffer 在处理交给它的快照时是纯的，元数据变化就可见了。
 
-    Note over T: 执行体死亡（chaos kill / 崩溃）
-    T->>K: task.expired / task.failed 事件（或周期 sweep）
-    K->>T: RequeueExpiredLeases() — 任务回 READY，checkpoint 保留
-    K->>F: 查询可复活快照（RevivableSnapshot）
-    alt 有认知快照
-        K->>F: RestartAgent 原位复活（继承认知）
-    else 无快照
-        K->>F: 按 capability spawn 替换执行体
-    end
-    K->>S: RegisterExecutorForTask — 替换体绑定该任务
-    S->>T: Acquire → RunQuantum → 从 checkpoint 续跑
-```
+这个细节也直接决定了 `SetNodeMetadata` 的存在意义（见 2.x）：它要**同时**改 Step 的 map 和 DAGNode 的快照。
 
-关键语义：
+## 二、MutableDAG：线程安全、可演进的运行时拓扑
 
-- **绑定不劫持**：替换执行体通过 `RegisterExecutorForTask` 绑定到*恰好那一个*恢复任务，不会抢占其他 READY 任务；任务到达终态后绑定自动解除。
-- **预算封顶**：`MaxRestarts`（默认 5）限制同一 agent 的重启次数，耗尽后返回 `ErrRecoveryExhausted`，改走通用替身。
-- **checkpoint 续跑**：任务重排队时保留 checkpoint，替换体从上次进度继续，不是从零再来。
-
-### 5.4 记忆蒸馏融合："秽土转生"
-
-RecoveryReplaceNode 最强大的场景是在恢复时结合记忆蒸馏（Memory Distillation）。
-
-传统的 ReAct 里，Agent 挂了就是挂了——上下文丢失，记忆清零。但在 ares 中，恢复链路天然携带记忆：
-
-1. agent 执行的历史被异步蒸馏为结构化经验（Memory Distillation）
-2. 每次 spawn 都会加载该 agent 最近一次蒸馏经验作为 **G1 经验先验**（`loadExperiencePrior` → `SpawnSpec.ExperiencePrior`）
-3. 认知快照可用的场景下，`RestartAgent` 原位复活同一身份——**继承完整认知状态**，而不是空白重启
-
-这就像《火影忍者》里的"秽土转生"——Agent 虽然挂了，但它的记忆被蒸馏提炼，注入到新的节点里，让它带着经验从头再来：
-
-```mermaid
-graph LR
-    A[Agent_A 执行失败] --> B[提取失败上下文]
-    B --> C[记忆蒸馏]
-    C --> D[蒸馏后的记忆]
-    D --> E[Agent_B 继承记忆]
-    E --> F[带经验恢复执行]
-```
-
-这种"失败即经验"的设计，使得每一次故障都不是白费的——它们成为 DAG 不断迭代自己的养料。
-
-## 六、热重载系统：FileWatcher 与 WorkflowReloader
-
-热重载是 Workflow Engine 的另一个关键特性，实现在 `internal/workflow/engine/reloader.go` 中。
-
-### 6.1 FileWatcher：双模式文件监控
-
-FileWatcher 采用 **优雅降级** 策略：
-
-1. 优先使用 `fsnotify` 的事件驱动模式（实时性高）
-2. 如果 fsnotify 不可用，回退到轮询模式（5 秒间隔）
+`internal/workflow/engine/mutable_dag.go`。核心结构：
 
 ```go
-func NewFileWatcher(loader WorkflowLoader, workflows map[string]*Workflow) *FileWatcher {
-    watcher, err := fsnotify.NewWatcher()
-    if err != nil {
-        slog.Warn("FileWatcher: fsnotify not available, falling back to polling", "error", err)
-    }
-    // ...
+type MutableDAG struct {
+    mu            sync.RWMutex
+    dag           *DAG
+    steps         map[string]*Step
+    version       uint64         // 单调递增的变更计数
+    hub           *GraphEventHub
+    SchedulerType string         // 活跃调度器类型（由 genome evolution patch 设置）
 }
 ```
 
-fsnotify 模式下，会递归监控子目录（`watchDirectory()`），只处理 `Write` 和 `Create` 事件，并过滤非工作流文件。
+它自己的哨兵错误：`ErrNodeNotFound`、`ErrNodeHasDependents`、`ErrDuplicateEdge`、`ErrEdgeNotFound`。
 
-### 6.2 线程安全的原子重载
+### 2.1 变更操作一览
 
-`scanAndLoad()` 方法实现了 M6 fix：在整个比较-交换周期持有锁，防止 TOCTOU 竞争：
+| 方法 | 行为 | 校验/失败 |
+|------|------|-----------|
+| `AddNode(ctx, step)` | 加节点 + 按 `DependsOn` 加边 | 重复 ID→`ErrDuplicateID`；依赖不存在→`ErrInvalidDependency`；会成环→`ErrCycleDetected`；**失败时回滚已加的边再删节点** |
+| `RemoveNode(ctx, id)` | 删节点并删相关边 | 节点不存在→`ErrNodeNotFound`；还有节点依赖它→`ErrNodeHasDependents` |
+| `AddEdge(ctx, from, to)` | 加有向边 | 节点缺失→`ErrNodeNotFound`；重复边→`ErrDuplicateEdge`；成环→`ErrCycleDetected` |
+| `RemoveEdge(ctx, from, to)` | 删边 | 节点缺失、边不存在→`ErrEdgeNotFound` |
+| `ReplaceNode(ctx, oldID, newStep)` | 原子替换节点并迁移边 | 见 2.3 |
+| `SetNodeMetadata(nodeID, md)` | 原位置换节点 Metadata | 见 2.4 |
+
+每一次合法变更都会 `version++`，并 `hub.Publish` 一个对应的 `GraphEvent`。
+
+### 2.2 环检测：BFS 增量 + 三色 DFS
+
+`AddEdge` 走的增量判环是 BFS：`wouldCreateCycle(from, to)` 从 `to` 出发沿出边 BFS，能回到 `from` 就是成环，加了就不会盲目加。
+
+`ReplaceNode` 因为要动多条边，用的是另一套：在**模拟邻接表**上跑三色 DFS（`hasCycleInAdjList`，白/灰/黑标记），真实修改之前先在模拟图上判环。所以替换操作是原子的——**判环先于变更**，不需要回滚逻辑（源码注释明说 "no rollback logic is needed"）。
+
+### 2.3 ReplaceNode：同 ID / 异 ID 两条路
+
+`ReplaceNode` 的真正签名：`ReplaceNode(ctx context.Context, oldID string, newStep *Step) error`。行为取决于新旧 ID 是否相同：
+
+- **同 ID（原地替换）**：直接更新 step 引用，做边的新旧对比——旧 step 的 `DependsOn` 里新 step 不存在的那些边要删掉，否则节点会"静默保留过期依赖"（源码第 #31 注记）；同时刷新节点的 Metadata 快照。
+- **异 ID（边迁移）**：完整迁移——把旧节点的入边/出边重定向到新 ID，更新下游 step 的 `DependsOn`，然后删旧节点。异 ID 也要先过模拟邻接表判环。
+
+替换成功后 `recalculateDegrees()` 从 Edges 重建所有节点的入度/出度，`version++`，发布 `ChangeReplaceNode` 事件（带 `OldNodeID`）。
+
+### 2.4 SetNodeMetadata：C4 元数据变更的落点
+
+前面 1.3 说过，元数据既要改 Step 的 map（这样 patch 在 snapshot/restore——它们按 steps 驱动——下也能存活），又要改 DAGNode 的快照（这样 WorkflowDiffer 能看到元数据变更并产出 patch）。`SetNodeMetadata` 就是干这个的：
 
 ```go
-func (w *FileWatcher) scanAndLoad(ctx context.Context, dir string) error {
-    // 先在外面做 I/O（慢操作）
-    loaded := make(map[string]loadedEntry)
-    for _, entry := range entries { /* 加载文件 */ }
-    // 然后在锁内做比较-交换
-    w.mu.Lock()
-    modified := false
-    for id, le := range loaded {
-        oldWF, exists := w.workflows[id]
-        if !exists || le.modTime.After(oldWF.UpdatedAt) {
-            modified = true
-            break
-        }
-    }
-    if modified {
-        newWorkflows := make(map[string]*Workflow, len(loaded))
-        for id, le := range loaded { newWorkflows[id] = le.workflow }
-        w.workflows = newWorkflows
-    }
-    w.mu.Unlock()
-    if modified { w.notifyCallbacks() }
+func (m *MutableDAG) SetNodeMetadata(nodeID string, md map[string]string) error {
+    m.mu.Lock(); defer m.mu.Unlock()
+    node, ok := m.dag.Nodes[nodeID]
+    if !ok { return ErrNodeNotFound }
+    node.Metadata = cloneMetadata(md)
+    if step, ok := m.steps[nodeID]; ok { step.Metadata = cloneMetadata(md) }
+    m.version++
+    m.hub.Publish(GraphEvent{ /* ChangeSetNodeMetadata */ })
     return nil
 }
 ```
 
-**M7 fix** 确保回调函数接收的是 workflows 的深度拷贝，防止回调修改共享状态：
+### 2.5 读与副本：ReadDeps / Snapshot / ResetFromSteps
 
-```go
-func (w *FileWatcher) notifyCallbacks() {
-    w.mu.RLock()
-    workflowsCopy := make(map[string]*Workflow, len(w.workflows))
-    for k, v := range w.workflows { workflowsCopy[k] = v }
-    callbacks := w.callbacks
-    w.mu.RUnlock()
-    for _, cb := range callbacks { cb.fn(workflowsCopy) }
-}
-```
+封装原则很统一：**不能让外部协程直接摸 `m.mu`/`step.DependsOn`**，所以暴露了带读锁的读取方法：
 
-### 6.3 WorkflowReloader：高层次管理
+- `ReadDeps(stepID)` —— 返回依赖列表的拷贝。
+- `Snapshot()` / `SnapshotWithSteps()` —— 拓扑深拷贝；`WithSteps` 版在**同一把读锁**下同时给出深拷贝 topology 和浅拷贝的 step 引用（同一个 `*Step` 指针）。
+- `Steps()` / `StepIndex()` —— 当前 steps 的拷贝。
+- `ResetFromSteps(steps)` —— **原地重建** DAG（保留 `*MutableDAG` 指针不变）。这是回滚安全的根基：runtime manager、WorkflowGenome、各个 patch executor 共享同一个指针，回滚不必换对象。
+- `DroppedEvents(subID)` —— 见第三部分的事件丢弃计数。
 
-WorkflowReloader 封装了 FileLoader、DirectoryLoader 和 FileWatcher，提供统一的生命周期管理：
+另外 `GetExecutionOrder()` 在 `MutableDAG` 上有自己的版本：`SchedulerType != "" && != "*graph.DefaultScheduler"` 时，每步对 ready 队列做随机打乱（用 `time.Now().UnixNano()`）——这就是 genome evolution 改调度器配置能真实影响运行时行为的那条缝。
 
-```
-StartWatching()
-  --> DirectoryLoader.LoadAll()    // 初始加载
-  --> FileWatcher.Watch()          // 启动监控
-        --> fsnotify/polling loop  // 监控变更
-        --> onReload()             // 重载回调
-              --> notifyCallbacks() // 通知订阅者
-```
-
-## 七、Graph System：轻量级 Fluent Builder 图编排
-
-与 Workflow Engine 的配置驱动不同，Graph System 提供了 **程序化定义工作流** 的能力，采用 Fluent Builder 模式。
-
-### 7.1 核心抽象
-
-**Node 接口：**
-
-```go
-type Node interface {
-    Execute(ctx context.Context, state *State) error
-    ID() string
-}
-```
-
-三种内置节点类型：
-- `AgentNode` -- 包装 Agent
-- `ToolNode` -- 包装 Tool
-- `FuncNode` -- 包装任意函数
-
-**Graph 定义：**
-
-```go
-type Graph struct {
-    id        string
-    nodes     map[string]Node
-    edges     map[string][]*Edge
-    start     string
-    scheduler Scheduler
-    tracer    observability.Tracer
-    limiter   ratelimit.Limiter
-}
-```
-
-**Fluent Builder 链式调用：**
-
-```go
-graph := NewGraph("my-workflow").
-    Node("fetch", fetchNode).
-    Node("analyze", analyzeNode).
-    Node("report", reportNode).
-    Edge("fetch", "analyze").
-    Edge("analyze", "report", IfFunc(func(state *State) bool {
-        result, _ := state.Get("analyze")
-        return result != nil
-    })).
-    Start("fetch").
-    SetScheduler(NewPriorityScheduler(priorities))
-```
-
-### 7.2 条件边
-
-Edge 可以挂载条件函数（`Condition`），只有条件满足时才会触发下游节点执行：
-
-```go
-type Edge struct {
-    from string
-    to   string
-    cond Condition
-}
-
-type Condition func(state *State) bool
-```
-
-**C7 fix** 修复了条件边的关键问题：当节点的入度降为 0 时，不仅要检查入度，还要检查是否至少有一条入边条件被满足：
-
-```go
-if inDegree[edge.to] == 0 && !executed[edge.to] && !readySet[edge.to] {
-    if hasAnySatisfiedEdge(g, edge.to, state) {
-        readyQueue = append(readyQueue, edge.to)
-        readySet[edge.to] = true
-    }
-}
-```
-
-`hasAnySatisfiedEdge` 确保：
-- **非条件边**：始终满足条件
-- **全条件边但不满足**：节点被跳过（防止幽灵执行）
-- **多条入边中至少一条满足**：节点被调度（防止静默丢失）
-
-```go
-func hasAnySatisfiedEdge(g *Graph, targetID string, state *State) bool {
-    for _, edges := range g.edges {
-        for _, edge := range edges {
-            if edge.to == targetID {
-                if edge.cond == nil || edge.cond(state) {
-                    return true
-                }
-            }
-        }
-    }
-    return false
-}
-```
-
-### 7.3 可插拔调度器
-
-Graph System 定义了清晰的 `Scheduler` 接口，提供三种实现：
-
-| 调度器 | 策略 | 适用场景 |
-|--------|------|----------|
-| `DefaultScheduler` | FIFO（先进先出） | 默认，与 Workflow Engine 一致 |
-| `PriorityScheduler` | 优先级最高优先 | 需要区分任务重要性 |
-| `ShortJobScheduler` | 最短预估耗时优先 | 希望快速反馈的场景 |
-
-```go
-type Scheduler interface {
-    Select(ready []string) string
-}
-```
-
-**重要设计约束**：调度器是单线程执行的（在 BFS 主循环中），因此无需考虑并发安全。
-
-### 7.4 BFS 执行器
-
-执行器采用广度优先遍历，维护入度计数和 ready 队列：
+### 2.6 图引擎的一张流程图
 
 ```mermaid
 flowchart TD
-    Start([开始]) --> Init[初始化：入度=0 的节点加入 readyQueue]
-    Init --> LoopCheck{readyQueue 非空?}
-    LoopCheck -->|是| Pick[调度器从 readyQueue 中\n选择下一个节点]
-    Pick --> Execute[执行节点]
-    Execute --> Update[更新后继节点的入度]
-    Update --> CheckDone{后继节点\n入度归零?\n且条件满足?}
-    CheckDone -->|是| Enqueue[加入 readyQueue]
-    Enqueue --> LoopCheck
-    CheckDone -->|否| LoopCheck
-    LoopCheck -->|否| End([执行完毕])
+    OP["AddNode / RemoveNode / AddEdge /<br/>RemoveEdge / ReplaceNode / SetNodeMetadata"]
+    OP --> CHK["变更校验 + 环检测<br/>BFS(wouldCreateCycle) / 三色DFS(hasCycleInAdjList)"]
+    CHK -->|非法| ERR["返回 sentinel error<br/>ErrDuplicateID / ErrInvalidDependency /<br/>ErrCycleDetected / ErrNodeNotFound / ErrNodeHasDependents"]
+    CHK -->|合法| MUT["锁内变更 topology<br/>version++ / recalculateDegrees"]
+    MUT --> RD["Snapshot / SnapshotWithSteps<br/>深拷贝供外部只读"]
+    MUT --> EV["hub.Publish(GraphEvent)<br/>seq++ 若缓冲区满则 dropped[id]++"]
+    MUT --> BEEP["ResetFromSteps 原地重建<br/>回滚时指针不变"]
 ```
 
-State 是 lock-free 的（`internal/workflow/graph/state.go`），因为整个图执行默认是单线程的：
+## 三、GraphEventHub：事件、序号、丢弃计数
+
+`internal/workflow/engine/graph_events.go`。核心是这三处，都直接来自源码：
 
 ```go
-type State struct {
-    values map[string]any
+type GraphChange struct {
+    Type      ChangeType
+    NodeID    string
+    OldNodeID string // ChangeReplaceNode 用
+    FromID    string
+    ToID      string
+    Step      *Step
+    Timestamp time.Time
+}
+
+type GraphEvent struct {
+    Seq     uint64       // hub 级单调递增序号
+    Change  GraphChange
+    Success bool
+    Error   error
 }
 ```
 
-### 7.5 Panic-on-Invalid 哲学
+### 3.1 ChangeType 全集
 
-Graph System 的 Fluent Builder 方法采用了激进的 **启动时校验** 策略：违反前置条件的调用会直接 panic。
+`ChangeType` 是一个 `int` 枚举，`iota` 起始。完整列表及其语义（我对照编译器的 dispatch 逐项确认）：
+
+```mermaid
+graph LR
+    A1[ChangeAddNode] --> C1["applyAddNode → 为该节点建一个任务"]
+    A2[ChangeRemoveNode] --> C2["applyRemoveNode → 删该节点的任务"]
+    A3[ChangeAddEdge / ChangeRemoveEdge] --> C3["applyEdgeChange → 改写目标任务依赖 set_dependencies"]
+    A4[ChangeSetNodeMetadata] --> C4["applyMetadataChange → 原位改任务 payload update_payload"]
+    A5[ChangeReplaceNode] --> C5["applyReplaceNode → 先建/迁移后继/再删旧"]
+    A6[ChangeReconcile] --> C6["标记一次全量 Reconcile 的结果<br/>（不是 DAG 发布的，而是补偿路径打的标签）"]
+```
+
+注意 `ChangeReconcile` 的重要细节：**它不是 DAG 发布的**。DAG 只发前六种；`ChangeReconcile` 是用来给"全量校准（Reconcile）产生的 ChangeResult"打标签，让"这是由补偿产生的"这件事可归属。
+
+### 3.2 发布与订阅：非阻塞 + 丢弃计数
+
+`GraphEventHub` 内部：
 
 ```go
-func NewGraph(id string) *Graph {
-    if id == "" {
-        panic("graph ID cannot be empty: empty id is a programming error")
-    }
-    // ...
-}
-
-func (g *Graph) Edge(from, to string, cond ...Condition) *Graph {
-    if _, ok := g.nodes[from]; !ok {
-        panic(fmt.Sprintf("from node %q not found: node must be added via Node() before Edge()", from))
-    }
-    // ...
+type GraphEventHub struct {
+    mu          sync.RWMutex
+    subscribers map[string]chan GraphEvent
+    dropped     map[string]uint64   // 每个订阅者各自累计的丢弃数
+    nextID      int
+    seq         uint64
 }
 ```
 
-这与其他 Go 项目常见的返回 error 模式不同。设计者的考虑是：这些调用发生在应用启动阶段，参数错误是编程错误，应该立即暴露而非在运行时静默失败。
+`graphEventBufferSize = 64`（每个订阅者 channel 缓冲 64 条）。订阅 ID 形如 `sub-%d`，`Unsubscribe(id)` 会 close channel 并删除 dropped 计数（ID 不复用，留着就是死条目）。
 
-## 八、Service API 层：统一入口
+`Publish` 的关键行为，我逐行确认：先 `h.seq++` 并把序号写进 event，再对每个订阅者做**非阻塞**投递——`select { case ch <- event: default: h.dropped[id]++ }`。缓冲区满就丢弃，但**绝不静默**：丢弃数累进 `dropped[id]`，同时下一个到达的事件在序号上会留一个空洞。
 
-API 层位于 `api/service/workflow/service.go`，提供了 Workflow Engine 的完整 API，包括：
+为什么序号和丢弃计数都这么较真？源码注释说得很重：**"a skipped AddNode is a node that never becomes a task"**——丢了一个 AddNode，就有一个节点永远不会变成任务。所以任何"序号跳变"或"丢弃计数变化"都必须触发全量补偿，而不是耸耸肩当作无事发生。
 
-- `RegisterWorkflow()` -- 注册工作流定义
-- `Execute()` -- 同步执行
-- `ExecuteStream()` -- 流式执行（通过 GraphEventHub 订阅）
-- `ListWorkflows()` -- 列出已注册工作流
-- `GetWorkflow()` -- 获取单个工作流定义
+### 3.3 术语小结
 
-流式执行通过 errgroup 管理两个并发协程：
+| 概念 | 说明 |
+|------|------|
+| `Seq` | hub 级单调序号；相邻事件不连续 = 漏事件 |
+| `dropped[id]` | 某订阅者因缓冲区满而错过的累计条数 |
+| `Dropped(id)` / `DroppedEvents(subID)` | 读上述计数（hub 与 MutableDAG 各暴露一份） |
+| `graphEventBufferSize` | 64，channel 缓冲大小 |
+
+## 四、DAGPatchExecutor：把结构 patch 直接打到活拓扑上
+
+`internal/workflow/engine/dag_patcher.go`。这个执行器很直白地体现了一个立场：**补丁不再"存到某处等写到别的地方"，而是直接改活 DAG**。
 
 ```go
-g.Go(func() error {
-    // 协程 1: 执行工作流
-    r, e := executor.ExecuteDynamic(gctx, wf, req.Input, mutableDAG)
-    resultCh <- execResult{result: r, err: e}
-    return nil
-})
-
-g.Go(func() error {
-    // 协程 2: 转发 graph 事件为 step 事件
-    for ev := range graphEvents {
-        events <- core.WorkflowEvent{
-            Type:       core.WorkflowEventStepStarted,
-            WorkflowID: req.WorkflowID,
-            StepID:     ev.Change.NodeID,
-            StepName:   ev.Change.Step.Name,
-            Status:     core.WorkflowStatusRunning,
-            Timestamp:  ev.Change.Timestamp,
-        }
-    }
-    return nil
-})
+type DAGPatchExecutor struct {
+    dag *MutableDAG
+}
 ```
 
-## 九、两套系统的对比与取舍
+构造函数是 `NewDAGPatchExecutor(dag *MutableDAG)`，`Name()` 返回 `"workflow.dag"`，`SetDAG(dag)` 可以重新绑定到新的活 DAG。它被接到 patch registry 的 fallback 上——源码注释：这样 workflow patch 不再因为 "no executor registered for target <nodeID>" 而死，而是真的改到活拓扑（"the real live DAG"）。
 
-| 维度 | Workflow Engine | Graph System |
-|------|----------------|-------------|
-| **定义方式** | YAML/JSON 配置文件 | Fluent Builder API |
-| **核心抽象** | Step + DAG | Node (interface) + Edge |
-| **执行模型** | 拓扑排序 + 信号量并发 | BFS 单线程 + 可插拔调度器 |
-| **并发** | errgroup + WaitGroup + semaphore | 单线程 |
-| **HITL** | 原生支持 (InterruptConfig + InterruptStore) | 不支持 |
-| **重试** | RetryPolicy (指数退避) | 不支持（需自行包装） |
-| **热重载** | FileWatcher + WorkflowReloader | 不支持 |
-| **恢复** | RecoveryPolicy + Kernel 恢复循环（重排队 → 替换执行体绑定 → checkpoint 续跑）+ 记忆蒸馏融合 | 不支持 |
-| **动态拓扑** | MutableDAG + DynamicExecutor（含 ReplaceNode） | 不支持 |
-| **条件边** | 不支持（依赖关系是静态的） | Condition 函数 |
-| **可观测性** | 仅日志 | Tracer 接口 |
-| **运行时状态** | OutputStore (线程安全 map) | State (lock-free map) |
-| **适用场景** | 生产级、配置驱动的多步工作流 | 轻量级、程序化的 Agent 链 |
+四个核心方法都实现了 `patch.Restorable` 契约：
 
-**设计哲学差异**：
+- **`Snapshot(ctx)` → `(any, error)`**：`DAGSnapshot{Steps []*Step}`，把活 DAG 的 steps 逐个 `cloneStepForSnapshot`（深拷贝 `DependsOn` / `RecoveryPolicy` / `RetryPolicy` / `Interrupt` / `Metadata`）。
+- **`Restore(ctx, snap)` → error**：把快照还原到活 DAG——`ResetFromSteps(s.Steps)`，`*MutableDAG` 指针保持不变（见 2.5）。
+- **`CanApply(ctx, p)` → error**：声明它接受哪几类结构 patch。我确认的支持集：
+  `PatchInsertNode`、`PatchRemoveNode`、`PatchReplaceNode`、`PatchAddEdge`、`PatchRemoveEdge`、`PatchSetNodeMetadata`。
+- **`Apply(ctx, p)` → (inverse *patch.RuntimePatch, error)**：真正改活 DAG，并**返回一个逆 patch**用于回滚。例如 InsertNode 的逆是 RemoveNode，AddEdge 的逆是 RemoveEdge，ReplaceNode 会把旧的 step（深拷贝）写进逆 patch 的 `Value`。
 
-Workflow Engine 选择了 **重量级、功能丰富** 的路线，适合需要热更新、人为审批、节点级恢复的生产环境。它的配置驱动特性使得非开发人员也能定义工作流。Step 之间通过 `DependsOn` 建立静态依赖，模板变量 `{{.input}}` 和 `{{.step_id}}` 提供了有限但清晰的变量传递机制。`ReplaceNode` 机制和 `RecoveryReplaceNode` 故障自愈能力，使得工作流在运行中也能动态调整拓扑并恢复失败节点——这是 LangChain 时代 ReAct 循环无法触及的能力。
+`SetNodeMetadata` 的 `Value` 兼容多种类型（`map[string]string` / `*Step` / `Step`），从里面抠出 metadata 再走 `SetNodeMetadata`。
 
-Graph System 选择了 **轻量级、可扩展** 的路线，适合在代码中动态编排 Agent 调用。它的 Fluent Builder 模式让代码阅读者一目了然，条件边机制提供了更灵活的流程控制。Node 通过 `State` 共享运行时数据，这是一种隐式的数据流，比 Workflow Engine 的模板变量更灵活但更难追踪。
+## 五、CompileCoordinator：把图"编译"成任务集合
 
-## 十、说实话环节——跳出既定范式的代价与收益
+现在到了 0.3.x 最核心的部分：图变了之后，任务集合怎么跟着变。全部在 `internal/planprojection/coordinator.go`。
 
-这篇文章写到这里，我想抛开技术细节，聊聊几个我一直纠结的设计选择。不是教你怎么做——坦白说，我自己都没把握做对了。纯粹是分享一些思考过程，希望能给同样在搭工作流系统的你提供一点参考。
+### 5.1 两条编译路径：全量 vs 增量
 
-如果你有不同看法，欢迎来讨论。我很好奇其他人是怎么处理这些问题的。
+`CompileCoordinator` 持有 task fabric、事件存储、演进代数（generation）、上次编译记录（`lastCompile`）、上次增量结果（`lastChange`）和已跟踪的任务 ID 集（`planIDs`）。
 
-### 10.1 一套工作流引擎还是两套
+包注释把两种路径的本质差异讲得很透：
 
-先说一个让我头疼了很久的问题。
+- **`CompileDAG(ctx, dag)` —— 全量路径**（冷启动、`ResetFromSteps`）：先回收上一次编译的所有任务（best-effort `Delete`），再重建整批。问题在于：**一个已被 scheduler 取走（正在运行）的任务删不掉**。删不掉就不能全量重建（会撞 `ErrTaskExists`），所以全量路径不适合运行时增长。
+- **`ApplyChange(ctx, dag, evt)` —— 增量路径**（运行时图增长）：**一条图变更，只移动一个任务**。它"绝不去删一个没被要求的任务"——所以正在 RUNNING 的任务不会被从它 owner 脚下拆掉。
 
-我一开始想做一个通用工作流引擎，一个方案解决所有问题。但做着做着就发现，工作流的使用方式根本没法统一——有人想写几行 YAML 就搞定一个流程，有人在代码里需要精确控制每一步。用同一套抽象去满足这两种用法，结果两边都不讨好。
+```go
+// ApplyChange(ctx, dag, evt) 按 ChangeType 分发，而不是重新编译。
+// 完整重建恰恰是"增长路径"无法承受的：
+// Fabric.Delete 拒绝 RUNNING 任务 → 重建撞 ErrTaskExists → CompilePlan 全有或全无回滚丢掉整批
+// → 新长的节点永远变不成任务。
+```
 
-所以我拆成了两套：一个是配置驱动的 Workflow Engine，一个是代码驱动的 Graph System。前者写 YAML/JSON，后者用 Fluent Builder。
+`ApplyChange` 的语义，我用源码确认了：`evt.Success == false` 时是 no-op（一个失败变更不投影任何东西），返回一个 `DAGVersion` 标到当前为止；`ChangeResult{Skipped}` 记录"哪些动作被任务状态拒绝"（如 RUNNING/LEASED/SUSPENDED 下不能删/改），单任务被拒不 fail 整个 change，只有结构性失败才返回 error。
 
-但我毕竟一个人，两套代码都要写、两套文档都要维护。有时候我会想：如果当初只选一条路，会不会省下一半的功夫？这个问题的答案我到现在也没完全想通。
+### 5.2 补偿：Reconcile 与 SubscribeGraphEvents
 
-### 10.2 拓扑能不能在执行中改变
+事件流会漏——缓存满了会 drop。所以有一个完整校准路径：
 
-传统工作流的拓扑是定义时定死的。这很省心——定义即执行计划，不会出现运行时意外。
+- **`Reconcile(ctx, dag)`**：把 DAG 的**当前**状态重新投影到 fabric，而不是依赖事件流。DAG 是事实来源：每个没有跟踪任务的节点都按拓扑序创建，每个已跟踪任务都从图刷新，每个图里已不存在的跟踪 ID 都被删除。拒绝（RUNNING 任务动不了）进 `Skipped`。它返回的 `ChangeResult.Change` 被标成 `ChangeReconcile`。
+- **`SubscribeGraphEvents(ctx, dag) func()`**：订阅 DAG 的事件并逐条喂给 `ApplyChange`。**漏事件是被补偿的，不是被容忍的**：下一条事件 `Seq` 不连续就触发一次全量 `Reconcile`；每次投递后轮询 `DroppedEvents`，还会在最后一条之后 250ms（`reconcilePollInterval`）再查一次——因为"一次突发的中段 drop"只有通过计数才能发现，靠序号只看得到"下一条事件之后"的空洞。那是一次性定时器，只有投递时才会 arm，空闲订阅不做任何事。
 
-但在 Agent 场景下我遇到了一个问题：工作流的下一步是由模型输出决定的，而模型输出在写代码时根本不知道。用静态拓扑的话，我只有一个选择——把所有可能路径全画出来。结果就是一个巨大的状态机，画完比写代码还累。
+回到第四章那句话说得好：**这补上了"两个图"之间的裂缝**——DAGPatchExecutor 对活 MutableDAG 做的一次变更，会通过事件到达任务集合，下一次 scheduler drain 就能看到更新后的拓扑。
 
-所以我做了一个叫 MutableDAG 的东西——允许拓扑在执行过程中发生变化。新增节点、替换节点、挂载恢复逻辑，都不需要停工作流。
+### 5.3 事件 → 编译 → 收敛
 
-这么做带来了一堆麻烦。不能再假设 DAG 构造之后就不变了——每个操作都要加并发安全、环检测、版本锁。ReplaceNode 里的三色 DFS 在教科书上很漂亮，但实践中它会忽略一个问题：如果你的业务逻辑漏了一条边，纯图算法救不了你。它是一个可靠的底层原语，但不是万能药。
+```mermaid
+sequenceDiagram
+    participant M as MutableDAG (变更方)
+    participant H as GraphEventHub
+    participant Sub as SubscribeGraphEvents 订阅协程
+    participant C as CompileCoordinator
+    participant F as Task Fabric
 
-回过头想，我可能是在用一个复杂的技术方案来解决一个本可以用更好的抽象层解决的问题。如果你有更优雅的方式在动态场景下管理执行路径，我很想听听。
+    M->>H: Publish(GraphEvent)  seq++
+    H->>Sub: 非阻塞投递；缓冲满则 dropped++（计数，绝不静默）
+    Sub->>C: ApplyChange(dag, evt)  按 ChangeType 分发
+    C->>F: CompileNode / Delete / SetDependencies / UpdatePayload
+    Note over Sub,C: 若 evt.Seq != lastSeq+1 → Reconcile 全量校准
+    Note over Sub,C: 投递后轮询 DroppedEvents；尾随 250ms 一次性定时器
+```
 
-### 10.3 工作流失败了，一定要全部重试吗
+### 5.4 增量路径的一步行动
 
-大多数工作流系统的做法是：失败了就全部重试。最多加指数退避、调调重试次数。
+`ChangeResult` 把一次增量编译的结果带全：`Change`、`CompileID`、`DAGVersion`、`Created` / `Removed` / `Updated`（触碰的任务 ID，按动作分类）、`Skipped`（未能应用的动作，`Complete()` 即 `len(Skipped)==0`）。每个 `SkippedOp` 记录 `TaskID`、`Op`、`Err`，`Op` 词汇表是四个：`delete` / `set_dependencies` / `update_payload` / `create`。
 
-我不太接受这个方案。一个 LLM 调用返回了格式错误的 JSON，为什么要回滚整个 Workflow？换一个模型重新跑这个节点不就够了吗？
+配合第一部分的 `CompileDAG` / `ApplyChange` 用两条路径把 `lastCompile`（含 `Generation` / `DAGVersion` / `CompileID` / `PlanIDs` / `StepCount`）都记进 event store，供事后审计。
 
-这个想法其实不是来自工作流领域——我是从操作系统学的。微内核里一个服务挂了，重启那个服务就够了，不需要重启整个内核。那 Agent 系统里为什么不行？
+## 六、设计意图的取舍
 
-所以我实现了节点级 RecoveryReplaceNode：只替换失败的那个节点，其他节点的执行结果保留。更进一步，我还尝试把失败节点的上下文蒸馏成经验，注入到替代节点里。
+- **图是事实，事件是通知，任务是投影**。增量编译器把 DAG 当 source of truth，事件只是提醒"该去对账了"；所以连加边/删边都收敛到"目标任务的依赖 = 图现在怎么说"。
+- **一次变更只动一个任务**。这是"运行时图增长"的地基：宁可增量慢，也不能让一个 RUNNING 任务被整批重建拆掉。
+- **丢弃计数 + 序号空洞 = 必须补偿的信号**。不把"没投递成功"当偶然，而是当必须回填的账。
+- **回滚不换对象**。`DAGPatchExecutor.Restore` 走 `ResetFromSteps`，`*MutableDAG` 指针稳定，所以 runtime manager / WorkflowGenome / patch executor 共享的引用在回滚后仍然一致。
 
-但说实话，这个功能目前的成熟度让我不太放心。它需要完整的执行上下文追踪——哪个节点跑了、输出了什么、依赖了谁。恢复策略引擎还是 v0.1，5 轮上限基本是拍脑袋定的。蒸馏管线更是粗糙：把错误塞进 EventSink，然后祈祷蒸馏服务能抽出有用的东西。方向我认同，工程还在路上。
+## 七、坦诚复盘
 
-### 10.4 Human-in-the-Loop 应该怎么等人
+这一篇我尽量只写代码里真实存在的东西，但也不是没纠结过。
 
-人机交互在大多数系统里的实现方式是：停下工作流，等人，再继续。人是一个同步阻塞环节。
+最让我意外的是 `Step.Output`——要是不看源码注释，我大概会想当然地把它当成"执行结果存这"。真相是执行事实在 taskfabric 的任务信封里，Output 字段是保留位。这说明**文档和注释比字段名更接近真相**，写这篇之前我自己都差点被字段名带偏。
 
-我一直在想：能不能换个角度，把 HITL 当作工作流图上的一个普通节点？它只是暂停执行、等待异步事件、然后恢复下游。不阻塞调度器，不占用 goroutine，不消耗资源。
+另一个反复敲打我的是：增量编译把"正确性"压在了**事件不丢**之上，而事件又可能因为缓冲满而丢弃。代码用两套信号兜底（序号空洞 + 丢弃计数 + 尾随定时器），这个设计我认可，但它意味着"一旦漏事件就必须全量 Reconcile"这件事是被写死在订阅循环里的。换句话说，**增量是性能优化，全量才是兜底事实**——愿意承担 Reconcile 的成本，才敢用增量。这个取舍我目前接受，但它是不是最好的，我还没完全想通。
 
-这样做的优点是天然支持"先做别的事，等人工回来再续上"。缺点是目前没有审批链、没有超时自动降级、没有多人协作决策——这些都是生产级 HITL 的基本能力，我还没做。MVP 级，不是谦虚。
-
-这个取舍我目前是接受的，因为它至少让 HITL 不成为系统的瓶颈。但如果你的场景需要复杂的审批流程，这个方案大概率不够用。
-
-### 10.5 配置更新一定要重启进程吗
-
-改配置 -> 重启进程，这是最常规的做法。简单，可靠，但服务会断。
-
-我选择了运行时热重载——文件变化后原子替换全量 Workflow map，不重启进程，不丢请求。实现不算复杂：fsnotify 监听 + 锁内 compare-and-swap + 深度拷贝回调。
-
-真正让我意外的是跨平台问题。inotify（Linux）和 kqueue（macOS）行为差异很大，macOS 上有些文件事件根本收不到。最后不得不做了轮询兜底（5 秒间隔），保证可用性，但在某些场景下太慢了。
-
-这个问题让我反思：为了"不重启"这个目标，我增加了多少复杂度？如果业务场景接受秒级的停机，重启方案可能更划算。这个选择不是技术问题，是 SLA 要求的问题。
+如果你在做类似的"活 DAG → 任务投影"系统，我会很想听听你怎么处理"事件可丢但投影不能丢"这道题的。
 
 ---
 
-## 十一、结语
+## 系列文章
 
-上面这些设计，每一个都有它的代价。把代价写出来不是为了证明选对了——只是想把这些真实的权衡过程记录下来。
+| # | 主题 | 你会学到什么 |
+|---|------|-------------|
+| I | 架构总览 | 全局视角 + 两级同构 MutableDAG + 全模块拆解 |
+| II | Agent 和声协议 | Agent 怎么通信 |
+| III | 记忆蒸馏 | `ares_experience`/`ares_memory` 怎么记住和遗忘 |
+| IV | **本文** | `workflow/engine.MutableDAG`：任务怎么在 DAG 里流、怎么进化 |
+| V | 工具调用层 | `tools/toolsource` 怎么发现、检索、绑定工具 |
+| VI | 安全与可观测 | `ares_events`/`introspect` 怎么看到发生了什么 |
+| VII | 运行时与生命周期 | Agent 怎么活和死、怎么复活 |
+| VIII | 事件系统 | 状态怎么记录和恢复 |
+| IX | 竞技场 / 故障注入 | `aresrecovery.Chaos` 怎么故意搞破坏再验证恢复 |
+| X | 检索系统 | 怎么找到相关记忆 |
+| XI | 自主进化 | `evolution` 怎么只 patch L1、怎么发布 |
+| XIII | Bootstrap 与 API | `ares_bootstrap` 怎么无痛接线 |
+| XV | MCP 集成 | `ares_mcp` 怎么教 Agent 用工具 |
+| 19 | 存储层 | `storage/postgres` + `services/embedding` |
+| 20 | LLM 客户端层 | `llm` Failover、多 provider 抽象 |
+| 21 | 评估框架 | `ares_eval` EvaluatorRegistry / LLMJudge |
 
-说到底就是两套工作流系统，一倍的代码量。说实话数量不算多，但每一条路都是被实际需求逼出来的——Workflow Engine 的配置驱动是给"不想写代码的人"准备的，Graph System 的 Fluent Builder 是给"想写代码的人"用的。两套都做了，就不用吵了。
+每篇文章遵循同一个模式：**问题 → 设计旅程 → 权衡取舍 → 坦诚反思。**
 
-最让我满意的不是功能数量，是并发模型和热重载。errgroup + WaitGroup + semaphore + stepDone 通道这一套组合拳，配合双模式文件监控和原子替换，是我花了最多心思调出来的。虽然中间踩过go并发上的坑，这些坑——但每次修完都更确定一件事：**Go 的并发，设计之初就要想清楚，不能靠后期 Debug 打补丁。**
-
-当然也有很多不完美的地方。熔断和重试的配置不够灵活，Graph System 的调度器只实现了拓扑序和并发两种，Event Trigger 还没有真正落地到生产……但这些都在 TODO 里躺着了，等用户来催的时候再修吧。开源就是这样——你永远不知道用户会怎么用你的系统，等他们发现少了什么，自然会来提 issue。😄
-
----
-
-下一篇聊 **运行时与生命周期**——Agent 会死吗？会。LLM 超时会死、内存溢出会死、panic 会死、宿主重启也会死。但有没有一种机制，能让 Agent 死后带着记忆复活？下一篇聊聊 Runtime 的"秽土转生"机制。
+不营销。不"比 X 快 10 倍"。只有工程师聊工程。

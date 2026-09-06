@@ -1,237 +1,229 @@
 # ares 架构拆解 (XXI)：评估框架——怎么知道 Agent 真的好了（0.3.x）
 
-"你怎么知道你的 Agent 改进了？"这个问题在 v0.2.5 一直困扰我们。进化引擎在生成新策略，竞技场在跑对战——但我们没有客观方法说"策略 A 比策略 B 好 12%"。
+"你怎么知道你的 Agent 改进了？"这个问题一直困扰我们。进化引擎在生成新策略，候选验证在跑保留样例回归——但我们需要的是一种客观方法说"策略 A 比策略 B 好多少"。
 
-评估框架（`internal/ares_eval/`，3,390 行）就是答案。它把"我觉得看起来更好"变成可复现的分数。
+评估框架（`internal/ares_eval/`，约 3,000 行）是这个问题的一部分答案。它把"我觉得看起来更好"变成可复现的分数。**需要先说实话：它的规模远小于"评测 Agent 一切能力"的通用框架**，它更准确地说是"给 Agent 输出打分的评估器 + 一个跑保留样例回归的门"。本文只写代码里真实存在的东西。
 
 ---
 
 ## 问题：凭感觉评估
 
-早期 ares 有三条评估路径，都是坏的：
+早期 ares 的评估路径基本靠人工和直觉，都是坏的：
 
 | 路径 | 方法 | 问题 |
 |------|------|------|
 | 人工 | "读输出，看起来对吗？" | 不可扩展，偏见严重 |
-| 单元测试 | 硬编码期望输出 | 脆弱，LLM 输出会变 |
-| Token 计数 | "更多 token = 更深入" | GPT-4o-mini 500 token 胜过 GPT-4 2000 token |
+| 精确匹配 | 输出必须等于期望文本 | 脆弱，LLM 输出表达多变 |
+| Token 计数 | "更多 token = 更深入" | 长度不等于质量（基于代码注释做的推断，未有实测数据，待核实） |
 
-我们试过自建评分规则。用了一周就出问题——有人问"任务 X 上的 7/10 怎么和任务 Y 上的 8/10 比？"答案：不能比，除非你有框架。
-
-**坦诚反思**：我们考虑过用现有 eval 框架（promptfoo、langchain eval）。它们对单模型评估很好。但 ares 需要*比较*评估——策略 A 在同一任务上比策略 B 好吗？这是不同的问题。
+在讲清楚这个框架之前，我们做的第一件事是诚实盘点**代码里真正有什么**——而不是给它虚构一个宏大的三层面貌。
 
 ---
 
-## 设计：三层
+## 真实结构：三个组件
+
+当前 `internal/ares_eval/` 的真实构成是一条很朴素的流水线，没有文档里常见的"Comparison 层""并发 Runner 层"：
 
 ```mermaid
 graph TD
-    L[Loader] --> R[Runner]
-    R --> EV[Evaluator]
-    EV --> LJ[LLMJudge]
-    EV --> DJ[DimensionJudge]
-    EV --> CO[Comparison]
-    R --> RE[Report]
+    L[Loader.Load / LoadDir] --> R[AgentTestRunner.RunSuite]
+    R --> E{EvaluatorRegistry}
+    R --> G[ReportGenerator.GenerateMarkdown/JSON]
+    E --> EM[ExactMatchEvaluator]
+    E --> KP[KeywordPresenceEvaluator]
+    E --> TU[ToolUsageEvaluator]
+    E --> LJ[LLMJudgeEvaluator]
+    LJ --> SA[Scale: 1-10 / 1-5 / pass-fail]
+    LJ -.WithDimensionAveraging.-> DA[4 维平均: correctness 0-3, completeness 0-3, efficiency 0-2, safety 0-2]
+    DA -.optional.-> EB[DimensionJudgeBridge]
+    EB -.-> ES[(evidence store: KindDimensionEval)]
 ```
 
-### 第 1 层：测试用例（`loader.go`、`types.go`）
+### 组件 1：Loader（`loader.go`）
+
+`Loader` 从 YAML 加载套件，提供 `Load(path)` 和 `LoadDir(dir)`。它包含一个路径校验 `validateSuitePath`，用来拒绝会穿进系统目录（etc/proc/sys/dev/boot/root）的套件路径。测试用例的字段在 `types.go` 里，注意**不是**旧博客里那个 `Expected/Category/Difficulty`：
 
 ```go
 // internal/ares_eval/types.go
 type TestCase struct {
-    ID          string
-    Input       string
-    Expected    string  // 可选参考答案
-    Category    string  // "reasoning", "coding", "chat" 等
-    Difficulty  string  // "easy", "medium", "hard"
-    Metadata    map[string]any
+    ID             string
+    Name           string
+    Input          string
+    ExpectedOutput string   // 可选参考答案
+    ExpectedTools  []string // 期望用到的工具
+    Timeout        Duration // 支持 "30s" / "1m30s"，默认 30s
+    Metadata       map[string]interface{}
+    Tags           []string // 选择性执行
 }
 
 type TestResult struct {
-    TestCaseID string
-    Output     string
-    Scores     []EvalScore
-    Duration   time.Duration
-    Error      error
+    TestCaseID   string
+    ActualOutput string
+    ToolsUsed    []string
+    Duration     time.Duration
+    TokensUsed   int
+    Error        string
+    Metrics      map[string]float64
+    Timestamp    time.Time
 }
 
 type EvalScore struct {
-    EvaluatorName string
-    Score         float64
-    MaxScore      float64
-    Reasoning     string
+    Metric  string  // "exact_match", "keyword_presence", "tool_usage", "llm_judge"
+    Score   float64 // 统一归一化到 [0,1]
+    Details string
 }
 ```
 
-测试用例从 YAML 或 JSON 加载：
+示例套件：
 
 ```yaml
-- id: reasoning_01
-  input: "If A > B and B > C, what's the relationship between A and C?"
-  expected: "A > C"
-  category: reasoning
-  difficulty: easy
+name: basic
+description: 冒烟测试
+test_cases:
+  - id: reasoning_01
+    input: "If A > B and B > C, what's the relationship between A and C?"
+    expected_output: "A > C"
+  - id: tool_call_01
+    input: "请帮我构建这个项目"
+    expected_tools: ["shell"]
+    timeout: "60s"
 ```
 
-### 第 2 层：评估器（`evaluator.go`、`llm_judge.go`、`dimension_judge.go`）
+### 组件 2：Runner（`runner.go`、`agent_runner.go`）
 
-核心接口：
+`runner.go` 只定义接口，**不存在旧博客里的 `Runner` 结构体或 `RunAll/RunScenario`**：
+
+```go
+// internal/ares_eval/runner.go
+type TestRunner interface {
+    RunSuite(ctx context.Context, suite TestSuite) ([]TestResult, error)
+    RunSingle(ctx context.Context, testCase TestCase) (TestResult, error)
+}
+
+type AgentExecutor interface {
+    Execute(ctx context.Context, input string) (output string, toolsUsed []string, tokensUsed int, err error)
+}
+```
+
+`AgentTestRunner`（`agent_runner.go`）用 `AgentExecutor` 跑用例，逐条带上超时上下文，记录 `Duration/TokensUsed/ToolsUsed`。它还持有可选的 `EvaluatorRegistry`，`RunAndEvaluate(ctx, suite, evaluatorName)` 按名字找评估器并对每个结果求分。**注意：这里目前是串行执行的，没有并发 Runner**（并发能力在进化侧的回归测试里以批量评分形式出现，见下）。
+
+### 组件 3：评估器（`evaluator.go`、`llm_judge.go`、`dimension_judge.go`）
+
+核心接口只承诺一件事（`Name()` 不在接口里，是各实现自带的）：
 
 ```go
 // internal/ares_eval/evaluator.go
 type Evaluator interface {
-    Name() string
-    Evaluate(ctx context.Context, tc TestCase, result TestResult) ([]EvalScore, error)
+    Evaluate(ctx context.Context, testCase TestCase, result TestResult) ([]EvalScore, error)
 }
 ```
 
-三个内置评估器：
+内置评估器：
+
+- `ExactMatchEvaluator`：`actual == expected` → 1.0，否则 0.0。`ExpectedOutput` 为空时给 1.0。
+- `KeywordPresenceEvaluator`：按关键词命中比例打分。
+- `ToolUsageEvaluator`：期望工具命中比例。
+- `LLMJudgeEvaluator`：LLM-as-judge（见下）。
+
+`EvaluatorRegistry`（`NewEvaluatorRegistry` / `Register(name, eval)` / `Get` / `Names`）做线程安全的名字注册。
 
 #### LLMJudgeEvaluator
 
-用 LLM-as-judge 给输出打分。支持三种量表：
+支持三种量表：
 
 ```go
 // internal/ares_eval/llm_judge.go
 const (
-    ScaleOneToTen  ScaleType = iota + 1  // 1-10 打分
-    ScaleOneToFive                       // 1-5 打分
-    ScalePassFail                        // 二元通过/失败
+    ScaleOneToTen  ScaleType = iota + 1 // 1-10
+    ScaleOneToFive                       // 1-5
+    ScalePassFail                        // 二元
 )
 ```
 
-judge prompt（简化版）：
+默认使用中文评分提示词 `DefaultJudgePromptCN`（`prompts.go`），按四维打分、总分 0-10，LLM 返回 JSON `{"score": N, "reason": "..."}`。`Evaluate` 把分数归一化到 `[0,1]`（`score / maxScore`），并通过 `extractJudgeJSON` 处理 markdown 代码块/裸 JSON 的鲁棒解析。
 
-```
-你在评估一个 AI 助手的回复。
+**坦诚反思**：LLM-as-judge 的偏见（偏好更长更"溜"输出）确实存在，但代码里**没有**长度惩罚提示、也没有对人工评分的校准。这些是真实的待办而不是已实现特性。也没有缓存层；成本控制体现在别处（见健康删减）。
 
-任务：{input}
-期望：{expected}
-实际：{output}
+#### 维度平均（`dimension_judge.go`）
 
-给回复打 1-10 分：
-- 10：完美，达到或超过期望
-- 7-9：好，有小问题
-- 4-6：部分，缺关键元素
-- 1-3：差，错误或无关
+注意：**不存在独立的 `DimensionJudgeEvaluator` 类型**。维度打分是 `LLMJudgeEvaluator` 通过选项 `WithDimensionAveraging()` 开启的一条路径——让 LLM 对四个独立维度打分再取平均以降低方差：
 
-返回 JSON：{"score": N, "reasoning": "..."}
-```
+| 维度 | 满 分 |
+|------|------|
+| correctness | 3 |
+| completeness | 3 |
+| efficiency | 2 |
+| safety | 2 |
 
-**坦诚反思**：LLM-as-judge 有已知偏见——它偏好更长、更啰嗦的回复。我们在 judge prompt 里加了长度惩罚，但那是创可贴。真正的修复是针对人工评估校准 judge，我们还没做。
+它返回 JSON `{"correctness":0-3,"completeness":0-3,"efficiency":0-2,"safety":0-2,"reason":"..."}`。归一化平均得到 metric `llm_judge_dimension_avg`。
 
-#### DimensionJudgeEvaluator
+诊断结果可经 `evidence_bridge.go` 的 `DimensionJudgeBridge.Emit` 写进通用证据库（`KindDimensionEval`），让进化的 `Diagnoser` 能消费真实失败证据——而不是把结果压缩成单一标量（这是第 8 篇验证的延续）。
 
-跨多个维度打分：
+### 报告（`report.go`）
 
-```go
-// internal/ares_eval/dimension_judge.go
-type Dimension struct {
-    Name      string  // "accuracy", "completeness", "clarity"
-    Weight    float64
-    MaxScore  float64
-}
-```
-
-每个维度得一个分，然后加权汇总。这是进化引擎用来做适应度评估的。
-
-### 第 3 层：Runner 和比较（`runner.go`、`comparison.go`、`concurrent_runner.go`）
-
-```go
-// internal/ares_eval/runner.go
-type Runner struct {
-    evaluators []Evaluator
-    loader     *Loader
-}
-
-func (r *Runner) RunAll(ctx context.Context) (*Report, error)
-func (r *Runner) RunScenario(ctx context.Context, scenario string) (*Report, error)
-```
-
-**比较**层是魔法所在：
-
-```go
-// internal/ares_eval/comparison.go
-type Comparison struct {
-    Baseline     *Report
-    Candidate    *Report
-    Improvements []ScoreDelta
-    Regressions  []ScoreDelta
-}
-```
-
-这让我们能说：
-
-```
-策略 A（基线）：平均分 7.2/10
-策略 B（候选）：平均分 8.1/10
-改进：+12.5%
-```
-
-`concurrent_runner.go` 并行跑测试用例，把 100 个用例的评估时间从 30 分钟砍到 3 分钟。
+`ReportGenerator.GenerateMarkdown/GenerateJSON` 汇总套件级统计（总数/通过/失败/耗时/Token）和每个 metric 的平均/最小/最大，`RunEvaluation` 是一条把 Load→Run→Evaluate 串起来的便捷函数。
 
 ---
 
-## 与进化集成
+## 与进化的两个真实接点
 
-评估框架是 GA 引擎的适应度函数（第 XI 篇）：
+### 接点 A：bootstrap 注册评估器（`ares_bootstrap/provide_evolution.go`）
+
+代码里**没有**旧博客那个 `SetupEvaluators`（带 `WithMaxRetries`/多个注册）。真实的是：
 
 ```go
-// internal/ares_bootstrap/bootstrap.go（简化）
-func SetupEvaluators(llmClient *llm.Client, registry *eval.EvaluatorRegistry) error {
-    judge, err := eval.NewLLMJudgeEvaluator(llmClient,
-        eval.WithScale(eval.ScaleOneToTen),
-        eval.WithMaxRetries(3),
+// internal/ares_bootstrap/provide_evolution.go（简化）
+func setupEvaluators(llmClient ares_eval.LLMClient) (*ares_eval.EvaluatorRegistry, error) {
+    judge, err := ares_eval.NewLLMJudgeEvaluator(llmClient,
+        ares_eval.WithChinesePrompt(),
+        ares_eval.WithScale(ares_eval.ScaleOneToTen),
     )
     if err != nil {
-        return err
+        return nil, err
     }
-    registry.Register(judge)
-
-    dimJudge, err := eval.NewDimensionJudgeEvaluator(llmClient,
-        eval.WithDimensions(defaultDimensions),
-    )
-    if err != nil {
-        return err
+    registry := ares_eval.NewEvaluatorRegistry()
+    if err := registry.Register("llm_judge", judge); err != nil {
+        return nil, err
     }
-    registry.Register(dimJudge)
-
-    return nil
+    return registry, nil
 }
 ```
 
-当进化运行时，它：
-1. 生成新策略（通过变异）
-2. 让 Agent 跑一遍
-3. 用 `LLMJudgeEvaluator` 评估输出
-4. 把分数用作选择的适应度
+这个 registry 挂在 `EvolutionComponents.EvaluatorRegistry` 上，供后续链路使用。
 
-**坦诚反思**：LLM judge 很贵——每次评估是一次 LLM 调用。100 个用例 + 每代 10 个策略 = 每代 1000 次 LLM 调用。我们加了缓存（相同输入 → 相同分数）和"快速模式"（只评估 10 个随机用例）。但根本成本还在。
+### 接点 B：Gate-3 保留样例回归（`evolution/candidate_regression.go`、`gate3_orchestrator.go`）
+
+这才是"比较策略 A vs 策略 B"真正落地的地方——它不在 `ares_eval`，而在进化验证门的第三道。`CandidateRegressionChecker` 拿稳定的旧指令 vs 候选 diff，在同一组保留样例上跑回归，用 `ares_arena.Scorer` 打分，然后跑统计检验。默认参数就写在代码里：
+
+| 项 | 默认值 |
+|------|------|
+| `baselineRuns` / `compareRuns` | 5 |
+| `minWinRate` | 0.55 |
+| `timeout` | 30s |
+| 显著性 | p < 0.05（Welch's t-test，`Confident`） |
+
+```mermaid
+graph TD
+    C[Candidate 待验证] --> K{Kind == Instruction?}
+    K -->|否| SKIP[跳过该门]
+    K -->|是| ST[profileStore.GetStable 目标角色]
+    ST -->|无基线| SKIP2[跳过]
+    ST -->|有| T[RegressionTester.Run]
+    S[LLMArenaScorer 打分 0..1] --> T
+    T --> R[RegressionResult: OldAvg/NewAvg/PValue/WinRate]
+    R --> D{Confident 且 NewAvg < OldAvg?}
+    D -->|是| REJ[判定回归, 拒绝候选]
+    D -->|否| PASS[通过 Gate 3]
+```
+
+打分模型是 `ares_evolution/service/llm_arena_scorer.go` 的 `LLMArenaScorer`：两次 LLM 调用，先让模型按指令在保留样例上执行、再对输出在 `[0,1]` 打分。还实现了 `ScoreBatch`，把一个回归跑压成两批调用（批量执行 + 批量评分），显著减少请求数——这是网关里真实存在的成本优化。`gate3_orchestrator.go` 的 `BuildRegressionGate3/LoadRegressionGate3` 负责接线，后者在配置了 `llm.fallbacks` 时用 `FailoverClient`（主 provider + 兜底）防止单家配额耗尽拖垮整门，并为 scorer 的指数退避重试配了更宽松的熔断器（8 次/15s）。
+
+**坦诚反思**：这正是旧博客里"每代 1000 次 LLM 调用、加缓存/快模式"说法**未能对应到任何真实代码/常量**的部分 —— 我删掉了它。真实的成本优化是批量评分与失败协调器，而不是缓存或"随机 10 例"。（该说法记为待核实，原文无对应实现。）
 
 ---
 
-## Service 层
+## 诚实收尾
 
-`internal/ares_eval/service/` 通过 HTTP 暴露评估框架：
+`internal/ares_eval/` 不是一个野心勃勃的"Agent 评测平台"，而是一座小而实的打分库：Loader + Runner + 评估器 + 报告，加上一个把维度诊断桥接进证据库的 `DimensionJudgeBridge`。"比较"这件事的真实答案是 Gate-3 保留样例回归与统计显著性检验，而不是某个 `Comparison` 结构。旧博客吹的 `concurrent_runner.go`、`comparison.go`、HTTP service 层（`/eval/run` 等端点）在代码中**均不存在**，本文已剔除并如实重述。
 
-```
-service/
-├── handler.go       # HTTP handler
-├── router.go        # 路由注册
-├── service.go       # 业务逻辑
-├── repository.go    # 结果持久化
-└── types.go         # API 类型
-```
-
-端点：
-- `POST /eval/run` — 跑一个评估套件
-- `GET /eval/results/{id}` — 获取结果
-- `POST /eval/compare` — 比较两次运行
-
----
-
-## 教训
-
-评估框架是 ares 里最被低估的模块。没人会在 demo 里问"你怎么评估？"但没有它，进化只是随机变异——没有适应度函数，没有选择压力，没有改进。
-
-**最好的评估框架是让"它更好吗？"变成有数字答案的问题。** 感觉不能扩展。可复现的分数可以。
+**最好的评估框架是让"它更好吗？"变成有数字答案的问题。** 感觉不能扩展。可复现的分数可以——但前提是这些分数确实来自你写得出来的那几行代码。

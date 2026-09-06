@@ -71,6 +71,7 @@ func ProjectStep(s *engine.Step) taskfabric.PlanStep {
 		MaxRetries: maxRetries,
 		Priority:   parsePriority(s.Metadata),
 		Payload:    payload,
+		SessionID:  parseSessionID(s.Metadata),
 	}
 }
 
@@ -100,4 +101,17 @@ func parsePriority(meta map[string]string) int {
 		return 0
 	}
 	return n
+}
+
+// parseSessionID reads the "session_id" key from step metadata. A missing or
+// empty value yields "" (session-less, legacy behavior). This is how the L2
+// session root's SessionID propagates to every tool/plan node grown from it:
+// the plannerCognition stamps session_id into the node's Metadata, and
+// ProjectStep carries it into the PlanStep so CompilePlan can stamp it onto
+// the checkpoint envelope.
+func parseSessionID(meta map[string]string) string {
+	if meta == nil {
+		return ""
+	}
+	return meta["session_id"]
 }

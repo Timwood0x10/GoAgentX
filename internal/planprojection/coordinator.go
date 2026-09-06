@@ -193,10 +193,12 @@ const (
 	opCreate          = "create"
 )
 
-// reconcilePollInterval is how often the event subscription polls the hub
-// drop counter. Event-driven gap detection (sequence skip on the next
-// delivered event) cannot see drops at the TAIL of a burst — no later event
-// arrives to reveal them — so the counter poll is what converges the tail.
+// reconcilePollInterval is how long after the last delivered graph event the
+// subscription re-checks the hub drop counter. Event-driven gap detection (a
+// sequence skip on the next delivered event) cannot see drops at the TAIL of a
+// burst — no later event arrives to reveal them — so this one-shot check is
+// what converges the tail. It is armed by delivery and left stopped otherwise,
+// so an idle subscription performs no work.
 const reconcilePollInterval = 250 * time.Millisecond
 
 // SkippedOp is one incremental-compile action that could not be applied
@@ -634,10 +636,13 @@ func (c *CompileCoordinator) applyReplaceNode(ctx context.Context, dag *engine.M
 // returned function can be called to unsubscribe early (e.g. during
 // shutdown).
 //
-// Missed events are compensated, not tolerated: a sequence skip on
-// the next delivered event triggers a full Reconcile, and the hub drop
-// counter is polled (per event plus on a ticker, which catches drops at the
-// tail of a burst where no later event arrives to reveal the gap).
+// Missed events are compensated, not tolerated: a sequence skip on the next
+// delivered event triggers a full Reconcile, and the hub drop counter is
+// polled after each delivered event plus once more shortly after the last one,
+// which catches drops at the tail of a burst where no later event arrives to
+// reveal the gap. The tail check is a one-shot timer armed by delivery, not a
+// standing ticker: an idle subscription costs nothing, because a drop requires
+// a full buffer, which requires events this loop is about to receive.
 //
 // This closes the "two graphs" gap: a GraphPatchExecutor mutation on the
 // live MutableDAG reaches the task set so the next scheduler drain sees the
@@ -654,8 +659,12 @@ func (c *CompileCoordinator) SubscribeGraphEvents(ctx context.Context, dag *engi
 		var lastSeq uint64
 		var haveSeq bool
 		lastDropped := dag.DroppedEvents(subID)
-		ticker := time.NewTicker(reconcilePollInterval)
-		defer ticker.Stop()
+		// Stopped and drained: it is armed only by a delivered event.
+		tailCheck := time.NewTimer(reconcilePollInterval)
+		if !tailCheck.Stop() {
+			<-tailCheck.C
+		}
+		defer tailCheck.Stop()
 		for {
 			select {
 			case <-ctx.Done():
@@ -678,6 +687,7 @@ func (c *CompileCoordinator) SubscribeGraphEvents(ctx context.Context, dag *engi
 				if err != nil {
 					log.Error("planprojection: incremental compile failed",
 						"change", int(evt.Change.Type), "node", evt.Change.NodeID, "error", err)
+					armTailCheck(tailCheck)
 					continue
 				}
 				// Not silent: every task the compiler could not move is
@@ -688,7 +698,8 @@ func (c *CompileCoordinator) SubscribeGraphEvents(ctx context.Context, dag *engi
 						"op", s.Op, "task_id", s.TaskID, "compile_id", res.CompileID, "error", s.Err)
 				}
 				lastDropped = c.checkDrops(ctx, dag, subID, lastDropped)
-			case <-ticker.C:
+				armTailCheck(tailCheck)
+			case <-tailCheck.C:
 				lastDropped = c.checkDrops(ctx, dag, subID, lastDropped)
 			}
 		}
@@ -698,6 +709,20 @@ func (c *CompileCoordinator) SubscribeGraphEvents(ctx context.Context, dag *engi
 		dag.Unsubscribe(subID)
 		<-done
 	}
+}
+
+// armTailCheck (re)arms the tail drop check for one reconcilePollInterval. The
+// timer is only ever armed from the subscription goroutine's own select, so
+// Stop/Reset here race with nothing: the channel cannot hold a stale value the
+// loop has not already consumed.
+func armTailCheck(t *time.Timer) {
+	if !t.Stop() {
+		select {
+		case <-t.C:
+		default:
+		}
+	}
+	t.Reset(reconcilePollInterval)
 }
 
 // checkDrops polls the subscriber's hub drop counter and reconciles when it

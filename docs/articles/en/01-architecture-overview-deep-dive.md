@@ -1,4 +1,4 @@
-# ares Architecture Deep Dive (I): The Big Picture — Why Another Agent Framework? (0.3.x)
+# ares Architecture Deep Dive (I): The Big Picture — Why Another Agent Framework? (current trunk M0–M1.5)
 
 I didn't set out to build a framework. I set out to solve a problem: **Agents kept dying, and I couldn't figure out why.**
 
@@ -15,209 +15,324 @@ That's when I realized: the problem isn't "how to make an Agent call an LLM." Th
 Every Agent framework answers one question: "How do I make an Agent call an LLM?" That's the easy part. The hard questions are:
 
 1. **What happens when the Agent dies?** (Resurrection)
-2. **How does it remember what it was doing?** (State Recovery)
+2. **How does it remember what it was doing?** (Memory distillation / state recovery)
 3. **How do I know what went wrong?** (Observability)
 
-ares is built around these three questions. The core shift in 0.3.x: **no longer asking "how to make an Agent call an LLM," but asking "how to keep an Agent alive at runtime."** ARES evolved from an "Agent orchestration framework" (Leader + Sub) into a **"dynamic compute runtime for Agents"** — Agents are not orchestrated. They are scheduled.
+ares is built around these three questions. The core stance has stayed constant: **Agents are not orchestrated. They are scheduled.** This article uses the **current real code** (the tool-DAG trunk, M0/M1/M1.5 landed): the whole system has exactly **one graph type** `engine.MutableDAG`, and ReAct's `for round` loop is unfolded into nodes grown on the graph — a node = one tool execution.
 
 ---
 
-## The Architecture: Seven Layers (0.3.x)
+## The Architecture: current code
 
 ```mermaid
-graph TB
-    subgraph API ["Layer 1: API Contract"]
-        Bootstrap["Bootstrap Factory"]
-        Interfaces["AgentService / Runtime / Evolution / Arena / MemoryService / LLMService"]
+flowchart TB
+    subgraph Entry["Entry / wiring"]
+        CLI["cmd/ares: serve · peer_mode · live_dag"]
+        BSP["ares_bootstrap: Components + provide_distillation / provide_new_evolution"]
+        CFG["ares_config + detector env detection"]
     end
 
-    subgraph Kernel ["Layer 2: ARES Kernel (new in 0.3.x)"]
-        TaskFabric["Task Fabric<br/>Durable task intent + DAG deps<br/>Leases + Checkpoints"]
-        AgentFabric["Agent Fabric<br/>Disposable agent lifecycle<br/>spawn/suspend/resume/retire/kill/recover"]
-        Scheduler["Kernel Scheduler<br/>capability-aware scheduling<br/>work stealing + cooperative preemption"]
-        IPC["Agent IPC<br/>peer-mesh six primitives<br/>Send/Request/Reply/Delegate/Handoff/Subscribe"]
+    subgraph Plugin["Execution core"]
+        AG["agentfabric: Agent/Fabric + Cognition + L2Graph + DAGExecution gate"]
+        SCH["kernelscheduler: Scheduler/Run/drain + fabricAgentExecutor + buildQuantumStep"]
+        TF["taskfabric: Task/Fabric + CompileNode + checkpoint envelope"]
+        WF["workflow/engine: MutableDAG + Step + GraphEventHub + DAGPatchExecutor"]
+        PP["planprojection: CompileCoordinator (events → incremental compile/reconcile)"]
     end
 
-    subgraph Workflow ["Layer 3: Workflow"]
-        DAG["MutableDAG<br/>evolvable topology"]
-        Exec["DynamicExecutor"]
-        Checkpoint["Checkpoint Resume"]
-        GraphPatch["GraphPatchExecutor<br/>insert/remove/replace nodes"]
+    subgraph Cognition["Cognition & support"]
+        LLM["llm + llmservice: Ollama /api/chat tool-calling"]
+        TOOLS["tools/toolsource: discover/selector + resources + ares_mcp"]
+        MEM["ares_experience + ares_memory + ares_skills: distillation / long-term memory / confidence prior"]
+        REC["aresrecovery + kernelscheduler recovery path + peer restart policy"]
     end
 
-    subgraph Memory ["Layer 4: Memory → Experience"]
-        Session["Session Memory"]
-        Distilled["Experience Distillation<br/>0.3.x relocated to evolution pipeline"]
-        Retrieval["Vector Retrieval"]
-        MemConfig["Memory Config<br/>max_history, session_ttl..."]
+    subgraph EvolutionL["Evolution (L1 only)"]
+        EV2["evolution v2: GAGenerator + WorkflowGenome + Deployment"]
+        EV1["ares_evolution v1 (coexists): fitness/guardrails/gate"]
+        ARENA["ares_arena/ares_eval + evidence + feedback"]
     end
 
-    subgraph Evolution ["Layer 5: Evolution Engine"]
-        Candidate["Candidate Pipeline<br/>0.3.0 candidate release closed-loop"]
-        Verifier["Three-tier verification<br/>Static + Evidence + LLM Regression"]
-        Release["Release gate<br/>Gate 3 reconfirmation"]
-        GA["GA Population (optional)<br/>demoted to advanced feature"]
-        Evidence["Evidence<br/>structured diagnostics with evidence chains"]
+    subgraph Platform["Events / storage / cross-cutting"]
+        EVS["ares_events: EventStore + compactor + archive"]
+        STORE["storage/postgres + services/embedding"]
+        OBS["ares_observability + introspect + ares_security + ares_ratelimit + logger/errors"]
     end
 
-    subgraph Skills ["Layer 6: Capability Fabric"]
-        Catalog["SkillCatalog"]
-        SourceMgr["SourceManager"]
-        Indexer["Indexer"]
-        Discovery["Discovery Engine"]
-        Loader["Loader / Resolver"]
-        ExpPrior["Experience relevance priors"]
-    end
-
-    subgraph Infra ["Layer 7: Infrastructure"]
-        Events["EventStore<br/>full Task lifecycle events"]
-        Storage["VectorStore"]
-        LLM["LLM Adapters"]
-        Tools["Tool Registry"]
-        ActionLog["ActionLog"]
-        Chaos["Chaos / Arena"]
-    end
-
-    Bootstrap --> TaskFabric
-    Bootstrap --> AgentFabric
-    TaskFabric --> Scheduler
-    AgentFabric --> Scheduler
-    Scheduler --> IPC
-    Scheduler --> DAG
-    DAG --> Exec
-    Exec --> GraphPatch
-    Session --> Distilled
-    Distilled --> Retrieval
-    Scheduler --> Events
-    DAG --> Events
-
-    Candidate --> Verifier
-    Verifier --> Release
-    Evidence --> Verifier
-    GA -.->|optional| Candidate
-
-    Catalog --> SourceMgr
-    SourceMgr --> Indexer
-    Indexer --> Discovery
-    Discovery --> Loader
-    ExpPrior --> Discovery
-    Scheduler -.->|capability scoring| ExpPrior
+    BSP --> Plugin & Cognition & EvolutionL & Platform
+    AG --> LLM & TOOLS & MEM
+    SCH --> REC
+    TF --> EVS --> STORE
+    WF -.L1 evolution surface.-> EV2
+    EV2 -.patch constrains L1.-> WF
+    RUN2["L2 execution graph"] -.execution stats (M6).-> EV2
 ```
 
-**Layer 1: API Contract** — What the outside world sees. Interfaces only, no implementations. The Bootstrap factory wires everything together. You call `ares_bootstrap.Bootstrap()` and get a fully connected system — Kernel, Memory, Knowledge/AKG, Evolution, Storage, Embedding, MCP, Flight Recorder, EventStore — all assembled from a single config struct. 0.3.x adds `system_runtime.Orchestrator` to manage component lifecycle (Construct → Bind → Start → Ready, reverse-order Stop → Wait → Close).
-
-**Layer 2: ARES Kernel (new in 0.3.x)** — The heart of the system. Replaces the 0.2.x Leader/Sub runtime. Three pillars + IPC:
-- **Task Fabric** (`internal/taskfabric`): Durable task intent, holding capability/state/lease/checkpoint. Six core primitives: Acquire / Release / Yield / Checkpoint / Steal / Preempt. All ownership operations carry a fencing token (epoch), preventing stale-holder late writes.
-- **Agent Fabric** (`internal/agentfabric`): Disposable agent lifecycle management. Agents are peer cognitive processes (A ≡ B ≡ C); parent-child has only spawn provenance, no authority hierarchy. Process Tree ≠ Scheduling Graph.
-- **Kernel Scheduler** (`internal/kernelscheduler`): Capability-aware scheduling. `score = capability_overlap × (1 - load) × confidence`. Execution Quantum boundary yield; cooperative preemption, not OS hard preemption. Supports event-driven drain (GAP 6).
-- **Agent IPC** (`internal/agentipc`): Peer-mesh message bus, six primitives: Send / Request / Reply / Delegate / Handoff / Subscribe. Three-layer context separation: Task Shared / Agent Private / IPC Messages.
-
-**Layer 3: Workflow** — How work flows. The MutableDAG defines task dependencies, and the topology itself is evolvable. The DynamicExecutor runs them in topological order. The **GraphPatchExecutor** can insert, remove, or replace nodes at runtime — this is how DAG topology evolution works. Checkpoint Resume lets you pick up where you left off after a crash. In 0.3.x, the DAG directly serves as the scheduling source — Task A completed → B ready / C ready → Scheduler — no leader dispatch needed.
-
-**Layer 4: Memory → Experience** — What agents remember. 0.3.x relocates memory distillation to the evolution pipeline: Trace (what happened) → Experience (what it means) → Memory (formal knowledge). Candidate knowledge and formal knowledge are stored separately. An experience requires ≥2 non-failure trajectory supports to graduate. Conversations are not vector-embedded — conversation history is linear narrative, experience is networked knowledge.
-
-**Layer 5: Evolution Engine** — How agents improve themselves. The 0.3.x primary mode: **Failure → Diagnosis → Patch → Verify**. 0.3.0 candidate release closed-loop: Candidate → three-tier verification (Gate 1 Static + Gate 2 Evidence + Gate 3 LLM Regression) → Release gate (Gate 3 reconfirmation) → SetStable → Promoted. **Candidate generation is easy; shipping is hard — the release gate is what makes evolution safe.** GA is demoted to an optional advanced feature. Evidence no longer returns scalar scores but structured diagnostics with evidence chains.
-
-**Layer 6: Capability Fabric** — The framework-native skill discovery, indexing, and loading system. It's cross-cutting — the runtime (agents need skills), the workflow layer (tasks invoke skills), and the evolution engine (strategies can optimize skill selection) all use it. SkillCatalog with SourceManager aggregates multiple skill sources; the five-piece catalog toolset (skill_search/load/activate/list/experience) implements Level-0/1/2 progressive disclosure. The Experience module learns relevance priors from historical usage, so frequently used skills rank higher in discovery results.
-
-**Layer 7: Infrastructure** — What holds it all up. EventStore records everything — 0.3.x event types upgraded to full Task lifecycle (Created/Ready/Acquired/Started/Yielded/Checkpointed/Preempted/Released/Completed/Failed/Expired/Stolen). VectorStore indexes memories. LLM Adapters talk to providers. Tool Registry manages capabilities. ActionLog records execution-fact audit. Chaos/Arena does Failure Injection + Recovery Verification.
-
-### Cross-Cutting Layer: SkillCatalog / Capability Fabric
-
-In 0.3.x, the Capability Fabric's importance rose — it directly became the capability-aware scoring source for the Kernel Scheduler (`score = capability_overlap × (1 - load) × confidence`). This makes skill-first design actually work.
-
-The core is the **SkillCatalog**, which aggregates skill sources through a **SourceManager** — MCP servers, git repos, local executables, and HTTP manifests are all first-class citizens. An **Indexer** builds searchable skill indexes, a **Discovery** engine finds relevant skills at runtime, a **Loader** resolves and instantiates them, and a **Resolver** handles dependency resolution. The **Experience** module learns relevance priors from past usage, so frequently invoked skills rank higher in discovery results.
-
-The five-piece catalog toolset (`skill_search`/`skill_load`/`skill_activate`/`skill_list`/`skill_experience`) implements Level-0/1/2 progressive disclosure: even with 1000 tools, none enter context; `skill_activate` is the only moment an MCP server connection is established. The **ToolExpander** interface in the AgentLoop engine lets runtime-discovered skill names be resolved into LLM tool definitions on the fly, so agents can pick up new skills without a restart.
+**One spine threading every module.** The seven layers of 0.3.x didn't vanish; they settled onto a handful of real packages: `agentfabric` = "how an Agent lives", `kernelscheduler` = "who runs", `taskfabric` = "the task's durable intent", `workflow/engine` = "the one graph", `planprojection` = "graph → tasks". Module by module below, using real components.
 
 ---
 
-## The Design Principles
+### Two isomorphic layers: L1 capability graph ↔ L2 execution graph
 
-**1. Agents are disposable. Tasks are durable.**
+The whole system has **one graph type** `engine.MutableDAG`; evolution operators, patch executors, the event bus and the compiler all operate on it regardless of what a node holds. The only new concept is **layering**:
 
-This is the most important principle. 0.3.x upgrades it to: **Agent death ≠ Task death.** An Agent is not a precious snowflake — it's a goroutine with a heartbeat. If it dies, the Agent Fabric creates a new one, and the Task Fabric restores progress from the checkpoint. This sounds wasteful until you realize it's the only way to guarantee recovery.
+```mermaid
+flowchart LR
+    subgraph L1["L1 capability graph (durable · evolution surface)"]
+        L1N["node = ToolClass (toolName#argShape)"]
+        L1M["Metadata = enabled/budget/prior"]
+        L1P["evolution → DAGPatchExecutor → L1"]
+    end
+    subgraph L2["L2 execution graph (per-session · runtime-grown)"]
+        L2N["node = ToolInstance (one tool execution)"]
+        L2M["root = ares/root session admission"]
+        L2C["compile: planprojection → taskfabric → kernelscheduler"]
+    end
+    L1 -->|constrains growth| L2
+    L2 -->|stats → fitness| L1
+```
 
-**Honest reflection**: We considered making Agents long-lived and resilient. Tried circuit breakers, retry loops, graceful degradation. It worked — until it didn't. The problem is that you can't predict every failure mode. A goroutine leak, a deadlock, an OOM kill — no amount of defensive coding covers all of them. Making Agents disposable means any failure is recoverable, because you always have a fresh start point. The 0.3.x Execution Quantum further reinforces this: at the end of each quantum, the agent yields, the checkpoint is persisted, and even if the agent dies, the next quantum resumes from the checkpoint.
+**Every step maps to real source:** `MutableDAG` (`workflow/engine/mutable_dag.go`), `GraphEventHub` with monotonic `seq` + per-subscriber drop counters (`graph_events.go`), `DAGPatchExecutor` (`dag_patcher.go`), the nine `WorkflowGenome` operators (`evolution/genome/`), `UpdateLiveDAG` (re-points the genome, `ares_bootstrap/provide_new_evolution.go`).
 
-**2. Record everything, replay anything.**
+---
 
-Every action — LLM call, tool invocation, task assignment, memory query — is an event in the EventStore. Want to know what happened? Replay the events. Want to restore state? Replay the events. Want to debug? Replay the events.
+### The execution chain: event-driven, the graph is the plan, the fabric holds the facts
 
-**3. Plugins, not hardcoding.**
+A ReAct round unfolds into "one node per tool execution." Execution is **not** in the graph — it is in the scheduler: each node compiles into a `taskfabric` task, drained by `kernelscheduler`, run as one quantum through the agent's Cognition, and the result lands in the task's checkpoint envelope:
 
-The PluginBus lets you extend behavior without modifying core code. Checkpoint snapshots, route decisions, tool invocations — all handled by plugins. The Runtime doesn't know or care which plugins are active.
+```mermaid
+flowchart LR
+    GROW["L2Graph.AddToolNode (single AddNode with DependsOn)"]-->EVT["GraphEventHub"]
+    EVT-->COORD["CompileCoordinator.SubscribeGraphEvents ApplyChange / Reconcile (seq gap / drop)"]
+    COORD-->CT["taskfabric.CompileNode"]
+    CT-->DR["kernelscheduler.Scheduler.Run/drain"]
+    DR-->SEL["capability scoring picks winner"]
+    SEL-->EXEC["fabricAgentExecutor.ExecuteStep"]
+    EXEC-->COG["agent.Cognition (router→tool/answer/root)"]
+    COG-->Q["buildQuantumStep: Done/Yield/Fail + envelope rewrap"]
+    Q-->ENV["checkpoint envelope (Output lives in fabric)"]
+```
+
+Behind this are three real, landed chunks:
+
+- **M0 incremental compiler:** `CompileCoordinator.ApplyChange` dispatches by `ChangeType`; `SetDependencies` / `UpdatePayload` / `CompileNode` / cross-batch dependency resolution (`taskfabric/workflow_plan.go`) — no more full-batch recompiles.
+- **M1 execution bodies:** `toolCognition` / `answerCognition` / `rootCognition` all implement the same `Cognition` interface; `routerCognition` dispatches by `Task.AgentType`.
+- **M1.5 event path:** `Reconcile` compensates dropped events, the `arg.` namespace isolates tool args from envelope plumbing, and the `DAGExecution` gate (default off = legacy ReAct) selects the session graph when open.
+
+**The `DAGExecution` gate** is the transition guardrail: production defaults to `chatCognition`; opening it requires full capability advertisement + a session registry first — I won't force it before the prereqs are real.
+
+---
+
+## Module deep-dives: one component diagram per core package
+
+### agentfabric — disposable agents + injected execution bodies
+
+```mermaid
+flowchart LR
+    SP["SpawnSpec.CognitionFactory (inject at spawn)"]-->AG["Agent State: IDLE/RUNNING/SUSPENDED/RETIRED"]
+    KILL["Kill / Retire (reclaim in-flight)"]-->AG
+    GATE["DAGExecution.Enabled true→router / false→chat"]-->ROUTER["routerCognition"]
+    GATE-->CHAT["chatCognition (legacy ReAct)"]
+    ROUTER-->PLAN["planner(ares/plan)"] & TOOL["tool(tool/*)"] & ANS["answer"] & ROOT["root admission"]
+    AG-->GATE
+    L2["L2Graph = engine.MutableDAG"]-->AG
+```
+
+### kernelscheduler — the scheduling pipeline
+
+```mermaid
+flowchart LR
+    R["ReadyTasks()"]-->SC["Schedule: capability score (overlap×load×confidence)"]
+    SC-->AQ["Acquire (lease + epoch)"]
+    AQ-->FE["fabricAgentExecutor.ExecuteStep"]
+    FE-->BQ["buildQuantumStep: Done/Yield/Fail"]
+    BQ-->ENV["checkpoint envelope"]
+    LT["LoadTracker (load/confidence)"]-->SC
+    RCV["recovery-bound executor (W1) + reconcileFabricDeaths"]-->FE
+```
+
+### taskfabric — the task state machine
+
+```mermaid
+stateDiagram-v2
+    [*]-->READY: Create/CompileNode/CompilePlan
+    READY-->LEASED: Schedule+Acquire
+    LEASED-->RUNNING: RunQuantum
+    RUNNING-->SUSPENDED: Yield (checkpoint)
+    SUSPENDED-->READY: requeue / re-acquire
+    RUNNING-->COMPLETED: Done
+    RUNNING-->FAILED: retries exhausted (RetryPolicy)
+```
+
+### workflow/engine — the graph engine
+
+```mermaid
+flowchart LR
+    D["MutableDAG: AddNode/AddEdge/RemoveNode/ReplaceNode/SetNodeMetadata"]-->S["Step: ID/AgentType/Input/Metadata/DependsOn"]
+    D-->H["GraphEventHub: seq + drop + ChangeType"]
+    P["DAGPatchExecutor: Snapshot/Restore/CanApply/Apply"]-->D
+```
+
+### planprojection — graph → task compiler
+
+```mermaid
+flowchart LR
+    SUB["SubscribeGraphEvents"]-->GA["seq gap / drop → reconcile"]
+    GA-->AC["ApplyChange (dispatch by ChangeType)"]
+    GA-->RC["Reconcile (create missing / delete stale / adopt pre-existing)"]
+    AC-->P["ProjectStep → PlanStep"]
+    RC-->P
+    P-->T["taskfabric.CompileNode/CompilePlan"]
+```
+
+### evolution (v2) — the evolution pipeline
+
+```mermaid
+flowchart LR
+    GA["GAGenerator"]-->CP["CandidatePipeline"]
+    CP-->WG["WorkflowGenome nine operators"]
+    WG-->V["CandidateVerifier / RegressionChecker"]
+    V-->DEP["Deployment: Evaluate+Promote+Rollback lever"]
+    WG-->DP["DAGPatchExecutor → L1 MutableDAG"]
+    CP-->CS["CandidateStore"]
+```
+
+### ares_experience — memory distillation
+
+```mermaid
+flowchart LR
+    TR["TaskResult"]-->DS["DistillationService.Distill"]
+    DS-->EX["ExtractedExperience"]
+    EX-->EMB["EmbeddingEnqueuer → services/embedding"]
+    EX-->RANK["RankingService → RankedExperience"]
+    EX-->CR["ConflictResolver"]
+    FB["FeedbackService (bandit)"]-->RANK
+    RANK-->STORE["experience store"]
+    STORE-.ExperiencePrior on spawn.->AGENT["agentfabric.Agent"]
+```
+
+### ares_memory — the memory pipeline
+
+```mermaid
+flowchart LR
+    SRC["ConversationSource/SessionData"]-->PIPE["Pipeline"]
+    PIPE-->DIST["Distiller"]
+    PIPE-->EV["EvidenceCollector"]
+    PIPE-->MGR["MemoryManager/ProductionMemoryManager"]
+    MGR-->PATCH["MemoryPatchExecutor"]
+    PATCH-->C["MemoryConfigStore/storage"]
+```
+
+### tools/toolsource — tool discovery & retrieval
+
+```mermaid
+flowchart LR
+    SRC["ToolSource: StaticSource/RegistrySource/MultiSource"]-->DISCO["discoverToolsTool (meta-tool: runtime search + expand)"]
+    DISCO-->SEL["ToolSelector: All/Tag/CapabilitySelector"]
+    SEL-->CAP["CapabilityExtractor"]
+    CAP-->BIND["agentsyscall.BindTools → ToolBinder"]
+    MCP["ares_mcp"]-->SRC
+    RES["tools/resources builtin tools"]-->SRC
+```
+
+### aresrecovery — agent resurrection / recovery
+
+```mermaid
+flowchart LR
+    CH["Chaos: random kill fault injection"]-->RC["Recovery: restore killed agent's in-flight tasks"]
+    RC-->AT["ExecutionAttribution/ChangeAttributor"]
+    AT-->EVO["EvolutionFeedbackAdapter/EvolutionAwareIPC"]
+    EVO-->SC["DeterministicScorer + ConfidenceInjector"]
+```
+
+### ares_events — the event bus
+
+```mermaid
+flowchart LR
+    APP["EventAppender"]-->ST["EventStore/MemoryEventStore"]
+    ST-->COMP["Compactor (compress/trim)"]
+    ST-->SUM["EventSummarizer → EventSummary"]
+    ST-->ARCH["ArchiveSink (archive)"]
+    ST-->FEED["feedback / evolution evidence persistence"]
+```
+
+---
+
+## Design Principles
+
+**1. Agents are disposable; tasks are durable.**
+
+The most important rule: **agent death ≠ task death.** `aresrecovery.Recovery` restores a killed agent's in-flight tasks, and `kernelscheduler`'s recovery-bound executor (W1) binds the replacement to exactly one task — it can never hijack another READY task. Every Execution Quantum yields at the boundary; the checkpoint is on disk, so the next quantum resumes from it.
+
+**2. Record everything, replay everything.**
+
+Every action — LLM call, tool call, task assignment, memory query — is an event in `ares_events.EventStore`. `introspect` shows the live Scheduling Observatory (decisions, winners, why). Want to restore state? Replay the events.
+
+**3. The graph is the plan; the fabric holds the facts.**
+
+L2 graph nodes do **not** carry Output. Results live in the fabric task's checkpoint envelope; you read the side effects by joining `nodeID = taskID`. A writer-back that copies results onto graph nodes? That's `toolprojection`'s ghost. Two sources of truth equals zero.
 
 **4. The API layer is a contract, not an implementation.**
 
-`api/core/` defines interfaces. `internal/` implements them. `api/bootstrap/` wires them together. You can swap implementations without changing the contract. This matters when you want to test with mocks, or switch from in-memory to PostgreSQL.
+`api/core/` defines the interfaces; `internal/` implements them; `ares_bootstrap` wires them together. Swap `storage` from in-memory to PostgreSQL without touching the contract.
 
 ---
 
-## What Makes This Different
+## What's Different
 
-Most Agent frameworks are "LLM orchestration engines" — they focus on prompt chains and tool calling. ares 0.3.x is an **Agent runtime** — it focuses on keeping Agents alive in production. The core proposition shifted from "how to orchestrate Agents" to "how to schedule Agents": **Agents are not orchestrated. They are scheduled.**
+Most Agent frameworks are "LLM orchestration engines" — focused on prompt chains and tool calls. ares is an **Agent runtime**: it unfolds the ReAct loop into a graph and makes each tool execution a first-class scheduling entity. That buys the fabric's retry, preemption, lease, crash-recovery and dependency-readiness — things a tool call inside the ReAct loop never had.
 
-| Capability | Typical Framework | ares 0.3.x |
-|-----------|------------------|------|
-| Agent lifecycle | Start and hope | Agent Fabric: spawn → suspend → resume → retire → kill → recover; **Agent death ≠ Task death** |
-| Scheduling model | Leader dispatch / central orchestration | **Agents are not orchestrated. They are scheduled.** Kernel Scheduler + capability-aware work stealing + cooperative preemption |
-| State management | In-memory struct | Event sourcing + checkpoints + fencing token (epoch) |
-| Failure handling | Try/catch | Execution Quantum + checkpoint recovery + lease expiry auto-requeue |
-| Observability | Logs | Logs + Events + Metrics + Traces + Scheduling Observatory (decision records) |
-| Extensibility | Subclass | Plugin system + Capability Fabric with dynamic skill discovery |
-| Self-improvement | None | Candidate release closed-loop: Candidate → three-tier verification → Release gate → SetStable. GA demoted to optional. Evidence carries evidence chains, not scalar scores |
-| Agent communication | HTTP/gRPC/Message Queue | Agent IPC peer-mesh six primitives (Send/Request/Reply/Delegate/Handoff/Subscribe) + legacy AHP compat |
-| Skill discovery | Hardcoded tool registrations | SkillCatalog with SourceManager, Indexer, Discovery, Loader, and learned relevance priors; five-piece catalog toolset progressive disclosure |
-| Concurrency control | None or external locks | General Lease (TaskLease/ResourceLease/CapabilityLease) + fencing token |
-| Agent architecture | Hierarchical (Leader/Sub) | Peer cognitive processes (A ≡ B ≡ C), spawn is a syscall not an orchestration API |
-| Lifecycle management | Manual | system_runtime.Orchestrator: Construct → Bind → Start → Ready, reverse-order Shutdown |
+| Capability | Typical framework | ares (current) |
+|------|---------|------|
+| Agent lifecycle | launch and pray | Agent Fabric: spawn → idle → running → suspend → retire; `aresrecovery` resurrects killed agents |
+| Scheduling | leader dispatch | **Agents are not orchestrated, they are scheduled.** capability-aware kernel scheduler |
+| Tool execution | inside the ReAct loop | one tool execution = one graph node = one schedulable task (free retry/recovery/dependency-readiness) |
+| Execution structure | linear messages | two isomorphic `engine.MutableDAG`s: L1 capability (evolution) / L2 execution (session) |
+| Memory | hard-stuffed message history | `ares_experience` distillation + `ares_memory` + `ares_skills` prior, injected as ExperiencePrior at spawn |
+| Resurrection | none | `aresrecovery.Recovery` + recovery-bound executor (W1) + `Chaos` fault-injection verification |
+| Observability | logs | `ares_events` event sourcing + `introspect` decision panel + metrics |
+| Self-improvement | none | `evolution` Candidate → verify → Deployment (patches L1 only) |
+| Tool discovery | hardcoded registry | `tools/toolsource` discover_tool meta-tool + selector + `ares_mcp` |
 
 ---
 
-## The Honest Truth
+## Honest Talk
 
-This project started as a chatbot and grew into something I didn't plan. The evolution engine wasn't in any roadmap — it emerged from the question "what if Agents could optimize their own prompts?" The chaos engineering arena came from "what if I could kill an Agent and watch it recover?" The plugin system came from "what if I could add checkpoint support without touching the executor?"
+This project started as a chatbot and grew into something I didn't plan. The evolution engine came from "what if an Agent could optimize its own prompt?" The chaos arena came from "what if I could kill an Agent and watch it recover?"
 
-Each feature was born from a real problem, not a feature checklist. That's why the architecture looks the way it does — it's not designed top-down, it's evolved bottom-up.
+**The honest edges right now:**
 
-**Honest reflection**: The codebase is bigger than it needs to be. The quant trading module, the interview demo, the MCP dashboard — these are experiments that should probably live in separate repos. The core (Kernel + Workflow + Memory + Events) is solid. The periphery is still finding its shape.
+- **The tool-DAG trunk is still behind the `DAGExecution` gate, closed.** M0/M1/M1.5 are landed and green, but production peers still run `chatCognition`. Opening needs M2 session registry + M3 full capability advertisement; I won't force it early.
+- **Evolution has v1 and v2** (`ares_evolution` vs `evolution`) coexisting. The trunk only guarantees "new code targets v2 + `MutableDAG`"; the ~30 legacy v1 files are untouched — cleaning them is a separate refactor.
+- **`toolprojection` is dead code awaiting deletion.** The graph is the truth; post-hoc projection is pure redundancy. "Delete means delete" lands at M4.
+- **`taskfabric` is in-memory.** Crash recovery requires the L2 graph to be rebuildable — `TestL2Graph_RecompilesIdempotentAfterRestart` pins exactly that as a regression test.
+- **`M6` feedback (L2 results → L1 fitness) is not wired yet.** That's the last link of the evolution loop.
 
-But that's how real projects work. You don't design the perfect architecture on day one. You solve problems, accumulate code, and occasionally stop to refactor. The refactoring we did in v0.3.x — Leader/Sub → Kernel, AHP → Agent IPC, memory distillation relocation, candidate release closed-loop — was one of those "stop and clean up" moments. The core philosophy of 0.3.x shifted from "Agent orchestration" to "Agent runtime" — this wasn't planned, it was forced by real problems.
+Every feature came from a real problem, not a feature checklist. That's why the architecture looks like this — not top-down designed, bottom-up evolved.
 
 ---
 
-## What's Next
+## The Series
 
-This series walks through each layer in detail:
+| # | Topic | What you'll learn |
+|---|------|-------------|
+| I | **This article** | Big picture + two isomorphic MutableDAGs + all-module breakdown |
+| II | Agent Harmony Protocol | how agents communicate |
+| III | Memory Distillation | how `ares_experience`/`ares_memory` remember and forget |
+| IV | Workflow Engine | `workflow/engine.MutableDAG`: how tasks flow and evolve in the DAG |
+| V | Tool Layer | how `tools/toolsource` discovers, retrieves and binds tools |
+| VI | Security & Observability | how `ares_events`/`introspect` show what happened |
+| VII | Runtime & Lifecycle | how an Agent lives, dies, and is resurrected |
+| VIII | Event System | how state is recorded and recovered |
+| IX | Arena / Fault Injection | how `aresrecovery.Chaos` breaks things then verifies recovery |
+| X | Retrieval | how relevant memory is found |
+| XI | Autonomous Evolution | how `evolution` patches L1 and ships |
+| XIII | Bootstrap & API | how `ares_bootstrap` wires without pain |
+| XV | MCP Integration | how `ares_mcp` teaches an Agent to use tools |
+| 19 | Storage layer | `storage/postgres` + `services/embedding` |
+| 20 | LLM client layer | `llm` failover, multi-provider abstraction |
+| 21 | Evaluation framework | `ares_eval` EvaluatorRegistry / LLMJudge |
 
-| # | Topic | What You'll Learn |
-|---|-------|-------------------|
-| I | **This article** | The big picture |
-| II | Agent Harmony Protocol | How agents communicate |
-| III | Memory Distillation | How agents remember and forget |
-| IV | Workflow Engine | How tasks flow through a DAG |
-| V | Tool Invocation Layer | How agents use tools |
-| VI | Security & Observability | How to see what's happening |
-| VII | Runtime & Lifecycle | How agents live and die |
-| VIII | Event System | How state is recorded and recovered |
-| IX | Arena / Fault Injection | How to break things deliberately |
-| X | Retrieval System | How to find relevant memories |
-| XI | Autonomous Evolution | How agents improve themselves |
-| XII | Security Hardening | How to defend against threats |
-| XIII | Bootstrap & API Layer | How to wire without pain |
-| XIV | Plugin System | How to extend without touching |
-| XV | MCP Integration | How to teach agents to use tools |
-| XVI | Flight Recorder | How to record and replay execution |
-| 00 | **SkillCatalog & Capability Fabric** | Framework-native skill discovery, indexing, and loading — MCP servers, git repos, local executables, HTTP manifests |
-| 00 | **SDK Layer** | One line of code to start an agent; bootstrap_runtime, team orchestration, event-driven distillation |
-| 00 | **Knowledge Graph Build** | From markdown to 27K edges (AKG) |
-| 00 | **Storage Layer** | postgres/embedding/models/query/repositories/services |
-| 00 | **LLM Client Layer** | Failover, DeepSeek Reasoning, multi-provider abstraction |
-| 00 | **Evaluation Framework** | EvaluatorRegistry, LLMJudge, Bench |
-| 00 | **Config System** | ares.yaml schema, YAML-driven flags |
-| 00 | **Quant Trading Module** | The experiment we keep honest about |
+Every article follows the same pattern: **Problem → Design Journey → Trade-offs → Honest Reflection.**
 
-Each article follows the same pattern: **the problem → the design journey → the trade-offs → the honest reflection.**
-
-No marketing. No "10x faster than X." Just engineers talking about engineering.
+No marketing. No "10x faster than X." Just engineers talking engineering.

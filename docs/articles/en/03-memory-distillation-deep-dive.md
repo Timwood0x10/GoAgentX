@@ -1,1013 +1,559 @@
-# ares Architecture Deep Dive (III): Memory Distillation — When the Agent Learns to Forget and Refine (0.3.x)
+# ares Architecture Deep Dive (III): Memory Distillation — How Experience Is Extracted, Ranked, Reused, and Forgotten
 
-> Ever used one of those chatbots? After 50 rounds it starts rambling because the context window is bursting at the seams.
-> What's more frustrating is: it just helped you solve one problem, and the next time you encounter something similar — it starts reasoning from scratch all over again.
-> I thought to myself: **When in doubt, add a middle layer. One layer not enough, add another. What about giving term frequency analysis a try?**
-> And so Memory Distillation was born — teaching the Agent to forget and refine.
->
-> 0.3.x update: Memory distillation relocated to the evolution pipeline. The data flow is now **Trace (what happened) → Experience (what it means) → Memory (formal knowledge)**. Candidate knowledge and formal knowledge are stored separately. An experience requires ≥2 non-failure trajectory supports to graduate.
+> Ever run an agent that, after a few hours, tries to remember every task / input / output it ever saw, and the memory only grows while the thing actually worth remembering — "I hit this trap last time" — gets lost in the noise?
+> I kept thinking: **instead of remembering "what happened," remember "what it means and what to do next time."**
+> And that produced this whole pile: one pipeline that distills task results into reusable `Experience`, one that distills conversations into `Memory`, and one that records task-pattern → skill relevance priors as `Experience`. They're all named "experience," but they're three different jobs.
+
+> Reading note: this article only describes symbols and flows that genuinely exist in the current repo and that I could verify. Anything I couldn't find in the code is explicitly marked **（待核实 / unverified)** — I won't fabricate an "architecture that should exist."
 
 ---
 
-## 1. Term Frequency Analysis: The First Instinct
+**Series Navigation**
 
-Let me start with the detour I took.
+| # | Topic | Status |
+|---|-------|--------|
+| 03 | Memory Distillation: Experience distillation / Memory distillation / Skill priors | This article |
+| 04 | Workflow Engine (preview) | Next |
 
-There are many ways to solve the "memory explosion" problem. My first thought wasn't a three-layer architecture — it was **term frequency analysis**. The idea was simple:
+---
 
-> Break the Agent's conversation history into words, and count which words appear most often. High frequency = this topic comes up often = worth remembering.
+## 1. Get One Thing Straight: ares Has THREE "Distillation" Tracks
 
-It's intuitive, right? Isn't that how humans summarize experiences too — "The user keeps asking about database slowness lately, so this must be a high-frequency lesson." I hacked together an extremely simple version back then:
+The package names all look like "experience / memory," but they're three unrelated pipelines. Don't mix them up:
+
+1. **Experience distillation** (`internal/ares_experience`): distills a **task execution result** (`TaskResult`) into a reusable, rankable, feedback-driven `Experience`. This is the star of this article.
+2. **Memory distillation** (`internal/ares_memory/distillation` + `pipeline.go`): distills a **conversation** into classified `Memory` (knowledge/preference/interaction/profile), producing reports and pushing.
+3. **Skill priors** (`internal/ares_skills`): remembers "task-pattern → skill relevance" priors, used as a confidence source by the scheduler.
+
+They share the word "experience" but differ in inputs, outputs, and lifecycles. Walk through them one by one — **only what I read in the code.**
+
+---
+
+## 2. Experience Distillation: From TaskResult to Experience
+
+### 2.1 Entry Point: Task Completed / Failed Events
+
+Experience distillation isn't `call`-ed by someone directly — it runs on an **event-subscription loop**. `subscribeDistillationEvents` in `internal/ares_bootstrap/bootstrap_steps.go` subscribes to two event types:
+
+- `EventTaskCompleted`
+- `EventTaskFailed`
+
+For each event it hands `HandleTaskCompletedForDistillation` to the same loop. The real entry, in intent:
 
 ```go
-type KeywordExtractor struct {
-    stopwords map[string]bool  // "的"、"了"、"是"、"好的"、"谢谢"……
-}
+// internal/ares_bootstrap/provide_distillation.go (excerpt)
+func HandleTaskCompletedForDistillation(ctx context.Context, svc *aresexp.DistillationService, ev *ares_events.Event) {
+    taskText   := stringField(p, ares_events.EventKeyTask)
+    resultText := stringField(p, ares_events.EventKeyResult)
+    tenantID   := stringField(p, ares_events.EventKeyTenantID)
+    agentID    := stringField(p, "agent_id")
+    usedExpID  := stringField(p, ares_events.EventKeyUsedExperienceID)
 
-func (e *KeywordExtractor) Extract(ctx context.Context, messages []Message) ([]Keyword, error) {
-    freq := make(map[string]int)
-    for _, msg := range messages {
-        for _, word := range tokenize(msg.Content) {
-            if !e.stopwords[word] {
-                freq[word]++
-            }
-        }
+    // content-length guard: task < 10 chars or result < 20 chars → skip
+    if tenantID == "" || len(taskText) < 10 || len(resultText) < 20 {
+        return
     }
 
-    // Sort by frequency, take top-K
-    var keywords []Keyword
-    for word, count := range freq {
-        keywords = append(keywords, Keyword{Word: word, Freq: count})
+    taskResult := &aresexp.TaskResult{
+        Task: taskText, Result: resultText,
+        TenantID: tenantID, AgentID: agentID,
+        UsedExperienceID: usedExpID,
+        Success: ev.Type == ares_events.EventTaskCompleted,
     }
-    sort.Slice(keywords, func(i, j int) bool {
-        return keywords[i].Freq > keywords[j].Freq
-    })
-    if len(keywords) > 10 {
-        keywords = keywords[:10]
+    if _, err := svc.Distill(ctx, taskResult); err != nil {
+        log.Warn("bootstrap: distillation on task completion failed", "error", err)
     }
-    return keywords, nil
 }
 ```
 
-This code looks pretty silly now, but at the time I thought it was beautiful — O(n) scan, one `map[string]int` does it all, no LLM needed, no database, not even a network request. In the early "get it running first" phase of the project, this simple and crude approach was irresistibly tempting.
+The input struct `TaskResult` lives in `internal/ares_experience/task_result.go`:
 
-But after running it for a while, all the problems surfaced.
-
-### High Frequency ≠ Importance
-
-Term frequency only looks at "how many times something appears." In Agent conversations, the most frequent words are always these:
-
-```
-"Hello" → opening line for every round
-"OK" → user's confirmation reply
-"Thanks" → closing remarks
-"Please help me" → polite prefix for every request
-
-Even with a stop word list filtering them out, genuinely valuable concepts — like "database connection pool," "index optimization," "query timeout" — appear an order of magnitude less frequently than "OK." All you can tell is "which words appear often," not "what problem the user encountered and how the Agent solved it."
-
-### Loss of Semantic Structure
-
-Term frequency flattens dialogue into a bag of words, completely losing the conversation's "problem → solution" mapping:
-
-```
-User: "Database query timed out"
-Agent: "Checked the indexes, found a missing composite index, created it"
-
-Term frequency tells you:
-"database"×2 → "query"×1 → "timeout"×1 → "index"×2 → "check"×1 → "create"×1
-
-But you don't know:
-"Database query timeout" is the problem
-"Missing composite index" is the cause
-"Created it" is the solution
+```go
+type TaskResult struct {
+    Task             string // task description (the distillation input text)
+    Context          string // extra context
+    Result           string // the task output/result
+    Success          bool   // whether the task succeeded
+    AgentID          string
+    TenantID         string // multi-tenant isolation
+    UsedExperienceID string // experience used by this execution (reinforcement tracking)
+}
 ```
 
-The most valuable part of a conversation — the causal chain of **"what the user encountered → what the Agent did"** — gets completely flattened by the bag-of-words model. And this is the core of experience reuse: you need to know that "a missing index caused a timeout, and creating a composite index fixed it," not that "the word 'index' appeared twice."
+> Key clarification: **both successful and failed tasks participate in distillation.** The doc comment states: "Both successful and failed tasks are eligible: successful tasks yield success experiences, while failed tasks yield failure experiences." So "only successful tasks are distilled" is wrong.
 
-### Cannot Support Semantic Retrieval
+### 2.2 Main Flow: Distill
 
-The most fatal limitation of the term frequency approach: you can't search using natural language semantics.
-
-User asks: "Database is slow again, any ideas?"
-
-The term frequency matching logic is: split words → find common high-frequency words → score. "Database" matches, but "slow" vs "timeout" don't match because the surface forms are different. Technically you could use Word2Vec for word vector expansion, but the training and maintenance costs are several times higher than just using LLM embeddings directly — using term frequency for retrieval is essentially using Naive Bayes for semantic understanding, and the ceiling is too low.
-
-### Lessons Learned
-
-The reason term frequency analysis didn't work boils down to one sentence: **What Agent memory needs to solve isn't "which words appeared," but "which experiences are worth reusing."**
-
-These two questions differ by a dimension. The former is a statistical problem, the latter is a semantic problem. Using statistical tools to solve semantic problems is like using a kitchen knife to turn a screwdriver — it's not that you can't do it, but you'll ruin the screw in the process.
-
-That's why I went back to fundamentals and rethought: what does an Agent actually need to remember?
-
----
-
-## 2. Let's Talk Pain Points First
-
-The first thing I ran into when running Agents myself wasn't about "not being smart enough" — it was memory explosion.
-
-An Agent runs for a few hours and accumulates thousands of conversation messages. Stuff all of that into the LLM's context? Is 1M context window meant for this? Tokens burn through like crazy, responses get slower and slower, and eventually it's practically unusable.
-
-But that's not what annoyed me the most. What annoyed me most was: **The Agent just solved one problem, and the next time it encounters something similar, it starts reasoning from scratch.**
-
-Have you experienced these scenarios?
-
-1. **Context Bloat**: After 50 rounds, the prompt is crammed with history, token consumption skyrockets, responses are slow as a snail
-2. **Experience Not Reusable**: Just fixed a complex bug, next user asks something similar — the Agent starts reasoning from scratch
-3. **Crash Amnesia**: Agent crashes and restarts automatically, user asks "where were we?", Agent: 😶
-4. **Retrieval Noise**: Vectorize all conversations and dump them into the database, recall is full of irrelevant old chat records
-
-I thought to myself: **This can't go on.** What the Agent needs to remember isn't the conversation itself, but the experiences extracted from the conversation. And so Memory Distillation was born.
-
----
-
-## 3. Three-Layer Memory Architecture
-
-The core of the entire memory system is a three-layer architecture, where each layer is more refined, more persistent, and more expensive than the one before:
+`DistillationService` (`internal/ares_experience/distillation_service.go`) exposes the core method `Distill`, whose pipeline looks like this:
 
 ```mermaid
-graph LR
-    subgraph "Session Memory"
-        SM1[Sliding Window]
-        SM2[TTL Expiry]
-        SM3[Not Persistent]
-        SM4[Max 100 Entries]
-        SM5[Pure In-Memory]
-    end
-    subgraph "Task Memory"
-        TM1[Execution Records]
-        TM2[TTL Expiry]
-        TM3[Persistable]
-        TM4[Max 1000 Entries]
-        TM5[Memory / DB]
-    end
-    subgraph "Distilled Memory"
-        DM1[Structured Knowledge]
-        DM2[Vector Embeddings]
-        DM3[LRU Eviction]
-        DM4[Max 5000 Entries]
-        DM5[pgvector]
-    end
-    SM --> TM --> DM
+flowchart LR
+    EV[EventTaskCompleted<br/>EventTaskFailed] --> SUB[subscribeDistillationEvents loop]
+    SUB --> HANDLE[HandleTaskCompletedForDistillation]
+    HANDLE --> D[DistillationService.Distill]
+    D --> GUARD[ShouldDistill guard<br/>nil→false / lenTask>=10 / lenResult>=20]
+    GUARD -->|fails| SKIP[return skipped error]
+    GUARD -->|passes| EX[extractExperience<br/>LLM Generate<br/>30s timeout]
+    EX --> LE[ExtractedExperience<br/>Problem / Solution / Constraints]
+    LE -->|Problem or Solution empty| ERR[invalid extracted experience]
+    LE --> ST[build storage_models.Experience<br/>Type=success/failure]
+    ST -->|default, no enqueuer| SYNC[embedAndCreate<br/>sync embed + Create]
+    ST -->|WithEmbeddingEnqueuer| ASYNC[Create row<br/>enqueueEmbeddingBackfill]
+    ASYNC -->|enqueue fails, fallback| FB[backfillEmbedding sync]
+    SYNC --> OUT[expToExperience returns *Experience]
+    FB --> OUT
 ```
 
-**Design Philosophy**: Not all data needs distillation, and not all experiences need vectorization.
+Real, verifiable points inside `Distill`:
 
-These three layers solve different problems:
-- **Session Memory**: Current conversation context. Equivalent to a human's "short-term working memory," used and discarded
-- **Task Memory**: Single execution record. Remembers which tasks the Agent performed and what the inputs/outputs were
-- **Distilled Memory**: Reusable experience. Extracts structured "problem → solution" knowledge from tasks
-
-Each layer performs a transformation of **getting smaller, getting better, getting more persistent**.
-
----
-
-## 4. MemoryManager Interface: Unified Abstraction
-
-The three layers of memory functionality are abstracted into the `MemoryManager` interface, defined in `internal/ares_memory/manager.go` (0.2.x was `internal/memory/`, 0.3.x relocated to `ares_memory`):
+**The gate `ShouldDistill`** — only looks at content length, not success:
 
 ```go
-type MemoryManager interface {
-    // ── Session Layer ──
-    CreateSession(ctx context.Context, userID string) (string, error)
-    AddMessage(ctx context.Context, sessionID, role, content string) error
-    GetMessages(ctx context.Context, sessionID string) ([]Message, error)
-    DeleteSession(ctx context.Context, sessionID string) error
-    BuildContext(ctx context.Context, input, sessionID string) (string, error)
-
-    // ── Task Layer ──
-    CreateTask(ctx context.Context, sessionID, userID, input string) (string, error)
-    UpdateTaskOutput(ctx context.Context, taskID, output string) error
-    DistillTask(ctx context.Context, taskID string) (*models.Task, error)
-
-    // ── Experience Layer ──
-    StoreDistilledTask(ctx context.Context, taskID string, distilled *models.Task) error
-    SearchSimilarTasks(ctx context.Context, query string, limit int) ([]*models.Task, error)
-
-    // ── Lifecycle ──
-    Start(ctx context.Context) error
-    Stop(ctx context.Context) error
-    SetEventStore(store events.EventStore, streamID string)
-}
-
-This interface design has several noteworthy points:
-
-**Clear Layer Separation**: CreateSession/AddMessage/GetMessages operate on sessions, CreateTask/UpdateTaskOutput operate on tasks, DistillTask/SearchSimilarTasks operate on experiences. Upper-layer code only needs to care about the functionality it requires.
-
-**Distillation is Explicit**: `DistillTask` and `StoreDistilledTask` are two independent steps. Callers can choose between lightweight extraction or full distillation as needed.
-
-**Event Sourcing Integration**: `SetEventStore` connects the memory system to the event bus, emitting events for all key operations.
-
-This interface has two implementations:
-
-| Feature | memoryManager | ProductionMemoryManager |
-|---------|--------------|------------------------|
-| Use Case | Dev/Test/Single Machine | Production/Multi-tenant/HA |
-| Session Storage | In-memory map | In-memory cache + PostgreSQL conversations |
-| Task Storage | In-memory map | PostgreSQL task_results |
-| Distillation Engine | Optional injection | WriteBuffer + async embedding |
-| Vector Search | Cosine similarity calculation | pgvector hybrid search (vector + BM25) |
-| Multi-tenancy | Not supported | TenantGuard |
-| Session ID | Timestamp + userID | crypto/rand 12 bytes → hex |
-
----
-
-## 5. Session Memory: Short-Term Working Memory
-
-Session Memory is the thinnest layer. When an Agent starts a conversation, it creates a Session and appends messages one by one.
-
-Implementation in the `internal/ares_memory/context` package:
-
-```go
-type SessionMemory struct {
-    sessions    map[string]*Session
-    mu          sync.RWMutex
-    maxSessions int
-    sessionTTL  time.Duration
-}
-
-type Session struct {
-    ID        string
-    UserID    string
-    Messages  []Message
-    CreatedAt time.Time
-    TTL       time.Duration
+func (s *DistillationService) ShouldDistill(ctx context.Context, task *TaskResult) bool {
+    if task == nil { return false }
+    if len(task.Task) < 10  { return false }
+    if len(task.Result) < 20 { return false }
+    return true
 }
 ```
 
-The core behavior is straightforward:
-
-- **Message Appending**: `AddMessage` appends to the Messages slice
-- **Sliding Window**: `BuildContext` only returns the last N messages (`MaxHistory`, default 10)
-- **TTL Expiry**: A background goroutine periodically scans and deletes sessions exceeding `SessionTTL` (default 24h)
-- **Pure In-Memory Storage**: Not persisted, lost on system restart
-
-There's an interesting detail here: `BuildContext` uses a sliding window when constructing context, not a simple truncation. This means even if a session has 100 messages, the LLM always receives only the latest 10. Older context naturally gets "forgotten."
+**LLM extraction `extractExperience`** — builds a "return Problem/Solution/Constraints" prompt, calls `llmClient.Generate` (30s timeout), then `parseExtractionResponse` parses line-by-line into `ExtractedExperience`:
 
 ```go
-func (sm *SessionMemory) BuildContext(ctx context.Context, input, sessionID string) (string, error) {
-    session, ok := sm.sessions[sessionID]
-    if !ok {
-        return input, nil
-    }
-
-    session.mu.RLock()
-    defer session.mu.RUnlock()
-
-    // Sliding window: only take the last maxHistory entries
-    start := 0
-    if len(session.Messages) > sm.maxHistory {
-        start = len(session.Messages) - sm.maxHistory
-    }
-    relevant := session.Messages[start:]
-
-    // Concatenate into context string
-    var sb strings.Builder
-    for _, msg := range relevant {
-        sb.WriteString(fmt.Sprintf("%s: %s\n", msg.Role, msg.Content))
-    }
-    sb.WriteString(fmt.Sprintf("user: %s\n", input))
-
-    return sb.String(), nil
+type ExtractedExperience struct {
+    Problem     string
+    Solution    string
+    Constraints string
 }
 ```
 
----
-
-## 6. Task Memory: Execution Logs
-
-Task Memory records the complete information of a single Agent execution: what the user input and what the Agent output.
+**Experience type** — decided by `task.Success`:
 
 ```go
-type TaskEntry struct {
-    TaskID    string
-    SessionID string
-    UserID    string
-    Input     string
-    Output    string
-    CreatedAt time.Time
-    TTL       time.Duration
+expType := ExperienceTypeFailure   // "failure"
+if task.Success { expType = ExperienceTypeSuccess }  // "success"
+```
+
+**Persistence / vectors** — two legs (the `/a2` async backfill option):
+
+- Default (no `EmbeddingEnqueuer` injected): `embedAndCreate` embeds synchronously and `Create`s the row with its vector.
+- With `WithEmbeddingEnqueuer`: writes the row first (`Embedding` stays NULL), then `enqueueEmbeddingBackfill` drops a backfill task onto the queue; an embedding worker writes the vector back asynchronously. If the enqueue fails, it logs a Warn and falls back to synchronous backfill so the row never sits without a vector.
+
+The interface (defined in the consuming package so `DistillationService` doesn't depend on the concrete postgres queue):
+
+```go
+type EmbeddingEnqueuer interface {
+    Enqueue(ctx context.Context, task *EmbeddingTask) error
+}
+
+type EmbeddingTask struct {
+    TaskID   string // i.e. the experience row id; the vector is written back here
+    Content  string
+    TenantID string
+    Model    string
+    Version  int
 }
 ```
 
-The key method of the task layer is `Distill()` — it's the entry point of the entire distillation pipeline:
+There's also a batch entry `DistillBatch(ctx, []*TaskResult)`: distills each one; a single failure is logged and skipped, the rest continue.
 
-```go
-func (tm *TaskMemory) Distill(ctx context.Context, taskID string) (*models.Task, error) {
-    entry, exists := tm.tasks[taskID]
-    if !exists {
-        return nil, ErrTaskNotFound
-    }
+> Two behaviors I verified: ① the async backfill is **optional** (bootstrap configures it by default); a zero-config SDK caller still goes synchronous. ② both paths stamp `EmbeddingModel` / `EmbeddingVersion` (version from `embeddingConfig.DefaultVersion`, falling back to `postgres.DefaultEmbeddingConfig().DefaultVersion` when unset).
 
-    task := &models.Task{
-        TaskID: entry.TaskID,
-        Payload: map[string]any{
-            "input":   entry.Input,
-            "output":  entry.Output,
-            "user_id": entry.UserID,
-        },
-        CreatedAt: entry.CreatedAt,
-    }
-    return task, nil
-}
-```
+### 2.3 The Domain Model: What an Experience Looks Like
 
-This `Distill()` itself is very lightweight — it just packages the raw data into `models.Task`. The real "distillation" (refinement, structuring, vectorization) happens in the upper-layer calls.
-
-In `memoryManager` (the in-memory version), the complete flow of `DistillTask` is:
-
-1. Call `taskMemory.Distill()` to get raw data
-2. Emit `EventMemoryDistilled` event
-3. Return `*models.Task`
-
-```go
-func (m *memoryManager) DistillTask(ctx context.Context, taskID string) (*models.Task, error) {
-    m.mu.RLock()
-    defer m.mu.RUnlock()
-
-    if m.stopped {
-        return nil, ErrMemoryStopped
-    }
-
-    task, err := m.taskMemory.Distill(ctx, taskID)
-    if err != nil {
-        return nil, err
-    }
-
-    m.emitEvent(ctx, events.EventMemoryDistilled, map[string]any{
-        "task_id":      taskID,
-        "session_id":   task.Metadata["session_id"],
-        "input_count":  len(task.Payload["input"].(string)),
-        "output_count": len(task.Payload["output"].(string)),
-    })
-
-    return task, nil
-}
-```
-
----
-
-## 7. Distilled Memory: Experience Refinement
-
-This is the most valuable part of the entire memory system. After distillation, the data is no longer raw messages, but structured `Experience`.
-
-Defined in `internal/ares_memory/distillation/distiller.go`:
+The `Experience` returned by the service is defined in `internal/ares_experience/ranked_experience.go` (mirrors the stored row):
 
 ```go
 type Experience struct {
     ID               string
-    Problem          string           // The user's problem/request
-    Solution         string           // The Agent's solution
-    Confidence       float64          // Confidence [0, 1]
-    ExtractionMethod ExtractionMethod // Extraction method: direct / summary / pattern
-    TenantID         string
-    UserID           string
-    Vector           []float64        // Vector embedding
-    Metadata         map[string]any
+    TenantID         string    // multi-tenant isolation
+    Type             string    // "success" or "failure"
+    Problem          string    // abstract problem statement (also the embedding target)
+    Solution         string    // concise solution
+    Constraints      string    // important constraints/context
+    Embedding        []float64
+    EmbeddingModel   string
+    EmbeddingVersion int
+    Score            float64   // overall score (bandit feedback signal; RecordFailure lowers it)
+    Success          bool      // whether the original task succeeded
+    AgentID          string    // agent that produced it
+    UsageCount       int       // times successfully used (reinforcement signal)
+    DecayAt          time.Time // expiry; zero = never expires
     CreatedAt        time.Time
 }
+```
 
-type ExtractionMethod string
+Three design decisions genuinely in the code here: **Problem/Solution/Constraints separation**, **Score as a feedback-mutated score**, and **UsageCount as a reuse reinforcement signal**.
 
+---
+
+## 3. The Feedback Loop: FeedbackService (bandit)
+
+Experiences don't just sit after being stored. `FeedbackService` (`feedback_service.go`) feeds task outcomes back into the loop:
+
+```go
+// a task succeeded using an experience → usage count +1
+func (s *FeedbackService) RecordSuccess(ctx, tenantID, experienceID) error {
+    return s.experienceRepo.IncrementUsageCount(ctx, tenantID, experienceID)
+}
+
+// a task failed using an experience → rank drops (Score goes down)
+func (s *FeedbackService) RecordFailure(ctx, tenantID, experienceID) error {
+    return s.experienceRepo.DecrementRank(ctx, tenantID, experienceID)
+}
+
+// convenience: dispatch to the two above by success flag
+func (s *FeedbackService) RecordFeedback(ctx, tenantID, experienceID string, success bool) error
+```
+
+One sentence for the code logic: **used successfully once → UsageCount+1; used and failed once → Score drops (DecrementRank).** This yields two independent signals for ranking.
+
+---
+
+## 4. Ranking: RankingService (multi-signal weighting)
+
+Experiences aren't enough by themselves — after recall you have to order them. `RankingService` (`ranking_service.go`) implements a "lightweight bandit" multi-signal scoring.
+
+Formula (confirmed in both comments and implementation):
+
+```
+FinalScore = SemanticScore + UsageBoost + RecencyBoost + persisted Score
+where:
+  UsageBoost   = min( log(1 + usage_count) * UsageWeight , 0.2 )
+  RecencyBoost = exp( -age_days / RecencyDays ) * RecencyWeight
+```
+
+Defaults are hardcoded in `NewRankingService` / `DefaultRankingWeights`:
+
+| Param | Default | Meaning |
+|-------|---------|---------|
+| UsageWeight | 0.05 | boost coefficient per log usage |
+| RecencyWeight | 0.05 | boost coefficient for recent experiences |
+| RecencyDays | 30.0 | decay half-life (days) |
+
+Real code excerpt (`Rank` scores each experience):
+
+```go
+func (s *RankingService) Rank(ctx context.Context, experiences []*Experience, baseScores []float64) ([]*RankedExperience, error) {
+    // error when len(experiences) != len(baseScores)
+    ...
+    finalScore := semanticScore + usageBoost + recencyBoost + exp.Score
+    ranked[i] = &RankedExperience{
+        Experience:      exp,
+        FinalScore:      finalScore,
+        SemanticScore:   semanticScore,
+        UsageBoost:      usageBoost,
+        RecencyBoost:    recencyBoost,
+        ConflictChecked: false,
+    }
+    ...
+    sort.Slice(ranked, func(i, j int) bool { // descending by FinalScore
+        return ranked[i].FinalScore > ranked[j].FinalScore
+    })
+}
+```
+
+Real boost implementations:
+
+- `calculateUsageBoost`: `log1p(usageCount) * weight`, capped at `0.2`, so old experiences can't dominate by sheer count.
+- `calculateRecencyBoost`: `exp(-ageDays/recencyDays) * weight`, 30-day half-life, naturally aging out.
+
+`RankedExperience` carries two booleans reserved for conflict detection:
+
+```go
+type RankedExperience struct {
+    Experience       *Experience
+    FinalScore       float64
+    SemanticScore    float64
+    UsageBoost       float64
+    RecencyBoost     float64
+    ConflictChecked  bool
+    ConflictResolved bool // if true, this one was chosen as best in its conflict group
+}
+```
+
+---
+
+## 5. Conflict Resolution: ConflictResolver (Store Simply, Retrieve Smartly)
+
+`ConflictResolver` (`conflict_resolver.go`) embodies one principle: **"Store Simply, Retrieve Smartly."**
+
+It does NOT dedupe at write time; instead it does lazy conflict grouping **after recall/ranking**. Two steps:
+
+1. `DetectConflictGroups`: clusters experiences by **cosine similarity of their problem vectors** (O(K²) single-link), grouping any pair above the threshold. Default threshold `0.9` (`problemSimilarityThreshold` in `NewConflictResolver`).
+2. `Resolve`: within each group, keeps the highest-`FinalScore` one, and marks the others `ConflictResolved` (only the winner gets `true`).
+
+```mermaid
+flowchart LR
+    RANK[RankingService.Rank<br/>→ ranked list] --> RES[ConflictResolver.Resolve]
+    RES --> GROUPS[DetectConflictGroups<br/>cosine sim > threshold=0.9<br/>O(K²) single-link]
+    GROUPS --> BEST[per group: keep highest FinalScore]
+    BEST --> WIN[return: one best experience per group]
+    BEST --> MARK[others marked ConflictChecked=true<br/>winner marked ConflictResolved=true]
+```
+
+Real-code essentials:
+
+```go
+func (c *ConflictResolver) cosineSimilarity(vec1, vec2 []float64) float64 {
+    if len(vec1) != len(vec2) { // dimension mismatch → 0
+        return 0.0
+    }
+    // standard dot / (|v1|*|v2|)
+}
+
+func (c *ConflictResolver) Configure(problemSimilarityThreshold float64) error {
+    // must be 0 < threshold <= 1, else error
+}
+```
+
+> Default threshold is `0.9` (overridable via `Configure`). Note this is a **different conflict mechanism** from `internal/ares_memory/distillation`'s `DistillationConfig.ConflictThreshold = 0.85` — one is the experience-ranking layer (ares_experience), the other is the conversation-distillation layer (ares_memory/distillation). Don't confuse them.
+
+---
+
+## 6. Evolution Guidance & Spawn Priors: How Experience Flows Downstream
+
+The experiences produced have two downstream paths, both wired in `internal/ares_bootstrap/provide_distillation.go`.
+
+### 6.1 Path A: Feeding the Evolution Algorithm (GA) as Guidance
+
+Bootstrap builds an `evolution.FuncGuidanceProvider` that turns the experience store into the GA's "hint source":
+
+- `HintsFunc`: calls `fetchExperiences` — preferably embeds the task type and does a semantic vector search (`Embed(taskType)` → `SearchByVector`), falling back to `SearchByKeyword`; maps hits into `evolution.EvolutionHint` (Problem/Solution/Constraints/Confidence).
+- `RecordFunc`: `recordStrategyOutcome` — writes back the real GA strategy result as an experience, closing the **Strategy → Experience → Guidance** loop. Failures return errors, never silently swallowed.
+
+In other words: **an agent's last success/failure becomes the hint for the next evolutionary mutation.** Here `Confidence` comes from the experience's `Score`, clamped to [0,1].
+
+### 6.2 Path B: Injecting Into a New Agent's Cognitive Context (Spawn prior)
+
+In `internal/agentfabric/lifecycle.go`, `SpawnSpec` has a field `ExperiencePrior any`:
+
+```go
+type SpawnSpec struct {
+    // ...
+    // ExperiencePrior is the distilled prior experience, loaded as the agent's
+    // initial cognitive context at spawn time (written into CognitiveState.Context)
+    // so the agent starts with reusable experience instead of a blank slate.
+    // Nil = no prior (zero-value usable).
+    ExperiencePrior any
+}
+```
+
+And the matching logic in `Fabric.Spawn` (G1: memory-distill hook into the agent lifecycle):
+
+```go
+if spec.ExperiencePrior != nil {
+    a.cognitive = CognitiveState{
+        SchemaVersion: CognitiveStateSchemaVersion,
+        Context:       spec.ExperiencePrior,
+    }
+}
+```
+
+So "distilled experience can become a new agent's initial cognition" is a **real, field-visible path**. But an honest boundary: **`ExperiencePrior` is an injection point at spawn time; I could NOT find a wiring that automatically searches the experience store's top-1 and fills it into `ExperiencePrior`.** Whether such an automatic backfill already exists I mark as **（待核实 / unverified）**.
+
+---
+
+## 7. Memory Distillation: Turning Conversations Into Classified Memory
+
+If the above is "task-level" distillation, `internal/ares_memory/distillation` handles "conversation-level" distillation. The entry `Distiller.DistillConversation` is a multi-stage orchestration (real phases in `distiller.go`):
+
+```
+extractPhase → classifyAndScorePhase → topNBeforeConflictPhase
+            → embedPhase → resolveConflictsPhase → finalTopNPhase
+```
+
+Combined with the `Pipeline` coordinator in `internal/ares_memory/pipeline.go`, it forms an end-to-end flow:
+
+```mermaid
+flowchart LR
+    SRC[ConversationSource.Next] -->|ConversationBatch<br/>ConversationID/TenantID/UserID/Messages| P[Pipeline.Run]
+    P --> D[Distiller.DistillConversation]
+    D --> E[extract phase]
+    E --> C[classify & score<br/>MemoryType: knowledge/preference/interaction/profile]
+    C --> T[topNBeforeConflict]
+    T --> EMB2[embed phase]
+    EMB2 --> RES2[resolveConflicts]
+    RES2 --> FINAL[finalTopN → []Memory]
+    FINAL -->|optional PushAfterDistill| PUSH[PushService.PushRelevant]
+    FINAL -->|per ReportInterval / at end| RPT[ReportGenerator.Generate<br/>→ reportSink.Save]
+```
+
+Real key interfaces & config:
+
+```go
+// pipeline.go
+type ConversationSource interface {
+    Next(ctx context.Context) (*ConversationBatch, error) // io.EOF when exhausted
+}
+
+type Distiller interface { // satisfied by *distillation.Distiller
+    DistillConversation(ctx, conversationID string, messages []distillation.Message,
+        tenantID, userID string) ([]distillation.Memory, error)
+}
+
+type PipelineConfig struct {
+    TenantID          string
+    ReportInterval    time.Duration // 0 = one report at the end of each Run
+    PushAfterDistill  bool
+    GenerateReportAtEnd bool
+}
+```
+
+Pipeline philosophy is explicit: **depends only on interfaces, never concrete types; a failing batch is logged and continued, never panics.** `Run` returns `PipelineRunResult` (TotalBatches/TotalMemories/FailedBatches/PushedItems/Duration…).
+
+Key `DistillationConfig` defaults (all word-for-word verifiable in `distiller.go`):
+
+| Config | Default | Meaning |
+|--------|---------|---------|
+| MinImportance | 0.6 | min importance for a memory to be kept |
+| ConflictThreshold | 0.85 | conflict similarity threshold (conversation layer) |
+| MaxMemoriesPerDistillation | 3 | max memories kept per distillation |
+| MaxSolutionsPerTenant | 5000 | per-tenant cap on solution-type memories |
+| EnableCode/Stacktrace/Log/MarkdownTableFilter | true | various noisy filters on by default |
+| EnableCrossTurnExtraction | true | cross-turn extraction on by default |
+| PrecisionOverRecall | true | precision takes priority over recall |
+
+Four memory classifications (in `api/experience`, re-exported by `ares_memory/distillation/memory.go`):
+
+```go
+type MemoryType string
 const (
-    ExtractionDirect  ExtractionMethod = "direct"   // Direct extraction from task
-    ExtractionSummary ExtractionMethod = "summary"  // LLM summarization and refinement
-    ExtractionPattern ExtractionMethod = "pattern"  // Pattern matching
+    MemoryKnowledge   MemoryType = "knowledge"
+    MemoryPreference  MemoryType = "preference"
+    MemoryInteraction MemoryType = "interaction"
+    MemoryProfile     MemoryType = "profile"
 )
-
-The structure of `Experience` embodies three important design decisions:
-
-1. **Problem + Solution Separation**: This is the most valuable form of knowledge. Not "what the user said," but "what problem the user encountered and how the Agent solved it"
-2. **Confidence Score**: Allows the retrieval system to filter results by quality. LLM direct extraction has higher confidence, pattern matching has lower
-3. **ExtractionMethod Traceability**: Knowing where an experience came from facilitates subsequent evaluation and improvement
-
-The `Distiller` engine takes a set of conversation messages and outputs a set of `Experience`:
-
-```go
-type Distiller struct {
-    config   DistillationConfig
-    embedder EmbeddingService
-    expRepo  ExperienceRepository
-}
-
-func (d *Distiller) DistillConversation(
-    ctx context.Context,
-    taskID string,
-    messages []Message,
-    tenantID, userID string,
-) ([]*Memory, error)
-```
-
-Each `Memory` is converted into an `Experience` and persisted in the experience repository, with a vector embedding generated simultaneously.
-
----
-
-## 8. Two Distillation Paths
-
-ares has two parallel distillation paths. This is not a design compromise, but a layered strategy.
-
-**Path One: Legacy DistillTask (Lightweight Extraction)**
-
-```
-DistillTask(taskID)
-  → taskMemory.Distill(taskID)    // Package raw data
-  → emit EventMemoryDistilled      // Notify downstream
-  → return *models.Task
-```
-
-This path is an O(1) in-memory operation that doesn't involve LLM calls or vector generation. Suitable for high-frequency, low-value tasks — like "check the weather," interactions that don't need long-term memory.
-
-**Path Two: Distiller Engine (Full Distillation)**
-
-```
-StoreDistilledTask(taskID, distilled)
-  → Extract input/output/user_id from distilled.Payload
-  → Construct []distillation.Message
-  → distiller.DistillConversation(...)
-      → Call LLM for summarization (optional)
-      → Call embedder for vector generation
-      → Return []*Memory
-  → Iterate Memory → Create Experience
-  → expRepo.Create(experience)
-```
-
-This path involves LLM calls + vector generation, which is more expensive. Suitable for low-frequency, high-value tasks — like "help me refactor the entire module," the kind of experience worth remembering.
-
-Callers can choose as needed: high-value tasks go through full distillation, ordinary tasks only do lightweight extraction. This design avoids expensive embedding calls for every single message.
-
----
-
-## 9. ProductionMemoryManager: Production-Grade Implementation
-
-`ProductionMemoryManager` is the default implementation for production environments. It's not just a CRUD wrapper, but a data engine with an asynchronous embedding pipeline.
-
-```go
-type ProductionMemoryManager struct {
-    dbPool            *postgres.Pool
-    tenantGuard       *TenantGuard
-    retrievalService  *RetrievalService
-    embeddingClient   *EmbeddingClient
-    writeBuffer       *WriteBuffer
-    conversationRepo  *ConversationRepository
-    taskResultRepo    *TaskResultRepository
-    sessionCache      *SessionCache   // In-memory LRU cache
-    config            MemoryConfig
-}
-```
-
-Each component has its own responsibility:
-
-| Component | Responsibility |
-|-----------|---------------|
-| dbPool | PostgreSQL connection pool |
-| tenantGuard | Multi-tenant isolation, ensuring one tenant can't see another tenant's data |
-| retrievalService | Hybrid search engine (vector + BM25) |
-| embeddingClient | Calls external embedding API to generate vectors |
-| writeBuffer | Write buffer + async embedding scheduling |
-| conversationRepo | Operates conversations table (no vectors, history tracking only) |
-| taskResultRepo | Operates task_results table (no vectors) |
-| sessionCache | In-memory LRU cache, reduces DB queries for hot sessions |
-
-**Session ID Generation Strategy**: The production version uses `crypto/rand` instead of timestamps to avoid timing attacks and ID prediction:
-
-```go
-func generateSessionID() string {
-    b := make([]byte, 12)
-    if _, err := rand.Read(b); err != nil {
-        return fmt.Sprintf("session_%d", time.Now().UnixNano())
-    }
-    return "sess_" + hex.EncodeToString(b)
-}
-```
-
-**Conversations are NOT embedded with vectors** — this is the most important design principle:
-
-```go
-// Note: This stores conversations WITHOUT vector embedding (per design standard).
-// conversations table is for history tracking only, retrieval uses knowledge/experience tables.
-
-Conversation history only serves the purpose of "building context for the current session," while experience retrieval uses its own independent experience table. Mixing the two in the same vector space would only reduce retrieval precision.
-
----
-
-## 10. Async Embedding Pipeline
-
-This is the performance heart of the entire distillation system. Let's look at the data flow first:
-
-```
-1. Write to DB with embedding_status = 'pending'
-2. Write to embedding_queue with dedupe_key
-3. Background Worker processes embedding tasks
-4. Worker updates DB with embedding and status = 'completed'
-```
-
-In `StoreDistilledTask`, data flows through the WriteBuffer:
-
-```go
-writeItem := &postgres.WriteItem{
-    TenantID: tenantID,
-    Table:    "experiences_1024",
-    Content:  fmt.Sprintf("%v", distilled.Payload),
-    Metadata: map[string]interface{}{
-        "output":   "",
-        "type":     "solution",
-        "agent_id": "style-agent",
-    },
-}
-if err := m.writeBuffer.Write(ctx, writeItem); err != nil {
-    return errors.Wrap(err, "write to buffer")
-}
-```
-
-Why asynchronous? Because embedding calls (especially calling external APIs over HTTP) typically have 100ms-500ms latency. If `StoreDistilledTask` waited synchronously for embedding to complete, the entire Agent task pipeline would be blocked.
-
-Through the decoupling of **WriteBuffer + EmbeddingQueue + Background Worker**:
-
-- **Business write O(1)**: Returns immediately after writing to the buffer, no blocking
-- **Async processing**: Embedding is processed in batches in the background
-- **Failure retry**: Data is not lost when the embedding service is temporarily unavailable
-- **Deduplication protection**: `dedupe_key` prevents the same data from being embedded multiple times
-
-This is a classic CQRS variant — write operations don't wait for the read model to be ready. It's particularly suitable for memory systems: users don't need to immediately search for results after calling `StoreDistilledTask`; brief eventual consistency is acceptable.
-
----
-
-## 11. Vector Retrieval: Similar Experience Recall
-
-When the Agent needs to reference past experiences, `SearchSimilarTasks` performs a hybrid search.
-
-```go
-func (m *ProductionMemoryManager) SearchSimilarTasks(
-    ctx context.Context,
-    query string,
-    limit int,
-) ([]*models.Task, error) {
-    // 1. Generate query vector
-    queryVector, err := m.embedder.EmbedWithPrefix(ctx, query, "query:")
-    if err != nil {
-        return nil, errors.Wrap(err, "embed query")
-    }
-
-    // 2. Configure retrieval plan — only search experience
-    searchRequest.Plan.SearchExperience = true
-    searchRequest.Plan.SearchKnowledge = false
-    searchRequest.Plan.SearchTools = false
-    searchRequest.Plan.ExperienceWeight = 1.0
-
-    // 3. Execute hybrid search
-    results, err := m.retrievalService.Search(ctx, searchRequest)
-    if err != nil {
-        return nil, errors.Wrap(err, "search experiences")
-    }
-
-    // 4. Convert back to models.Task format
-    var tasks []*models.Task
-    for _, result := range results {
-        if result.Source == "experience" {
-            task := &models.Task{
-                TaskID:   result.ID,
-                Payload:  map[string]any{
-                    "input":  result.Content,
-                    "output": result.Metadata["output"],
-                    "score":  result.Score,
-                },
-                Priority: int(result.Score * 100),
-            }
-            tasks = append(tasks, task)
-        }
-    }
-    return tasks, nil
-}
-```
-
-The key `RetrievalPlan` struct makes the search strategy highly configurable:
-
-```go
-type RetrievalPlan struct {
-    SearchExperience bool
-    SearchKnowledge  bool
-    SearchTools      bool
-    ExperienceWeight float64
-    KnowledgeWeight  float64
-    ToolsWeight      float64
-}
-
-`RetrievalService.Search()` internally implements a hybrid search — running both **pgvector cosine distance** and **BM25 full-text search** simultaneously, merging results with weights. This is the best practice in production: pure vector retrieval performs poorly for new terms and niche words, and combining it with BM25 provides complementary coverage.
-
-The underlying `VectorStore` interface is extremely concise:
-
-```go
-type VectorStore interface {
-    Search(ctx context.Context, table string, embedding []float64, limit int) ([]*SearchResult, error)
-    AddEmbedding(ctx context.Context, table, id string, embedding []float64, metadata map[string]any) error
-    CreateCollection(ctx context.Context, name string, dimension int) error
-}
-```
-
-The presence of the `table` parameter means a single VectorStore instance can manage multiple collections — this provides the foundation for multi-tenant isolation: each tenant can have their own experience/knowledge tables, all sharing the same pgvector instance.
-
----
-
-## 12. Event Sourcing and Memory
-
-The MemoryManager connects to the event sourcing system via `SetEventStore`. Key event types:
-
-```go
 const (
-    EventMemoryDistilled EventType = "memory.distilled"
-    EventSessionCreated  EventType = "session.created"
-    EventMessageAdded    EventType = "message.added"
+    ExtractionDirect     = "direct"       // direct user-assistant pair extraction
+    ExtractionCrossTurn  = "cross-turn"   // multi-turn conversation extraction
 )
 ```
 
-`emitEvent()` is called at all key operation points:
+And the write-time conflict resolution strategies (when an `ExperienceStore` is configured):
 
 ```go
-// session creation
-m.emitEvent(ctx, events.EventSessionCreated, map[string]any{
-    "session_id": sessionID,
-    "user_id":    userID,
-})
-
-// message added
-m.emitEvent(ctx, events.EventMessageAdded, map[string]any{
-    "session_id": sessionID,
-    "role":       role,
-})
-
-// distillation complete
-m.emitEvent(ctx, events.EventMemoryDistilled, map[string]any{
-    "task_id":      taskID,
-    "input_count":  len(inputStr),
-    "output_count": len(memories),
-})
+type ResolutionStrategy string
+const (
+    ReplaceOld Strategy = "replace"    // new replaces old
+    KeepOld    Strategy = "keep_old"   // higher-confidence old wins over incoming
+    KeepBoth   Strategy = "version"    // keep both (competing solutions)
+    Merge      Strategy = "merge"      // merge (reserved for future use)
+)
 ```
-
-The purpose of events is not just auditing. In ares, they form the foundation of Runtime Manager **cognitive recovery** (covered in the next section).
 
 ---
 
-## 13. Agent Fabric Cognitive Recovery (0.3.x Upgrade)
+## 8. Session & Task Memory: The Underlying Tools
 
-This is the most valuable orchestration scenario for the memory system. In 0.3.x, when an Agent crashes, **Agent Fabric** (replacing 0.2.x's Runtime Manager) performs recovery in two steps.
+`ProductionMemoryManager` leans on two in-memory stores in `internal/ares_memory/context`:
 
-The core 0.3.x change: **Agent death ≠ Task death**. Agents are disposable; Tasks are durable. When an Agent dies, Agent Fabric creates a new one, and Task Fabric restores progress from the checkpoint. Cognitive recovery is the key link — the new Agent needs to know
+- `SessionMemory`: holds sessions in `map[string]*SessionData`, `SessionData{SessionID, UserID, Messages, Context, AccessedAt, CreatedAt}`. A background `StartCleanup` prunes expired sessions every TTL/2; `Cleanup` removes at most 100 per call (avoids holding the lock too long).
+- `TaskMemory`: holds tasks in `map[string]*TaskData`; `TaskData` also tracks `Steps []StepRecord` / `Results []ResultRecord`. `TaskMemory.Distill` collapses a task into `models.Task` (input/output/context) for the "lightweight extraction" path.
 
-```go
-func (m *Manager) recoverAgentState(
-    ctx context.Context,
-    agentID string,
-    factory AgentFactory,
-) (base.Agent, error) {
-    newAgent := factory()
-    if newAgent == nil {
-        return nil, fmt.Errorf("runtime: factory returned nil for agent %s", agentID)
-    }
+`MemoryConfig` (`manager.go`) defaults — all from `DefaultMemoryConfig`, verifiable:
 
-    // Replay events
-    evts := m.replayEvents(ctx, agentID)
+| Field | Default |
+|-------|---------|
+| MaxHistory | 10 |
+| MaxSessions | 100 |
+| MaxTasks | 1000 |
+| MaxDistilledTasks | 5000 |
+| SessionTTL | 24h |
+| TaskTTL | 7d |
+| DistilledTaskTTL | 30d |
+| VectorDim | 128 |
+| EnableRAG | false (opt-in) |
+| RAGTopK | 5 (applied when enabled) |
+| RAGMinScore | 0.4 (applied when enabled) |
 
-    if sa, ok := newAgent.(base.StatefulAgent); ok {
-        // Rebuild state from events
-        state := buildStateFromEvents(evts)
+> RAG is opt-in. With `EnableRAG=false`, `BuildContext/BuildPromptMessages` behave as before (history only); set true to retrieve past experiences/distilled memories into the prompt. `ProductionMemoryManager` also has `retrievers []memctx.ContextRetriever` used when RAG is on.
 
-        // Cognitive recovery: load conversation history
-        if m.memManager != nil {
-            cognitiveState := m.buildCognitiveState(ctx, agentID, state)
-            for k, v := range cognitiveState {
-                state[k] = v
-            }
-        }
+---
 
-        // Restore state
-        if len(state) > 0 {
-            if err := sa.RestoreState(state); err != nil {
-                slog.Warn("runtime: RestoreState failed",
-                    "agent_id", agentID, "error", err)
-            }
-        }
+## 9. The MemoryManager Abstraction & the Production Implementation
 
-        // Replay events to agent
-        if len(evts) > 0 {
-            if err := sa.ReplayEvents(evts); err != nil {
-                slog.Warn("runtime: ReplayEvents failed",
-                    "agent_id", agentID, "error", err)
-            }
-        }
-    }
-    return newAgent, nil
-}
+Experience distillation (ares_experience) runs on its own; the unified memory-access abstraction is `MemoryManager` (`internal/ares_memory/manager.go`), with three blocks:
 
-**Step Two: Cognitive Recovery**
+- **Session**: CreateSession / AddMessage / GetMessages / AddStructuredMessage / BuildPromptMessages / BuildContext / DeleteSession
+- **Task**: CreateTask / CreateTaskWithID / UpdateTaskOutput / DistillTask / StoreDistilledTask / SearchSimilarTasks
+- **Lifecycle & events**: GetLatestSessionForAgent / Start / Stop / SetEventStore
 
-`buildCognitiveState` retrieves recent session and conversation history through the MemoryManager:
+The production implementation `ProductionMemoryManager` (`production_manager.go`) composes a lot: `dbPool` (PostgreSQL + pgvector), `retrievalService`, `writeBuffer` (write buffering), `embeddingClient`, `conversationRepository`, `taskResultRepository`, `sessionCache` (in-memory hot-session cache), `ctxCleaner` (strips tool noise / compresses verbosity), optional `eventStore` and `EvidenceCollector`.
+
+`EvidenceCollector` is a minimal interface:
 
 ```go
-func (m *Manager) buildCognitiveState(
-    ctx context.Context,
-    agentID string,
-    operationalState map[string]any,
-) map[string]any {
-    state := make(map[string]any)
-
-    // Get session_id from operational state or checkpoint
-    sessionID, _ := operationalState["session_id"].(string)
-    if sessionID == "" {
-        sessionCtx, sessionCancel := context.WithTimeout(ctx, 5*time.Second)
-        sid, err := m.memManager.GetLatestSessionForLeader(sessionCtx, agentID)
-        sessionCancel()
-        if err != nil {
-            return state
-        }
-        sessionID = sid
-    }
-
-    if sessionID == "" {
-        return state
-    }
-
-    // Load conversation history (5 second timeout protection)
-    msgCtx, msgCancel := context.WithTimeout(ctx, 5*time.Second)
-    defer msgCancel()
-    messages, err := m.memManager.GetMessages(msgCtx, sessionID)
-    if err != nil {
-        return state
-    }
-
-    if len(messages) > 0 {
-        state["session_id"] = sessionID
-        state["conversation_history"] = messages
-    }
-    return state
+type EvidenceCollector interface {
+    Emit(ctx context.Context, kind string, payload any, keysAndValues ...string) error
 }
 ```
 
-This mechanism means: when an Agent crashes and is restarted, it doesn't just rebuild the connection pool and timers — it also knows "what were we talking about." This is the cognitive layer of ares's self-healing capability. The 5-second timeout acts as a safety net, preventing a slow DB from blocking the recovery flow.
+> Honest note: the original blog's snippets about `experiences_1024` table names and the exact code walk of `StoreDistilledTask` through WriteBuffer I did not re-derive line-by-line from the current `manager` layer here. The internal write details live in `production_manager.go` / `production_manager_tasks.go`; this article won't re-quote them verbatim.
 
 ---
 
-## 14. Configuration System
+## 10. Runtime Evolution: MemoryPatchExecutor
 
-The memory system's configuration is exposed at the YAML layer, while runtime parameters are controlled by code constants:
+Memory config isn't read-once at startup. `MemoryPatchExecutor` (`memory_patcher.go`) turns `MemoryConfig` into a `patch.RuntimeComponent` that can evolve at runtime:
 
-```yaml
-memory:
-  enabled: true
-  session:
-    enabled: true
-    max_history: 50
-  user_profile:
-    enabled: true
-    storage: postgres
-    vector_db: true
-  task_distillation:
-    enabled: true
-    storage: postgres
-    vector_store: true
-    prompt: "Please summarize the user's requirements and technical solution, extract reusable patterns"
-```
+- `PatchChangePlanner` → change `max_history` / `max_tasks` / `max_sessions`
+- `PatchChangeBudget` → change `max_distilled_tasks` / `session_ttl`
+- `PatchChangeReducer` → change `use_structured_cleaning`
 
-Runtime configuration:
-
-```go
-type MemoryConfig struct {
-    Enabled          bool          `yaml:"enabled"`
-    Storage          string        `yaml:"storage"`       // memory / postgres
-    MaxHistory       int           `yaml:"max_history"`   // Default 10
-    MaxSessions      int                                 // Default 100
-    MaxTasks         int                                 // Default 1000
-    MaxDistilledTasks int                                // Default 5000
-    SessionTTL       time.Duration                       // Default 24h
-    TaskTTL          time.Duration                       // Default 7d
-    VectorDim        int                                 // Default 128
-}
-
-YAML exposes business-semantic switches (session/profile/distill), code constants set performance-related thresholds (TTL/Max), and environment variables override sensitive information (DB passwords, etc.). The three configuration layers don't conflict with each other.
+It implements `validate-before-mutate` (a bad patch leaves config untouched) and returns a rollback-able `RuntimePatch` (`rollback: restore previous memory config`). `NewMinimalMemoryManager` provides a config-only lightweight `ProductionMemoryManager` for the no-database default bootstrap path (its dbPool/embeddingClient etc. are nil — config access only).
 
 ---
 
-## 15. Design Tradeoffs and Evolution
+## 11. Skill Priors: Task Pattern → Relevance (Related But Not "Distillation")
 
-After reviewing the entire memory system, there are several design decisions worth discussing in depth:
+The third thing named "experience" is in `internal/ares_skills`. It's not the same as distillation above — this is a **Learned Source** that only biases future skill-discovery ranking, never auto-invokes a skill.
 
-### 1. Conversations Are Not Vector-Embedded
+- `Experience.Record(skill, taskPattern, successRate)`: stores {skill, task pattern, success rate}; re-recording the same (skill, pattern) pair replaces its rate; count is capped at `maxRecords=1000`, oldest evicted when exceeded.
+- `Experience.BestMatch(taskPattern)`: scores by **keyword overlap** (short patterns use containment; long patterns tokenize and score by overlap ratio, threshold `matchScoreThreshold=0.5`), returning the highest-success-rate prior.
+- Optional persistence: `JSONExperienceStore` writes atomically (temp file + rename); `NewExperienceWithStore` preloads at startup.
+- `ExperienceConfidenceSource`: adapts `Experience` to `taskfabric.ConfidenceSource`; `Confidence(taskPattern)` returns the best prior's `SuccessRate` (0 when none). This is the piece that actually reaches the scheduler side — driven by real learned priors, not hardcoded constants.
 
-This was a design point confirmed through repeated deliberation. The comment on `ProductionMemoryManager.AddMessage` explicitly states that the conversations table is only for history tracking, and retrieval uses the independent experience table.
+If your interest is "how memory priors affect scheduling," **this is the path that lands on the scheduler**, whereas the ares_experience ranking/conflict machinery serves GA guidance and spawn injection.
 
-Rationale: **Conversation history is linear narrative, experience is networked knowledge.** The former only needs chronological ordering, the latter needs semantic retrieval. Mixing the two in the same vector space would only reduce retrieval precision.
+---
 
-### 2. Two Distillation Paths Coexisting
+## 12. Things You Might Expect — Marked Clearly
 
-The coexistence of the legacy `DistillTask` and the new `Distiller` engine is not a design compromise, but a layered strategy.
+Let me be blunt about several things I did **not** find in the code (things intuition / the old blog might assume "should be there"):
 
-- `DistillTask`: O(1) in-memory operation, no LLM calls or vector generation
-- `StoreDistilledTask + Distiller`: Involves LLM calls + vector generation
+1. **"Requires ≥2 non-failure trajectory supports to graduate" —（待核实 / not found）.** I grepped `ares_experience` and `ares_memory/distillation` for graduate / promote / vote / minSupport — no such implementation; `ShouldDistill` only checks length. If any "graduation" logic exists elsewhere (e.g. `knowledge/` or `flight/`), it belongs to a different system.
+2. **"Candidate knowledge and formal knowledge stored separately" —（待核实 / not found）.** Experiences/memories all go into the unified ExperienceRepository; I saw no candidate-vs-formal split-table design.
+3. **"Original three-layer memory + event-sourcing cognitive recovery" — partially unverified.** `MemoryManager` does split session/task blocks and `SetEventStore` does exist, but `manager.go` has no `experiences_1024`-style table details, and the `RecoverAgentState / buildCognitiveState` story belongs to agentfabric (another article). Trust the files cited here.
+4. **"How many tokens distillation saves / 22.3% deviation / GPT-5.5 / sensenova" tables — NOT adopted.** Those are numbers I couldn't trace to a source in this repo and couldn't reproduce — I won't fake an "LLM-verified 96% savings" conclusion in front of you. (A benchmark test file `distillation/benchmark_token_comparison_test.go` does exist, but this article won't invent a "verified savings" figure.)
 
-Business logic can choose which path to take based on task value — high-frequency low-value tasks take the lightweight path, low-frequency high-value tasks take the full distillation path.
+---
 
-### 3. Session ID Generation Strategy Evolution
+## Conclusion: The Real Data Flows
 
-- Dev version: `session_{userID}_{timestamp}` — simple and readable
-- Production version: `sess_{12 bytes crypto/rand hex}` — unpredictable
-
-This reflects the evolution of security awareness. Predictable session IDs are a potential information leak vector in multi-tenant environments.
-
-### 4. WriteBuffer Async Strategy
-
-Write to buffer first → batch flush to DB → async embedding → failure retry. This is a classic CQRS variant.
-
-Users don't need to immediately search for results after calling `StoreDistilledTask`; brief eventual consistency (sub-second) is acceptable. But if waiting synchronously for embedding, users would have to wait hundreds of milliseconds before continuing.
-
-### 5. VectorStore's Minimal Design
-
-Three methods, one `table` parameter. This allows a single VectorStore instance to manage multiple collections — multi-tenancy just requires sharing the same pgvector instance, isolated by table name.
-
-### 6. Three-Layer TTL Strategy
+Linking the three tracks, ares "accounts" for memory like this:
 
 ```
-Session Memory: 24h → Pure in-memory, lost on restart
-Task Memory/DB: 7d → Persistable, periodic cleanup
-Distilled Memory: LRU eviction (Max=5000) → Persistent, evicted by capacity
+TaskResult
+  → (EventTaskCompleted/Failed) → DistillationService.Distill
+      → ShouldDistill guard → LLM extraction of Problem/Solution/Constraints
+      → store Experience (Type success/failure)
+      → default sync embed, or async queue vector backfill
+  → FeedbackService: success count +1 / failure Score down
+  → RankingService: FinalScore = Semantic + UsageBoost + RecencyBoost + Score
+  → ConflictResolver: group at 0.9 similarity, keep highest per group
+  → downstream: GA guidance (Hints/Record)  +  Spawn injection (ExperiencePrior → CognitiveState.Context)
 
-TTL increases layer by layer, value density increases layer by layer. Session data is voluminous but short-lived, while Experience data is compact but needs to be retained long-term.
+Messages
+  → (ConversationSource→Pipeline→Distiller.DistillConversation)
+      → extract → classify(knowledge/preference/interaction/profile) → embed → resolveConflicts → finalTopN
+      → optional PushRelevant + report generation (reportSink)
 
----
-
-## 16. Let's Be Honest: Is This Design Too Heavy?
-
-Alright, enough praise. Let's be real for a moment.
-
-Now look back at this memory system — MemoryManager interface, three-layer architecture, async embedding pipeline, event sourcing, cognitive recovery… how many lines of code does all that add up to? Just under `internal/memory/` there are over forty files. You might be thinking:
-
-> **Just to remember what the Agent did before, does it really need to be this complicated?**
-
-Honestly, fair point.
-
-### This Design IS Heavy
-
-Seven components working together: SessionMemory, TaskMemory, Distiller, WriteBuffer, EmbeddingClient, RetrievalService, EventStore. Each has its own configuration, its own lifecycle, its own error handling. Deploying requires PostgreSQL, pgvector, and an embedding service. Local development? docker-compose with at least three containers.
-
-For most scenarios — a single-machine Agent, a few dozen calls a day, no need for cross-session experience reuse — this is complete overkill. A `map[string][]Message` + a periodic cleanup goroutine would suffice. That's how I ran it early on.
-
-### But There's a Reason It's Heavy
-
-This design isn't built for "a few dozen calls a day." It serves these scenarios:
-
-1. **Multi-tenant production deployment**: One Agent instance serving hundreds of users, each with their own sessions and experience stores. Without TenantGuard, data would leak
-2. **Long-running operation**: Agents running for weeks or months without restart. Without event sourcing, a single crash means amnesia
-3. **Cross-session experience reuse**: This is the core. If your Agent starts each conversation from scratch — then you really don't need this. But if it needs to "learn something from the past hundred conversations," you need a place to store structured experiences, a retrieval method to find the most relevant ones, and an eviction strategy to prevent unbounded growth
-
-So "heavy" in this design isn't a bug, it's a feature. It pre-pays for problems that might arise in the future — the price is writing a few more layers of abstraction today.
-
-### A Few Things I'm Not Happy About Either
-
-There are some areas I'm not satisfied with either:
-
-- **Configuration is too scattered**: YAML switches, code constants, environment variables — three layers covering different dimensions of the same thing. New users need to understand all three to get parameters right
-- **Async embedding's eventual consistency**: Writes aren't searchable immediately. For most scenarios this is fine, but when a user asks "what did you just learn?", you have to choose between consistency and latency. I chose latency, but it's not without cost
-- **Conflict detection is too conservative**: Only cosine > 0.85 is considered a conflict. In practice, many semantically similar experiences with different surface forms get stored as two separate entries. Recall may produce duplicates or contradictions. I set PrecisionOverRecall = true as a safety net, but this parameter should be user-configurable
-- **Gap between in-memory and production versions**: `memoryManager` only has basic functionality, `ProductionMemoryManager` is the complete one. Developing with the in-memory version is great, but going to production reveals a bunch of missing features — with no smooth "medium option" in between
-
-### If You Want to Use This
-
-My advice: **Don't go all-in from the start.**
-
-1. Start with just Session Memory + Task Memory, enable `BuildContext`'s sliding window
-2. If you find the Agent repeating the same mistakes, turn on Distillation with a simple embedding service
-3. When user count grows and crashes become frequent, add EventStore and cognitive recovery
-
-This architecture is designed for **a la carte usage** — you don't need to initialize things you don't use. The interfaces are there, but empty implementations won't waste any of your resources.
-
-Alright, now that I've admitted the shortcomings, let me still share some hard data.
-
-
----
-
-## 17. Show Me the Numbers: How Much Does Distillation Actually Save?
-
-After all that architecture and design talk, let's look at some real data. I wrote a benchmark for the distillation pipeline, simulating a typical Agent operations conversation scenario — the user repeatedly asks about database slowness, API errors, configuration issues, and the Agent troubleshoots them one by one.
-
-The test uses 20 sets of real Problem → Solution pairs (e.g., "Database query timeout → Checked indexes, found missing composite index, created it"), with 15% of messages containing follow-up questions, random sampling per round. The Tokenizer uses character-level estimation (English: 4 chars/token, Chinese: 1.5 chars/token).
-
-> **On data authenticity**: All token counts in the scenarios below have been **verified through real LLM calls (sensenova-6.7-flash-lite)**, not just estimation. We recorded both the estimated values from `estimateTokens()` and the actual token counts returned by the LLM, with a deviation rate of approximately **22.3%** (see decoding accuracy verification section for details). The conclusions don't change qualitatively, but the data is more credible.
-
-### Scenario 1: Un-truncated Full History (The Most Critical Metric)
-
-This is where distillation truly shines. If the Agent needs to reference **all** conversation history (without `MaxHistory=10` truncation), the raw context grows linearly with the number of rounds. Distillation compresses it into 3 highest-priority experience representations:
-
-| Dialogue Rounds | Raw Context (tokens) | Distilled (tokens) | Savings |
-|:---------------:|:--------------------:|:------------------:|:-------:|
-| 10 | 1,121 | 379 | **66.2%** |
-| 20 | 2,124 | 339 | **84.0%** |
-| 30 | 3,320 | 379 | **88.6%** |
-| 40 | 4,380 | 339 | **92.3%** |
-| 50 | 5,387 | 443 | **91.8%** |
-| 60 | 6,168 | 330 | **94.6%** |
-| 70 | 7,054 | 379 | **94.6%** |
-| 80 | 8,257 | 339 | **95.9%** |
-| 90 | 9,524 | 379 | **96.0%** |
-| 100 | 10,972 | 339 | **96.9%** |
-
-<small>*The data above is based on estimateTokens() character-level estimation, serving as a baseline reference.*</small>
-
-**LLM Verified Measurement**: We called sensenova-6.7-flash-lite to verify key data points:
-
-| Checkpoint | estimateTokens Prediction | LLM Actual | Deviation |
-|:----------:|:------------------------:|:----------:|:---------:|
-| 20-round Full Raw | 2,124 | 1,930 | -9.1% |
-| 100-round Full Raw | 10,972 | 9,163 | -16.5% |
-| 20-round Distilled | 339 | 378 | +11.5% |
-| 100-round Distilled | 339 | 326 | -3.8% |
-
-Data note: estimateTokens() deviates approximately **±10-15%** for short mixed Chinese-English text, and approximately **±15-20%** for long text. The accuracy of this estimation function is within acceptable engineering range, but precise billing must use the LLM's returned `usage.completion_tokens` field.
-
-**Result Analysis**: The distilled context size is essentially constant at **330-443 tokens** (about 3 experiences), not growing with the number of dialogue rounds. Savings range from 66% at 10 rounds to **96.9%** at 100 rounds — the longer the conversation, the greater the benefit.
-
-Based on GPT-5.5 pricing ($5.00/1M input tokens), for a 100-round conversation:
-- Raw: 10,972 tokens → $0.055/request
-- Distilled: 339 tokens → $0.002/request
-- Savings of $0.053 per call. At 100,000 calls per day, that's **$5,300 saved daily**.
-
-Similarly, using Claude Opus 4.8 (input $5/1M tokens) provides the same input-side savings. The difference between the two is primarily on the output side (GPT-5.5: $30/1M vs Claude Opus 4.8: $25/1M), but since distillation mainly reduces input context, input-side economics is the key factor here.
-
-### Scenario 2: Multi-Session Growth Comparison
-
-This is closer to actual usage — each new conversation round builds on the distillation results from previous rounds. Simulates 10 conversations, 5 rounds each, with no history truncation:
-
-| Session | Raw Context (tokens) | Distilled (tokens) | Savings | Cumulative Experiences |
-|:-------:|:--------------------:|:------------------:|:-------:|:---------------------:|
-| 1 | 538 | 498 | 7.4% | 3 |
-| 2 | 1,058 | 796 | 24.8% | 6 |
-| 3 | 1,509 | 1,061 | 29.7% | 9 |
-| 4 | 1,974 | 1,317 | 33.3% | 12 |
-| 5 | 2,620 | 1,567 | 40.2% | 14 |
-| 6 | 3,320 | 1,567 | 52.8% | 14 |
-| 7 | 3,938 | 1,567 | 60.2% | 14 |
-| 8 | 4,380 | 1,918 | 56.2% | 16 |
-| 9 | 4,690 | 2,126 | 54.7% | 17 |
-| 10 | 5,387 | 2,126 | **60.5%** | 17 |
-
-<small>*The data above is based on estimateTokens() character-level estimation.*</small>
-
-**LLM Verified Measurement**: In the Session 10 verification, the LLM returned the full raw context as **4,763 tokens** (estimated 5,387) and the distilled context as **1,942 tokens** (estimated 2,126). The distillation savings adjusted from the estimated 60.5% to **59.2%**, within the margin of error.
-
-**Result Analysis**: Raw context grew linearly from 538 tokens to **5,387 tokens** (10x), while distilled context only grew from 498 to **2,126 tokens** (4.3x). More importantly, the 17 accumulated experiences are **high-value structured knowledge** (complete Problem→Solution pairs), while much of the raw context contains meaningless transition dialogue and redundant information.
-
-### Scenario 3: Information Density Comparison
-
-Under the same budget of approximately 300-400 tokens:
-
-| Metric | Raw Context (truncated) | Distilled Context |
-|:-------|:-----------------------:|:-----------------:|
-| Token count (estimated) | ~277 | ~339 |
-| Token count (LLM actual) | **312** | **378** |
-| Complete Problem→Solution pairs | **0** (all fragmented) | **3** |
-| Semantic units | 10 truncated fragments | 3 complete experiences |
-| Information reusability | Low (incomplete context) | High (self-contained) |
-
-This is the cost of `BuildContext`'s `MaxHistory=10` + 100-character truncation: you save tokens, but the retained information is severely fragmented. At the same token budget, distillation provides complete, independently reusable experiences.
-
-LLM verification also revealed a systemic issue with `estimateTokens()`: the function **consistently underestimates token counts**, with a deviation rate of approximately **22.3%** (in one typical context, it estimated 160 tokens while the LLM returned 206). For a billing system, this means budget control based on estimates could overshoot by about 20%. Production environments should use the LLM's returned `usage` field for precise metering.
-
-### Summary
-
-| Use Case | Best Solution | Token Savings |
-|:---------|:-------------:|:-------------:|
-| Single conversation, only last few rounds needed | Sliding window truncation | ~70% |
-| Cross-session experience reuse | Distillation + accumulation | 40-60% (LLM verified: 59.2%) |
-| Full history reference needed | Distillation | **66-97% (LLM verified: 80.4%-96.4%)** |
-
-> **On data sources**: In the data above, "LLM verified" means calling sensenova-6.7-flash-lite to tokenize the actual context and using the returned `usage.completion_tokens` count. Values not marked "LLM verified" are `estimateTokens()` character-level estimates. Verification confirmed: the estimated data trends are accurate, but values are generally 10-20% lower.
-
-**Core Conclusion**: The greatest value of Memory Distillation isn't "saving tokens" — it's **preserving the semantic integrity of information while saving tokens.** Sliding window truncation directly discards information; distillation refines and stores it. The former is "saving money but going hungry," the latter is "saving money AND eating well."
-
-
----
-
-## Conclusion
-
-ares's memory system isn't a simple matter of stuffing data into PostgreSQL. It's a complete data refinement pipeline:
-
-```
-Raw Messages → Sliding Window (Session) → Execution Records (Task) → Structured Experiences (Experience) → Vector Index (pgvector)
+taskPattern
+  → ares_skills.Experience.Record(skill, pattern, successRate)
+  → BestMatch → ExperienceConfidenceSource.Confidence → scheduler/downstream
 ```
 
-0.3.x adds a Pipeline coordinator (`internal/ares_memory/pipeline.go`) that wires **ExperienceStore → Distiller → ReportGenerator → PushService** into an end-to-end flow. The Pipeline pulls conversation batches from `ConversationSource`, distills them, optionally generates reports and pushes, supporting batch processing and periodic reports.
+Honest wrap-up: four things in this code are genuinely solid — **event-driven task-level experience distillation**, **bandit feedback with multi-signal weighted ranking**, **lazy conflict grouping**, and **the two experience feedback channels (spawn + GA)**. As for "how many trajectories it takes to graduate," "candidate vs formal split stores," and "how many tokens saved," I couldn't verify those, so I'm not going to dress them up for you here.
 
-Each layer does the same thing: **get smaller, get better, get more persistent.** The core 0.3.x change is relocation — memory distillation moved from a standalone module to the evolution pipeline:
-
-- **Trace** (what happened): Conversations and execution traces, stored in the Session/Task layer
-- **Experience** (what it means): Distilled structured experiences, requiring ≥2 non-failure trajectory supports to graduate
-- **Memory** (formal knowledge): Graduated experiences enter the formal knowledge base; candidate knowledge is stored separately
-
-- **Session**: Remember the current conversation → sliding window keeps only the latest N messages
-- **Task**: Record a single task → Distill extracts key information
-- **Experience**: Refine reusable experience → LLM summarization + vectorized storage
-- **Pipeline** (new in 0.3.x): End-to-end coordination, ExperienceStore → Distiller → Report → Push
-- **Dashboard**: Flight Recorder visualizes memory status
-
-What I'm most satisfied with isn't "distillation" itself — it's the closed loop: the experiences distilled not only allow future tasks to retrieve and reuse them, but can also restore conversation context after an Agent crashes. 0.3.x upgraded this: **Agent death ≠ Task death**. Agents are disposable; Task Fabric holds checkpoints; Agent Fabric creates a new Agent and restores progress from the checkpoint while the memory system restores conversation context. In other words, **the Agent not only gets smarter while alive, but can come back with its memories intact after dying.**
-
----
-
-**Next Article Preview**: Workflow Engine — In 0.3.x, the DAG directly serves as the scheduling source. Task A completed → B ready / C ready → Scheduler, no Leader dispatch needed. MutableDAG supports dynamically adding and removing nodes at runtime — GraphPatchExecutor inserts/removes/replaces nodes at runtime. There's also thread-safe cycle detection, semaphore-based concurrent scheduling, and checkpoint recovery.
+**Next Article Preview**: Workflow Engine — in 0.3.x the DAG is the scheduling source directly, MutableDAG adds/removes nodes at runtime (GraphPatchExecutor), with thread-safe cycle detection and checkpoint recovery. Same approach: only code I can verify.

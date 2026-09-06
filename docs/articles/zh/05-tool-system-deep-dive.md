@@ -1,542 +1,493 @@
-# ares 架构深度解析（五）：工具调用层拆解 -- 四条路径与一个兜底（0.3.x）
+# ares 架构深度解析（五）：工具调用层 —— 从"注册"到"真正被 LLM 调起来"（0.3.x）
 
-> 22 个工具注册好之后，我以为万事大吉了。结果第一个集成测试就把我打回了原型——LLM 生成的参数传进去直接 panic，因为类型断言失败了。
-> 我意识到一件事：定义工具只是第一步。真正复杂的，是工具**怎么被调起来**的这条链路。
-> 后来我又意识到另一件事：LLM 不是每次都靠谱。它可能选错工具、可能传错参数、甚至根本不知道用什么工具。
-> 所以我又加了第四条路——当 LLM 不靠谱的时候，用确定性引擎兜底。
+> 我一度把工具系统想得很简单：定义 Tool → 塞进 Registry → LLM 就能用了。
+> 后来在代码里追了几条链路才发现，真正复杂的是工具从静态定义**走到 LLM 手里、再被一把调起来**的整条流水线。
+> 这篇我复盘了 `tools/toolsource`、`tools/resources`、`tools/planner`、`tools/discovery`、`tools/envcap`，
+> 以及 `agentfabric` 里真正执行工具的 `ToolBinder` / `chatCognition` / `toolCognition`。
+> 只讲我在代码里真实看到的符号和逻辑。看不到的，我不吹。
 >
-> 0.3.x 更新：工具系统与 Capability Fabric 深度集成。ToolExpander 接口让运行时发现的技能名称即时解析为 LLM 工具定义。五件套 catalog 工具（skill_search/load/activate/list/experience）实现渐进披露，1000 个工具也不进 context。Kernel Scheduler 的 capability-aware 评分直接依赖工具注册的能力声明。
+> 一个很重要的先验修正：**Agent 并不直接调 `Registry.Execute`。** 中间始终隔着一层 `ToolBinder`。
+> 而这层 Binder 后面，还有两条"发现"通路（`discover_tools` 运行时展开 + 能力规划兜底）各司其职。
 
-## 一、工具调用的四条路径
+## 〇、先承认一件事：这篇的范围
 
-很多人看完工具注册那一套，以为工具调用就是 `registry.Execute(name, params)` 一把梭。但实际跑起来，你会发现有四条完全不同的调用路径，各有各的考量：
+工具系统散在好几个包，我把它分成五块来讲：
+
+1. **`tools/toolsource`** —— 工具的"来源抽象"。`ToolSource`（`Tools` / `OnChange` / `Source`），以及 `StaticSource` / `RegistrySource` / `MultiSource` 三个实现。
+2. **`tools/resources/core`** —— 工具元模型。`core.Tool` 接口、`ToolSchema`、`core.Registry`（含参数校验 `ValidateParams` 与渐进披露 `activeTools`）、内置工具目录（`builtin/`）。
+3. **运行时发现与选择** —— `discover_tools` 元工具（`discover_tool.go`）、三个 `ToolSelector`（`selector.go` / `capability_selector.go`）、`agentloop.Engine.expandDiscoveredTools`。
+4. **`tools/planner` + `tools/discovery` + `tools/envcap`** —— 能力规划兜底、本机命令发现、环境能力检索。
+5. **`agentfabric`** —— 真正把工具调起来的执行体：`ToolBinder` 接口、ReAct 工具循环 `chatCognition`、以及 L2 图里的 `toolCognition`（参数走 `arg.` 前缀命名空间）。
+
+一句话概括真正的主干线：
+
+```
+ToolSource（静态/注册表/多源合并）
+  → ToolSelector（全量/标签/能力）选出本轮的子集
+  → GetToolSchemas / ToolSchemaToLLMTool 变成 LLM 的 Tool 定义
+  → LLM 返回 tool_calls
+  → ToolBinder.CallTool(name, args)
+  → core.Tool.Execute≈ 最终被调起来
+```
+
+---
+
+## 一、工具从哪来：ToolSource 抽象
+
+`internal/tools/toolsource/toolsource.go` 定义了工具的来源层。这个抽象是 0.3.x 工具系统的地基：
+
+```go
+type ToolSource interface {
+    // Tools 返回当前可用工具的快照，调用方不得改动返回的切片
+    Tools(ctx context.Context) ([]core.Tool, error)
+    // OnChange 注册"工具集合可能变了"的回调（静态源通常不注册）
+    OnChange(func())
+    // Source 返回稳定标识，用于去重优先级的日志（"static"/"registry"/"mcp"）
+    Source() string
+}
+```
+
+三个实现，各自的 `Source()` 标识：
+
+| 实现 | Source() | 行为 |
+|---|---|---|
+| `StaticSource` | `"static"` | 构造时做一次防御性 copy，之后永不变；`OnChange` 是空操作 |
+| `RegistrySource` | `"registry"` | 包一个 `*core.Registry`，用导出的 `List`+`Get` 拍快照，`OnChange` 转发给 Registry |
+| `MultiSource` | `"multi"` | 把多个源按序合并，**按工具名 first-wins 去重**（静态 > 注册表 > MCP） |
+
+`MultiSource` 的合并逻辑值得单独看：后到的同名工具直接跳过（`seen[name]`），所以**优先级由传入顺序决定**——名字冲突时第一个源赢。任一个 `.Tools()` 报错都会被包上 `source` 标识并向上抛。所有实现对 nil 都返回哨兵错误 `ErrNilToolSource`。
+
+> 一句话：这不是"工具都在一个 Registry 里"的想象，而是**多个来源（静态内置、Registry、MCP）先合并成一份快照，谁先谁赢**。
+
+---
+
+## 二、给 LLM 的那份清单：Schema → 广告 → 执行
+
+### 2.1 工具元模型（core）
+
+`internal/tools/resources/core/tool.go` 里，`core.Tool` 是能被执行的统一契约：
+
+```go
+type Tool interface {
+    Name() string
+    Description() string
+    Category() ToolCategory      // system / core / data / knowledge / memory / external
+    Capabilities() []Capability
+    Execute(ctx context.Context, params map[string]interface{}) (Result, error)
+    Parameters() *ParameterSchema
+}
+```
+
+两个可选接口（用类型断言探测）：
+- `IdempotentTool.IsIdempotent() bool` —— 纯计算工具返回 true；有副作用的（文件 I/O、网络、状态变更）不实现或返回 false。
+- `TaggableTool.Tags() map[string]string` —— 给 LLM 路由/discovery 用的语义标签，标准 key 有 `domain` / `input_type` / `output_type` / `side_effects` / `requires_network` / `mutates_state`。
+
+对外广而告之用的是 `ToolSchema`：`Name` / `Description` / `Category` / `Parameters` / `Tags`。它来自 `Registry.GetSchemas()`，并会在广告给 LLM 前被 `ToolSchemaToLLMTool` 转成 `api/core.Tool`。
+
+### 2.2 Registry：注册、校验、渐进披露
+
+`core.Registry`（`registry.go`）要点：
+
+- `Register` / `Unregister`，`Get` / `List` / `Count`，并发安全（`sync.RWMutex`）。
+- **`Execute` 带参数校验**：在真正执行前调用 `ValidateParams`，检查`必填参数存在`、`Go 类型匹配 schema（string/integer/number/boolean/array）`、`enum 是否命中`。这能挡住一部分 LLM 传错的类型（比如数字 vs 字符串），**不会**因为类型不对直接 panic。
+- **渐进披露**：`SetActiveTools(names)` 只收窄"广告给 LLM 的清单"（`GetSchemas`/`GetLLMTools` 尊重它），`Execute`/`Get` 仍能看到并执行全部工具。nil 表示"全部 active"（零值向后兼容）。
+- 全局的 `GlobalRegistry` 已**废弃**（deprecated），`Register`/`Get`/`List`/`Execute` 操作的是空的 GlobalRegistry——生产代码现在走 DI 注入的 `*Registry` 实例。
+
+### 2.3 真正执行工具的是 ToolBinder，不是 Registry
+
+`internal/agentfabric/chat_cognition.go` 里定义了 `ToolBinder` 接口（消费端接口，sub executor 和 fabric 都满足它）：
+
+```go
+type ToolBinder interface {
+    CallTool(ctx context.Context, name string, args map[string]any) (any, error)
+    ListTools() []string
+    IsToolIdempotent(name string) bool
+    GetToolSchemas() []resources.ToolSchema
+}
+```
+
+`chatCognition`（0.3.x 的默认 ReAct 工具循环执行体，从 sub executor 下沉而来）是这样用的：
+
+1. 每轮从 `toolBinder.GetToolSchemas()` 取 Schema。
+2. 可选的 whitelist（`agents.ToolWhitelistFromParams`）把不在 `Params["tools"]` 白名单里的工具**先从广告清单里删掉**；白名单与已注册工具交集为 0 时回退到全集，不留给 LLM 空清单。
+3. 可选的预算（`agents.ToolBudgetFromParams` / `agents.ToolAllowedByBudget`）在 schema 层剔除预算用尽的工具（budget <= 0 表示不限，默认不动老路径）。同轮内对同一工具的多次调用，超预算的直接跳过并给配对的 tool 消息。
+4. `ToolSchemaToLLMTool` 转成 LLM 用 `core.Tool`。
+5. `chatClient.Chat(...)`（`ChatClient` 接口，`*llm.FailoverClient` 满足它）→ 拿 `ToolCallResponse`。
+6. 有 `ToolCalls` 就循环 `executeToolCall`：把 `tc.Function.Arguments`（JSON 字符串）`json.Unmarshal` 成 `map[string]any`，`kernelctx.WithCallerID` 打上调用者身份，然后 `c.toolBinder.CallTool(...)`。
+
+这里就有第二课：**`chatCognition` 这条路径不走 `Registry.Execute`，也就没有那层 `ValidateParams`** —— 参数是否靠谱，取决于具体 Binder 的回调实现，以及每个工具自己 `params["key"].(string)` 的类型断言。也就是说：**`Registry.Execute` 有统一校验；`ToolBinder.CallTool` 路径不一定有。** 这是两套入口，别混为一谈。
+
+一个 mermaid 把 2.2 / 2.3 的主干画在一起：
 
 ```mermaid
 graph TB
-    Request[用户请求]
-    LLM[LLM Response<br/>tool_calls]
-    subgraph "Path 1: LLM 驱动调用"
-        P1A[parseToolCallsFromResponse]
-        P1B[toolBinder.CallTool]
-        P1C[Registry.Execute]
-    end
-    subgraph "Path 2: Planner 兜底"
-        P2A[Bridge.Execute<br/>toolName为空]
-        P2B[Planner.Plan<br/>语义分析→能力规划→评分]
-        P2C[Planner.<br/>executeStepWithFallback]
-    end
-    subgraph "Path 3: Workflow Graph"
-        P3A[ToolNode.Execute]
-        P3B[ToolNode.eventSink]
-    end
-    subgraph "Path 4: MCP 外部工具"
-        P4A[MCPTool.Execute]
-        P4B[MCPClient.CallTool]
-    end
-    Request --> LLM
-    LLM --> P1A --> P1B --> P1C
-    Request --> P2A --> P2B --> P2C
-    LLM --> P3A --> P3B
-    P4A --> P4B
-    P1C --> TOOL[core.Tool.Execute]
-    P2C --> TOOL
-    P3A --> TOOL
-    P4A --> TOOL
+    REG[core.Registry<br/>RegisterGeneralTools 注入内置工具]<br/>-- 可选 -- SetActiveTools 渐进披露 --> AD
+    TS[ToolSource<br/>MultiSource 合并静态/注册表/MCP<br/>first-wins 去重]
+    TS --> SEL[ToolSelector<br/>AllSelector / TagSelector / CapabilitySelector]
+    SEL --> SCHEMA[GetToolSchemas → ToolSchema]
+    SCHEMA --> AD[广告给 LLM<br/>ToolSchemaToLLMTool / Chat API tools]
+    WL[Whitelist / Budget 过滤<br/>agents.ToolWhitelistFromParams<br/>agents.ToolBudgetFromParams] --> AD
+    AD --> LLMCALL[LLM 返回 tool_calls]
+    LLMCALL --> EXEC[chatCognition.executeToolCall<br/>解 JSON → kernelctx.WithCallerID<br/>→ toolBinder.CallTool]
+    EXEC --> TOOL[core.Tool.Execute]
+    TOOL -.->|Registry.Execute 另有<br/>ValidateParams 统一校验| REG
 ```
-
-当 LLM 决定调用一个工具时，数据长这样流：
-
-```
-LLM 返回 tool_calls (OpenAI JSON)
-    ↓
-parseToolCallsFromResponse()     [internal/llm/output/openai.go]
-    ↓ ToolCallResponse { ToolCalls: [{ID, Name, Arguments}] }
-sub-agent executor               [internal/agents/sub/executor.go]
-    ↓ 遍历 ToolCalls
-toolBinder.CallTool(name, args)  [internal/agents/sub/tools.go]
-    ↓ 查找闭包映射
-Registry.Execute(ctx, params)    [internal/tools/resources/core/registry.go]
-    ↓ 按名查找 Tool
-Tool.Execute(ctx, params)        [core/tool.go]
-    ↓
-core.Result { Success, Data, Error }
-```
-
-但这里有个隐藏分支：如果 LLM 返回的 `tool_name` 在 Registry 里不存在，或者 LLM 根本没返回 `tool_calls`，那就走 **Path 2**——Planner 兜底。
 
 ---
 
-## 二、路径一：LLM 驱动的工具调用
+## 三、运行时发现：discover_tools 与渐进披露
 
-### 2.1 toolBinder：Registry 到 Agent 的桥梁
+工具再多也不可能全塞进 context。`internal/tools/toolsource/discover_tool.go` 提供了一个元工具，叫 **`discover_tools`**（`DiscoverToolsName = "discover_tools"`）。
 
-子 Agent 不能直接拿 `GlobalRegistry` 到处用。中间隔了一层 `toolBinder`：
-
-```go
-// internal/agents/sub/tools.go
-type toolBinder struct {
-    mu       sync.RWMutex
-    tools    map[string]func(ctx context.Context, args map[string]any) (any, error)
-    registry *core.Registry
-}
-
-func (b *toolBinder) BridgeFromRegistry(registry *core.Registry) {
-    // 遍历 registry，为每个工具创建闭包
-    // 实际效果：b.tools[name] = func(ctx, args) { return t.Execute(ctx, args) }
-}
-```
-
-为什么多这一层？三个理由：
-
-1. **接口隔离**：子 Agent 不需要知道 `Registry` 的存在，它只需要 "按名字调函数"
-2. **本地优先**：`toolBinder.GetTool` 有本地 → Registry 的 fallback 链，支持子 Agent 注入私有工具
-3. **测试友好**：测试时可以直接 mock toolBinder，不需要启动整个 Registry
-
-### 2.2 LLM 工具调用协议适配
-
-参数从 LLM 的 JSON 到 Go 的 `map[string]interface{}`，这条链路看起来简单，实际上藏着不少弯弯绕：
+它的参数就一个（常量 `queryParam = "query"`，**required**）：
 
 ```go
-// internal/llm/output/openai.go
-func parseToolCallsFromResponse(choice *Choice) (*ToolCallResponse, error) {
-    // OpenAI 返回的 tool_calls 是这种结构：
-    // {
-    //   "tool_calls": [{
-    //     "id": "call_xxx",
-    //     "function": {
-    //       "name": "calculator",
-    //       "arguments": "{\"expression\": \"1+1\"}"
-    //     }
-    //   }]
-    // }
-    // arguments 是 JSON **字符串**，不是对象
-    // 需要二次反序列化
-}
-```
-
-这里有个容易忽略的点：`arguments` 是 JSON `string`，不是 JSON `object`。如果 LLM 返回非法 JSON，就会在这里崩。OpenAI 和 Anthropic 的工具调用格式还不一样——Anthropic 的 content block 里直接带 JSON object。
-
-为了统一，框架内部定义了自己的抽象：
-
-```go
-// internal/llm/output/toolcall.go
-type ToolCapable interface {
-    GenerateWithTools(ctx context.Context, prompt string, 
-        tools []ToolDefinition, choice ToolChoice) (*ToolCallResponse, error)
-    SendToolResult(ctx context.Context, messages []map[string]interface{},
-        toolResults []ToolResult) (*ToolCallResponse, error)
-}
-
-type ToolCall struct {
-    ID        string `json:"id"`
-    Name      string `json:"name"`
-    Arguments string `json:"arguments"`  // JSON string
-}
-```
-
-每一家 LLM 的 adapter 自己负责把供应商格式转成 `ToolCallResponse`。这样一来，**工具注册、调度、执行**对 LLM 供应商完全透明。
-
-### 2.3 参数校验的缺口
-
-这是整个调用链路里最让我睡不着的一个问题。看代码：
-
-```go
-// internal/tools/resources/builtin/math/calculator.go
-func (t *Calculator) Execute(ctx context.Context, params map[string]interface{}) (core.Result, error) {
-    expression, ok := params["expression"].(string)  // 手动类型断言
-    if !ok || expression == "" {
-        return core.NewErrorResult("invalid_expression"), nil
+func (t *discoverToolsTool) Parameters() *core.ParameterSchema {
+    return &core.ParameterSchema{
+        Type: "object",
+        Properties: map[string]*core.Parameter{
+            queryParam: {Type: "string",
+                Description: "Search query: matches tool name, description, or tags (case-insensitive substring)."},
+        },
+        Required: []string{queryParam},
     }
-    // ...
 }
 ```
 
-每个工具自己 `params["key"].(string)` 断言参数类型。没有统一校验层。这意味着：
+执行逻辑：
+- 从 `source.Tools(ctx)` 拿快照 → `searchTools(tools, query)`：对每个工具按**名称 / 描述 / 任一标签 key 或 value** 做大小写不敏感的子串匹配（`toolMatches`）。
+- 结果 `json.Marshal` 成一个 JSON **字符串**（`[]discoverToolEntry`，`{name, description}` 紧凑形式）放进 `Result.Data`——所以数据落到 `%v` 格式化后是合法 JSON，LLM 能看到，展开器也能解析。
+- 上限 `maxDiscoverResults = 20` 条，保持 context 小。
 
-- LLM 传了 `"expression": 123`（数字不是字符串）→ panic
-- LLM 传了 `"expression": null` → panic
-- LLM 忘了传 `expression` → `ok` 为 false，返回 "invalid_expression"，LLM 和用户都看不懂
+关键的"展开"在 `internal/agentloop/engine.go`。`agentloop.Engine` 不认识 `toolsource`，它只依赖一个窄接口 `ToolExpander`：
 
-更麻烦的是，这个错误信息会在 LLM 对话里继续传播——"invalid_expression" 被送回 LLM，LLM 重新生成参数，又传错，又回来，循环。我在实际测试中见过 5 轮以上的这种死循环。
+```go
+type ToolExpander interface {
+    Expand(ctx context.Context, names []string) ([]core.Tool, error)
+}
+```
 
-**根本原因**：`ParameterSchema` 定义了一套完整的参数规则，但没有任何代码在 `Execute` 之前校验它。定义和执行之间，隔了一层空气。
+`Engine.executeToolCalls` 里，当 LLM 调用的恰好是 `discover_tools`、且执行成功（`err == nil && result.Success`）时，走 `expandDiscoveredTools`：
+
+1. 把结果当 `[]struct{ Name string }` 解析出名字；
+2. 调 `req.ToolExpander.Expand(ctx, names)` 得到 LLM 工具定义；
+3. 按 `Function.Name` 去重，追加进 `st.activeTools`，供**后续迭代**使用。
+
+注意这里的"自动追加"是 **显式由 engine 代码实现**的：只有 LLM **主动调用了 `discover_tools`**，该轮展开才会发生；`ToolExpander == nil` 时展开被禁用，元工具结果只作为文本回给 LLM（不会变成可调用工具）。所以不是"工具自动重展开"，而是"**被发现的工具名，下一轮才可调用**"。
 
 ---
 
-## 三、路径二：Capability Planner 兜底调度
+## 四、选择器：把"候选池"缩成"本轮子集"
 
-这是后来加的第四条路——不对，在文章结构里是第二条路。因为它在执行链路上的位置，排在 LLM 驱动之后、Workflow 之前。
-
-### 3.1 为什么需要这条路径
-
-Path 1 有一个前提假设：**LLM 知道要调哪个工具**。但这个假设不是每次都成立：
-
-- 新工具刚上线，LLM 的训练数据还没覆盖到
-- 用户描述需求时没提到工具名（"计算1+1" 而不是 "调calculator算1+1"）
-- LLM 生成 tool_name 时幻觉了，写了个不存在的名字
-- 工具被卸载/重命名了，LLM 不知道
-
-这些场景下，Path 1 直接失败。传统的做法是返回一个错误让 LLM 重试，但重试只是碰运气——LLM 大概率生成同样的错误名字。
-
-所以核心思路变了：**LLM 不知道用什么工具 → 我替它选**。
-
-### 3.2 ToolExecutionBridge：统一入口
-
-`ToolExecutionBridge` 是两条路径的分叉点：
+`internal/tools/toolsource/selector.go` 定义 `ToolSelector`：
 
 ```go
-// internal/tools/planner/bridge.go
-func (b *ToolExecutionBridge) Execute(ctx, toolName, params, userRequest) (Result, error) {
-    // Path 1: LLM 给了工具名且存在 → 直接执行
-    if toolName != "" {
-        tool, exists := b.registry.Get(toolName)
-        if exists {
-            return tool.Execute(ctx, params)
-        }
-        log.Warn("tool not found, triggering planner fallback")
-    }
-
-    // Path 2: Planner 兜底
-    plan, _ := b.planner.Plan(ctx, userRequest)
-    return b.executePlan(ctx, plan, params)
+type ToolSelector interface {
+    Select(ctx context.Context, input string, available []core.Tool) ([]core.Tool, error)
 }
 ```
 
-逻辑很简单：
+三个实现：
+
+| 选择器 | 行为 | 兜底 |
+|---|---|---|
+| `AllSelector`（默认） | 原样返回 all，按 `Name` 排序保证确定性 | — |
+| `TagSelector` | 从 input 提关键词，只留 `TaggableTool` 且标签值命中关键词的工具 | 提取不到关键词或全不命中 → 返回 all（不给 LLM 空清单） |
+| `CapabilitySelector` | 复用 `planner.ToolResolver` + `planner.ToolScorer`，每个能力挑 top-1 工具 | 提取不到能力/解析失败 → 返回 all |
+
+### 4.1 TagSelector 的关键词提取（extractKeywords）
+
+规则写得很具体：
+- 只保留字母数字 token（`r<'a'||r>'z'` 等分割）；
+- 丢掉 stop word（`the/a/an/and/or/to/of/in/on/for/is/.../please/me/my/how/what/who/some/get/want/need/use/using/via/into/out/...`）；
+- 丢弃单字符 token，`len(f)<2` 不要，重复关键词合并。
+- `tagsMatchKeywords`：只要**任一标签 value** 含**任一关键词**（大小写不敏感）就算命中——注意是 value，不是 key。
+
+### 4.2 CapabilitySelector 的能力提取（capability_selector.go）
+
+这才是"关键词 → 能力 → 工具"的桥。`CapabilityExtractor func(input string) []string`，默认实现 `DefaultCapabilityExtractor` 复用 `extractKeywords`，再过一个 `keywordToCapability` 映射。这个映射很全，随手摘几组：
+
+| 关键词 | 派生能力（planner 能力名） |
+|---|---|
+| `math` / `calculate` / `calc` / `add` / `multiply` | `Arithmetic` |
+| `sum` | `Summation` |
+| `hash` / `sha` / `md5` | `Hashing` |
+| `regex` / `pattern` | `Regex` |
+| `json` | `JSONProcessing` |
+| `pdf` | `PDFParsing` |
+| `api` / `http` / `url` | `HTTPRequest` |
+| `search` / `web` / `google` | `WebSearch` |
+| `code` / `run` / `execute` | `CodeExecution` |
+| `embedding` / `vector` | `Embedding` |
+
+`CapabilitySelector.Select` 对每个提取出的能力：构造 `&planner.CapabilityRequirement{Name: cap}` → `resolver.Resolve` → `scorer.Score` → 取 `scored[0].ToolName` → 从 available 里按名取出对应工具，去重。能力名必须与 planner 里的常量一致（`toolsource` 里用 `const` 重新暴露了一组 24 个 `capXxx`）。
+
+> 一句话：选择器把"全局工具池"按本轮输入缩成"给 LLM 的子集"，**做不出来就回退全量**，宁可多看也不能给空清单。
+
+---
+
+## 五、内置工具目录（builtin）
+
+真正被注册进 Registry 的内置工具在 `internal/tools/resources/builtin/builtin.go` 的 `RegisterGeneralTools(*core.Registry, ...GeneralToolsDeps)` 里。固定注册的一批（都带语义标签）：
+
+```mermaid
+graph LR
+    subgraph 始终注册
+        MATH[calculator · datetime · text_processor]
+        NET[http_request · web_scraper · web_search]
+        FILE[file_tools]
+        TEXT[json_tools · data_validation · data_transform<br/>regex_tool · log_analyzer · string_utils]
+        SYS[system/id_generator]
+        EXEC[execution/code_runner]
+        EMB[embedding]
+        CRYPTO[hash_tool]
+        PDF[pdf_tool]
+    end
+    subgraph 依赖注入才注册
+        KNOW[knowledge_search / add / update / delete<br/>correct_knowledge]
+        MEM[memory_search · user_profile<br/>distilled_memory_search]
+        PLANTOOL[task_planner]
+    end
+    MATH --> C[core.Registry<br/>toolsource.RegistrySource 可见]
+    NET --> C
+    FILE --> C
+    TEXT --> C
+    SYS --> C
+    EXEC --> C
+    CRYPTO --> C
+    PDF --> C
+    KNOW --> C
+    MEM --> C
+    PLANTOOL --> C
+```
+
+表格化（按 `builtin.go` 目录）：
+
+| 领域 | 工具名 | 标签要点 |
+|---|---|---|
+| 数学 | `calculator` / `datetime` / `text_processor` | domain=math / text，side_effects=false |
+| 网络 | `http_request` / `web_scraper` / `web_search` | requires_network=true；`http_request` side_effects=true |
+| 文件 | `file_tools` | side_effects=true, mutates_state=true；受 `ARES_FILE_TOOLS_ALLOWED_DIR` 限制 |
+| 数据 | `json_tools` / `data_validation` / `data_transform` | domain=data，side_effects=false |
+| 文本 | `regex_tool` / `log_analyzer` / `string_utils` | domain=text，side_effects=false |
+| 系统 | `id_generator` | domain=system |
+| 执行 | `code_runner` | Python **默认禁用**，需 `EnablePython(true)` 显式开启 |
+| 嵌入 | `embedding` | requires_network=true |
+| 加密 | `hash_tool` | domain=crypto |
+| PDF | `pdf_tool` | domain=pdf；与 file_tools 同一 allowed dir |
+| 知识（注入依赖） | `knowledge_search/add/update/delete`、`correct_knowledge` | 依赖 `GeneralToolsDeps` 里的后端 |
+| 记忆（注入依赖） | `memory_search`、`user_profile`、`distilled_memory_search` | 依赖 MemoryMgr / DistilledRepo |
+| 规划（注入依赖） | `task_planner` | 依赖 `LLMClient` |
+
+有两个"秒懂"级实现值得点名：
+
+- **`calculator`**（`builtin/math/calculator.go`）基于 `expr` 引擎，函数多达 27 个：基础 `sqrt/abs/sin/cos/tan/log/round/floor/ceil/pow/min/max`、组合 `factorial/nPr/nCr`、数论 `gcd/lcm/isPrime`、统计 `mean/variance/stddev/median`、概率 `binomial/normalPdf/poissonPdf`、常量 `pi/e`。表达式编译结果按表达式缓存（`compiled map[string]*vm.Program`，上限 `maxCompiledPrograms=512`），并发用 `RWMutex`。它是 `IdempotentTool`（`IsIdempotent()==true`）。
+
+- **`code_runner`** 和安全护栏：`RegisterGeneralTools` 的注释明确说 "CodeRunner is registered with **Python DISABLED** by default"，HTTPRequest/WebScraper 在 HTTP client 层做 SSRF 过滤，FileTools 用 `WithAllowedDir` 默认挡掉路径穿越。也就是**默认安全偏保守，逃生必须显式开**。
+
+工具分类常量（`core.ToolCategory`）完整是 `system / core / data / knowledge / memory / external`。
+
+> 注意一个"名实一致性"的坑：planner 的静态 `capabilityMapping`（见下文）里写的工具名是 `calculator / hash_tool / string_utils / regex_tool / pdf_tool / web_search ...`，这些必须和 `NewBaseToolWithCapabilities(...)` 的第一个字符串参数写进的名字对上，否则 resolver 会"解析出来但注册表里找不到"而被过滤掉。
+
+---
+
+## 六、能力规划兜底：planner + ToolExecutionBridge
+
+LLM 不会次次选对工具。`internal/tools/planner` 提供了确定性的规划兜底。`planner/doc.go` 写的流水线是 **6 步**（比 5 步多一步 ExecutionPlanner）：
+
+```mermaid
+graph TD
+    REQ[用户请求]
+    REQ --> A[1 SemanticAnalyzer<br/>规则→Intent]
+    A --> CP[2 CapabilityPlanner<br/>Intent→能力需求，含去重/依赖]
+    CP --> R[3 ToolResolver<br/>静态 mapping + provider 动态能力]
+    R --> S[4 ToolScorer<br/>静态元数据 + 历史证据]
+    S --> EP[5 ExecutionPlanner<br/>单步或 DAG 计划]
+    EP --> PE[6 ParameterExtractor<br/>从自然语言填参数]
+    PE --> BRIDGE[ToolExecutionBridge.Execute<br/>直接执行 or UnitStep/DAG]
+```
+
+### 6.1 SemanticAnalyzer：20 条内建关键词规则
+
+`analyzer.go` 的 `defaultRules()` 按"更具体在前"排序。规则用 `intentRule{keywords, goal, operation, complexity, capabilities}` 描述，匹配是 **OR**（`matchAnyKeyword` 用 `strings.Contains`，注意是字面子串，不是正则——注释专门提醒了别写正则进 keywords）。举例：
+
+```
+{keywords:["累加","求和"], capabilities:["Summation","Arithmetic"]}
+{keywords:["hash","md5","sha1","sha256","sha512","哈希"], capabilities:["Hashing"]}
+{keywords:["pdf","document"], capabilities:["PDFParsing","TextExtraction"]}
+{keywords:["mean","median","stddev","variance","average","平均","标准差","方差","统计"], capabilities:["Statistics","Arithmetic"]}
+{keywords:["gcd","lcm","prime","公约数","素数"], capabilities:["NumberTheory","Arithmetic"]}
+...
+```
+
+如果一条都不命中，`Analyze` 直接返回 `"no matching rule for request"` 错误——**规划兜底不是万能的**，它只认得规则库里的模式。
+
+### 6.2 CapabilityPlanner：去重 + 依赖
+
+`capability.go` 的 `capabilityPlanner.Plan` 把 Intent 的能力列转成 `CapabilityRequirement`。有子sumption：`Summation ⊇ Arithmetic`、`TextExtraction ⊇ PDFParsing`、`ExpressionEvaluation ⊇ Arithmetic`——父能力出现时子能力被标记为已见，不发冗余步骤。还有 `dependenciesFor`：`TextExtraction → PDFParsing`、`Embedding → [TextExtraction, StringManipulation]`。
+
+### 6.3 ToolResolver：静态映射 + 动态能力
+
+`resolver.go`。`capabilityMapping` 是静态"能力 → 工具名"表（`Arithmetic→calculator`、`Hashing→hash_tool`、`Regex→regex_tool`、`WebSearch→web_search`、`CodeExecution→code_runner` ...）。`toolMetadata` 是工具的静态评分元数据（`cost/latency/deterministic/composable/sideEffects`，如 `calculator{cost:1,latency:1ms,deterministic:true,composable:true}`、`http_request{cost:5,deterministic:false,sideEffects:true}`）。
+
+`Resolve` 收集两路候选：静态 mapping + provider 的 `GetToolCapabilities()`（动态注册工具）。**最后按 `provider.ListTools()` 过滤，只留真注册的。**
+
+### 6.4 ToolScorer：评分公式（有两套）
+
+planner 里其实有**两个 scorer**：
+
+- `toolScorer`（`scorer.go` 的 `NewToolScorer`）：
+  ```
+  BaseScore   = (1/Cost)*10 + Deterministic?3:0 + Composable?2:0
+  EvidenceScore = SuccessRate*20 - (有证据时) min(latencyMs/100, 5)
+  Penalty     = SideEffects ? 5 : 0
+  Final       = BaseScore + EvidenceScore - Penalty
+  ```
+- `evidenceScorer`（`evidence.go` 的 `NewEvidenceScorer`）额外在**有证据且失败数>0**时扣 `failureRatio*10`，证据按 `tool:capability` 聚合。
+
+算个真实的账（用默认 SuccessRate=0.95、无证据、无延迟惩罚）：
+- `calculator`：Base=10+3+2=15，Evidence=0.95*20=19，Penalty=0 → **34**（不是网文里的"35"，差的 1 分来自默认成功率 0.95 而非 1.0）。
+- `http_request`：Base=(1/5)*10+0+2=**4**（网文写"base=2"，漏了 Composable 的 +2），Evidence=19，Penalty=5 → **18**。
+
+所以 `calculator` 比 `http_request` 高约 16 分，靠的是确定 + 低成本 + 无副作用。但**具体分数高度依赖是否有历史证据**（反射到 `SuccessRate`、延迟惩罚、失败惩罚），别当固定值背。
+
+证据流：`ToolExecutionBridge` 每次执行后 `evidence.Save(...)`（含工具名/能力名/成功/延迟），默认 `NewMemoryEvidenceStore()`（进程内，重启丢失）；跨进程实现需按 `EvidenceStore` 接口自写。
+
+### 6.5 ParameterExtractor：自然语言 → 参数
+
+`extractor.go` 只处理它能识别的那几个"纯模式"（正则硬编码），不认识的返回 nil 让后续决定。举例（来自真实正则）：
+
+```
+"从1到100" / "from 5 to 10"   → expression = "(b-a+1)*(a+b)/2"  （顺带修正：不是 b*(b+1)/2）
+"2的10次方" / "…的…次方"      → expression = "2**10"
+"根号16"                      → expression = "sqrt(16)"
+"nCr(10,3)" / "组合(10,3)"   → expression = "nCr(10,3)"
+"factorial(10)" / "10的阶乘"   → expression = "factorial(10)"
+"median/方差/..."             → expression = "median(1,2,3)" 等
+"12和18的最大公约数"           → expression = "gcd(12,18)"
+```
+
+### 6.6 ToolExecutionBridge：合并执行 + 多步 DAG
+
+`bridge.go` 的 `Execute(ctx, toolName, params, userRequest)`：
 
 | 条件 | 行为 |
 |---|---|
-| LLM 给了工具名 + 存在 | 直接执行（Path 1） |
-| LLM 给了工具名 + 不存在 | 日志警告 → 走 Planner |
-| LLM 没给工具名 + 有用户请求 | 走 Planner |
-| 两者都没有 | 返回错误 |
+| `toolName != ""` 且注册表里存在 | 直接执行，并 `evidence.Save`（能力名取 `primaryCapabilityName(tool)`，即 `Capabilities()[0]`） |
+| `toolName != ""` 但不存在 | 日志警告 → 走 planner 兜底 |
+| `userRequest == ""` | 报错 `"tool not found and no user request for fallback"` |
+| 走 planner | `Plan` → DAG 校验 → 单步 or 多步 |
 
-### 3.3 Planner 的五步流水线
+多步计划先 `NewDAGValidator().Validate`：结构性错误（`cycle_detected` / `missing_dependency` / `incompatible_io`）阻断；IO 不兼容是 advisory 只告警。然后 `executeMultiStep` 用 `topoSort`（Kahn 算法，检测循环）定序，每步 `mergeParams`（计划默认 → 依赖输出绑定 → 用户参数覆盖），再 `executeStepWithFallback`（主工具 → `FallbackToolNames` 逐个 fallback，全失败返回最后错误；证据只在成功那次保存）。
 
-Planner 接到请求后，执行五步确定性流水线：
+依赖输出绑定（`bindDependencyOutput`）按能力猜字段名：如 `PDFParsing` 输出找 `text/content`，`Arithmetic` 找 `result/value/number`，`WebSearch` 找 `results/output`；输入侧 `inputParamNamesForStep` 优先用工具 schema 的 `Required`，再补能力默认名。
 
-```text
-用户请求 "计算1到100万的和"
-    ↓
-Step 1: 语义分析  (SemanticAnalyzer)
-    → Intent{goal: "mathematical computation", capabilities: ["Summation"]}
-    ↓
-Step 2: 能力规划  (CapabilityPlanner)
-    → [CapabilityRequirement{Name: "Summation", Tool: "calculator"}]
-    ↓
-Step 3: 工具解析  (ToolResolver)
-    → [ToolCandidate{Name: "calculator", Score: 0, Cost: 1}]
-    ↓
-Step 4: 证据评分  (ToolScorer)
-    → calculator 28.5分 vs web_search 15.3分
-    ↓
-Step 5: 参数提取  (ParameterExtractor)
-    → {"expression": "1000000*(1000000+1)/2"}
-    ↓
-执行计划 → Bridge.Execute()
-```
+> 关于"生产怎么接"：`planner/doc.go` 说 cmd/ares 里 `newToolBinder(internalReg)` + `newPlannerBridge(internalReg)` + `binder.WithPlannerBridge(bridge)`，工具名不存在时 Binder 回退到 bridge。**这部分我依据 doc.go 转述，serve 的具体接线我还没逐行读（待核实）**，但它说明了一个重要事实：planner 兜底挂在 **Binder 层**，与 `agentfabric` 的 `ChatCognitionDeps.ToolBinder` 接口正好对上。
 
-**Step 1：语义分析**
+---
 
-`SemanticAnalyzer` 是一个规则引擎，目前内置了 20 条规则，覆盖中英文：
+## 七、本机工具发现 + 环境能力检索
+
+### 7.1 discovery：探测本机命令
+
+`internal/tools/discovery/discover.go` 的 `Discoverer` 是"本机工具发现"原语：对 allowlist 里的每个命令做 `command -v` + `--help`，把存在的命令适配成 `CommandTool`。
+
+安全边界写得非常明确（包注释原文）：
+- **只有 allowlist 里的命令才被探测/执行**，命令名在构造时固定，`Execute` 只是把用户参数用 `exec.CommandContext` 传进去，**没有 shell、没有字符串插值**，不能注入元字符或调未列入的白名单二进制。
+- 输出上限 `maxCommandOutputBytes = 1 MiB`，超限当错误（不静默截断），避免 `yes` 之类把内存打爆。
+- stdio 分 stdout/stderr，描述取 `--help` 的**第一行非空**。
+- `Parameters` 只声明一个 `"args"` 数组参数。
+
+### 7.2 envcap：跨工具/技能/命令的统一检索
+
+`internal/tools/envcap` 的 `Searcher` 聚合三路：注册工具（`ToolLister`，`RegistryLister` 适配 Registry）、技能（`skills.Registry`）、本机命令（`discovery.Discoverer`）。`Search` 按 kind（tool→skill→command）排再按名排序。`search_tool.go` 把它包成一个 `core.Tool`，名为 **`search_capabilities`**（`SearchToolName`），参数 `query`（required）+ `limit`（默认 20）。这就是渐进披露的另一条入口：先拿到 name+description，真要用时再按名调用。
+
+---
+
+## 八、L2 图里的 toolCognition：`arg.` 命名空间
+
+除非 `DAGExecution.Enabled=true`，生产执行体默认还是 `chatCognition`；**L2 图目前还没接入生产 serve 路径，是 test-only 的种子实现**（`l2graph.go` 顶部原文："not yet wired into the production serve path – until it is, peers keep their default ReAct chatCognition and this graph stays test-only"）。但它的一个设计值得单独讲，因为它和参数命名强相关：
+
+`routerCognition.ExecuteStep` 按 `task.AgentType` 分发：`tool/<name>` → `toolCognition`，`ares/answer` → `answerCognition`，`ares/root` → `rootCognition`，`ares/plan` → `planner`。其中 `toolCognition.ExecuteStep` 只做一件事：
 
 ```go
-// internal/tools/planner/analyzer.go
-func defaultRules() []intentRule {
-    return []intentRule{
-        {keywords: []string{"累加", "求和"},
-            capabilities: []string{"Summation", "Arithmetic"}},
-        {keywords: []string{"pdf", "document"},
-            capabilities: []string{"PDFParsing", "TextExtraction"}},
-        {keywords: []string{"hash", "sha256", "md5"},
-            capabilities: []string{"Hashing"}},
-        {keywords: []string{"mean", "stddev", "average", "平均", "方差"},
-            capabilities: []string{"Statistics", "Arithmetic"}},
-        {keywords: []string{"factorial", "permutation", "组合", "阶乘", "离散"},
-            capabilities: []string{"DiscreteMath", "Arithmetic"}},
-        // ... 共 20 条规则
-    }
-}
+res, err := c.binder.CallTool(ctx, c.tool, argsFromPayload(task.Payload))
 ```
 
-匹配逻辑是 OR——任意一个关键词命中就返回对应的 intent。规则按优先级排序，更具体的规则（如"累加"）排在通用规则（如"计算"）前面。
+关键在 `argsFromPayload` 和常量 `argMetadataPrefix = "arg."`：
 
-**Step 2：能力规划**
+- 规划器在 `L2Graph.AddToolNode(ctx, id, tool, args, dependsOn)` 里，用 `argsMetadata(args)` 把参数写成节点 Metadata，**每个 key 都加 `"arg."` 前缀**（`arg.<key>=<value>`）。
+- 执行时 `toolCognition` 经 `argsFromPayload(task.Payload)` **只读 `arg.` 前缀开头的键**（前缀剥掉后作为参数名），其余键（投影用的 `input`、调度恢复用的 `checkpoint` 等信封管道）全部忽略。
+- 于是**只有真实参数能进 `CallTool`**，严格 schema（`additionalProperties:false`）的工具才接受这次调用——这就是为什么参数要活在 `arg.` 命名空间里。
 
-CapabilityPlanner 把 Intent 里的能力列表转成有序的 `CapabilityRequirement`。大部分请求是单步的，直接 1:1 映射。复杂请求（如 PDF→Text→Embedding）会生成多步依赖链。
-
-有个关键去重逻辑：如果 `Summation` 已出现，自动消融 `Arithmetic`，因为求和隐含了算术能力。
-
-**Step 3：工具解析**
-
-ToolResolver 将能力映射到具体的工具。既有静态映射表（calculator→Arithmetic），也会查询 provider 的 `GetToolCapabilities()` 来发现动态注册的工具（如 MCP 工具）。
-
-只有实际注册在 provider 里的工具才会进入候选列表。
-
-**Step 4：证据评分**
-
-这是整个 planner 里唯一用"历史经验"的地方。评分公式：
-
-```
-BaseScore = (1 / Cost) × 10 + (Deterministic ? 3 : 0) + (Composable ? 2 : 0)
-EvidenceScore = SuccessRate × 20 - latencyPenalty - failurePenalty
-Penalty = SideEffects ? 5 : 0
-Final = BaseScore + EvidenceScore - Penalty
+```mermaid
+graph LR
+    PLAN[plannerCognition<br/>新增 AddToolNode] -->|"args 写成<br/>arg.<key>=<value>"| META[(节点 Metadata)]
+    META --> PAYLOAD[task.Payload<br/>`input` / `checkpoint` 等信封键也在里面]
+    PAYLOAD --> ARG[argsFromPayload<br/>只剥 arg. 前缀的键]
+    ARG --> CALL[ToolBinder.CallTool<br/>tool 名 = 节点 capability tool/&lt;name&gt;]
+    CALL --> OUT[StepOutcome → 任务信封]
 ```
 
-- calculator（cost=1, deterministic, composable）→ base=15
-- 100% 成功率 + 1ms 延迟 → evidence ≈ 20
-- 无副作用 → penalty=0
-- **总计 ≈ 35 分**
+`argsFromPayload` 的解析是"尽力而为"：值以 `{` 或 `[` 开头且能 `json.Unmarshal` 就算 JSON 解码，否则原样传字符串（所以文件路径这类纯字符串不会被误当 JSON）。同名函数 `extractArgsJSON`（供 `CountToolClass` 反推 argShape）逻辑类似。
 
-- http_request（cost=5, 有副作用）→ base=2
-- 90% 成功率 + 300ms 延迟 → evidence ≈ 15
-- 副作用惩罚 → penalty=5
-- **总计 ≈ 12 分**
-
-calculator 比 http_request 高 20 多分，这是确定性 + 低成本 + 高成功率的累积优势。
-
-证据来自 `EvidenceStore`，每次工具执行结果都会被记录并聚合。没有历史数据时，使用静态默认值。
-
-**Step 5：参数提取**
-
-`ParameterExtractor` 把自然语言里的数字和操作提取出来，生成工具的参数字段：
-
-```
-"从1累加到100万"   → expression="1000000*(1000000+1)/2"  (高斯公式)
-"2的10次方"       → expression="2**10"
-"根号16"          → expression="sqrt(16)"
-"12和18的最大公约数" → expression="gcd(12,18)"
-"计算1,2,3,4,5的平均值" → expression="mean(1,2,3,4,5)"
-"10的阶乘"         → expression="factorial(10)"
-```
-
-参数提取器仅对常见模式生效。不在模式里的请求，保持空参数让 LLM 后续决定。
-
-### 3.4 多步 DAG 执行
-
-Planner 支持多步执行。当请求需要多个工具协作时（如"下载 PDF → 提取文字 → 向量化"），会生成 DAG：
-
-```go
-ExecutionPlan{
-    PlanID: "uuid",
-    IsMultiStep: true,
-    Steps: [
-        {StepID: "fetch", Tool: "web_search", DependsOn: []},
-        {StepID: "extract", Tool: "pdf_tool", DependsOn: ["fetch"]},
-        {StepID: "embed", Tool: "embedding", DependsOn: ["extract"]},
-    ],
-}
-```
-
-执行前会经过 `DAGValidator` 校验：
-
-| 校验项 | 阻断执行？ |
-|---|---|
-| 循环依赖（A→B→C→A） | ✅ 阻断 |
-| 依赖的工具不存在 | ✅ 阻断 |
-| IO 类型不兼容 | ✅ 阻断 |
-| 重复 StepID | ✅ 阻断 |
-| 空执行计划 | ✅ 阻断 |
-
-通过校验后，`Bridge.executeMultiStep()` 用拓扑排序确定执行顺序，逐步骤执行，每步支持 fallback 工具。
-
-### 3.5 23 条用例实测
-
-我用本地 Ollama 的 llama3.2（3B 小模型）测了 22 条请求，真实工具执行（不是 mock）：
-
-```
-calculator("1+1")             = 2          ✅
-calculator("100*(100+1)/2")   = 5050       ✅ 高斯公式
-calculator("sin(pi/2)+cos(0)")= 2          ✅ 三角函数
-calculator("gcd(12,18)")      = 6          ✅ 最大公约数
-calculator("factorial(10)")   = 3628800    ✅ 阶乘
-calculator("nCr(10,3)")       = 120        ✅ 组合数
-calculator("variance(1..5)")  = 2          ✅ 方差
-calculator("isPrime(17)")     = 1          ✅ 素数判断
-hash_tool sha256("hello")     = 2cf24dba.. ✅
-string_utils upper            = HELLO WORLD ✅
-```
-
-22/22 全部通过。更重要的是，**换模型不需要改代码**——LLM 只负责生成 tool_name 和参数，实际执行规则由 planner 的确定性引擎保证。
+> 给读者的一课：**同一套参数，两套路径两套取法**——ReAct 的 `chatCognition` 直接解 `tc.Function.Arguments`；L2 的 `toolCognition` 只认 `arg.` 前缀。分清你所在的执行体，才读得对参数。
 
 ---
 
-## 四、路径三：Workflow Graph 的 ToolNode
+## 九、已知问题与坦诚反思
 
-当工具调用发生在 Workflow 编排中时，走的是 ToolNode 路径。这一条路径相对封闭，与 agent 层隔离。
+1. **参数校验是"两本账"**：`Registry.Execute` 有 `ValidateParams`，但 `chatCognition`→`ToolBinder.CallTool` 路径不经过它，参数合法性取决于具体 Binder 回调与每个工具自己的类型断言。这是风险点，不是统一防线。
 
-```go
-// internal/workflow/graph/node.go (ToolNode)
-func (n *ToolNode) Execute(ctx context.Context, state State) (State, error) {
-    // 1. 从 state 提取工具名和参数
-    toolName := state.Get("tool_name").(string)
-    params := state.Get("params").(map[string]any)
-    
-    // 2. 从全局 Registry 获取工具
-    tool, err := n.registry.Get(toolName)
-    
-    // 3. 执行并写回 state
-    result, err := tool.Execute(ctx, params)
-    state.Set("result", result)
-    return state, nil
-}
-```
+2. **planner 是"规则发动机"不是"万能兜底"**：`Analyze` 只认内建 20 条关键词规则，不命中直接报错；`ParameterExtractor` 只认硬编码正则。超出模式集的自然语言（比如复杂中文句式）规划不进。
 
-ToolNode 做了三件事：
-1. 从 `State` 中提取输入（工具名 + 参数）
-2. 从 Registry 获取工具、执行
-3. 把结果写回 `State`
+3. **L2 图未接入生产**：`DAGExecution` 门默认关闭，`toolCognition` / `arg.` 命名空间目前只在测试里跑。
 
-没有参数校验，没有重试，没有结果格式化。这些问题在 workflow 体系下被 ToolNode 的 `eventSink` 机制部分补偿了——每次执行都有完整的事件追踪和 execution_id，方便后续 debug。
+4. **scorer 分数会漂移**：`toolScorer` 与 `evidenceScorer` 公式不同（后者有失败惩罚），且是否携带 `tool:capability` 证据、默认 SuccessRate=0.95，都会改变最终分——评分只能当排序参考，不是稳定常数。
 
-ToolNode 目前不支持 Planner 兜底。如果要加，需要在 ToolNode 的执行逻辑里加一个 `Bridge.Execute` 的调用分支。这是个已知缺口——workflow 和 planner 两条路径目前还没有打通。
+5. **discovery 依赖本机**：`discovery` 只在 allowlist 且命令存在于宿主时才注册工具；本机没有的命令被静默跳过（graceful degrade）。
+
+6. **服务端接线待核实**：`cmd/ares` 里 `toolBinder`/`ToolExecutionBridge`/envcap `Searcher` 的具体装配、以及 `discover_tools` 到底挂在哪个 `ToolSource` 上，我依据 doc.go/包注释转述，尚未逐行核对（待核实）。
 
 ---
 
-## 五、路径四：MCP 外部工具适配
+## 系列文章
 
-当 Agent 需要调用外部系统（如数据库查询、第三方 API、自定义脚本）时，走 MCP 路径。
+| # | 主题 | 你会学到什么 |
+|---|------|-------------|
+| I | 架构总览 | 全局视角 + 两级同构 MutableDAG + 全模块拆解 |
+| II | Agent 和声协议 | Agent 怎么通信 |
+| III | 记忆蒸馏 | `ares_experience`/`ares_memory` 怎么记住和遗忘 |
+| IV | 工作流引擎 | `workflow/engine.MutableDAG`：任务怎么在 DAG 里流、怎么进化 |
+| V | **本文** | `tools/toolsource` 怎么发现、检索、绑定工具 |
+| VI | 安全与可观测 | `ares_events`/`introspect` 怎么看到发生了什么 |
+| VII | 运行时与生命周期 | Agent 怎么活和死、怎么复活 |
+| VIII | 事件系统 | 状态怎么记录和恢复 |
+| IX | 竞技场 / 故障注入 | `aresrecovery.Chaos` 怎么故意搞破坏再验证恢复 |
+| X | 检索系统 | 怎么找到相关记忆 |
+| XI | 自主进化 | `evolution` 怎么只 patch L1、怎么发布 |
+| XIII | Bootstrap 与 API | `ares_bootstrap` 怎么无痛接线 |
+| XV | MCP 集成 | `ares_mcp` 怎么教 Agent 用工具 |
+| 19 | 存储层 | `storage/postgres` + `services/embedding` |
+| 20 | LLM 客户端层 | `llm` Failover、多 provider 抽象 |
+| 21 | 评估框架 | `ares_eval` EvaluatorRegistry / LLMJudge |
 
-```go
-// internal/ares_mcp/mcp_tool.go
-type MCPTool struct {
-    client     *MCPClient
-    serverName string
-    toolDef    *MCPToolDef
-}
+每篇文章遵循同一个模式：**问题 → 设计旅程 → 权衡取舍 → 坦诚反思。**
 
-func (t *MCPTool) Execute(ctx context.Context, params map[string]interface{}) (core.Result, error) {
-    // 1. 参数序列化成 JSON
-    // 2. 通过 MCPClient 发送 JSON-RPC 请求（stdio/SSE）
-    // 3. 反序列化返回结果
-    return result, nil
-}
-```
+不营销。不"比 X 快 10 倍"。只有工程师聊工程。
 
-MCP 工具在 Registry 里和内置工具完全平级。调用方不需要知道这个工具是 Go 代码还是远程进程。
+我把能写进代码的都写进了下表，作为这篇的"断言清单"，方便你对着源码查：
 
----
-
-## 六、结果格式化：被低估的一层
-
-工具执行完成后，结果怎么从 `core.Result` 变成 LLM 能看懂的文字？这个环节比大多数人想象的重要。
-
-工具执行返回的 `Result.Data` 通常是 `map[string]interface{}`：
-
-```json
-{"result": 5050, "expression": "100*(100+1)/2"}
-```
-
-LLM 不是 JSON 解析器。它需要自然语言形式的结果描述。但问题来了——不同工具的输出形状完全不同，无法用一个统一的模板填充。
-
-目前的方案是 `formatByToolType`，一个 15 条 case 的 switch：
-
-```go
-// internal/ares_runtime/tool.go
-func formatByToolType(toolName, rawJSON string) string {
-    switch toolName {
-    case "calculator":
-        return fmt.Sprintf("计算结果: %v", data)
-    case "web_search":
-        return fmt.Sprintf("搜索结果: %d 条", len(results))
-    // ... 还有 13 个工具
-    }
-}
-```
-
-每新增一个工具，都要来这里加一行。忘了加就走到 `formatDefault`——直接把 JSON dump 给 LLM。
-
----
-
-## 七、事件与回调：两套系统并存
-
-工具调用的生命周期事件由两套系统同时追踪：
-
-1. **callbacks.Emit**——简单的生命周期钩子，由 sub-agent executor 触发
-2. **ToolNode.eventSink**——Workflow 层面的事件追踪，粒度更细，含 execution_id
-
-两套系统互不感知。同一个工具调用，在 sub-agent 路径下走 callbacks，在 Workflow 路径下走 eventSink。后续应该把事件模型统一，但目前各自为政。
-
----
-
-## 八、横切关注点
-
-### 8.1 超时
-
-工具调用的超时完全靠 `context.Context`：
-
-```go
-// sub/executor.go
-ctx, cancel := context.WithTimeout(parentCtx, 30*time.Second)
-defer cancel()
-result, err := toolBinder.CallTool(ctx, name, args)
-```
-
-调用方各自设 timeout，没有统一兜底。
-
-### 8.2 并发与限流
-
-`GlobalRegistry` 本身是并发安全的（`sync.RWMutex`），但它**没有为单个工具提供并发控制**。如果 10 个子 Agent 同时调同一个 `CodeRunner`，没有排队机制。
-
-### 8.3 日志与追踪
-
-工具调用的日志散布在三个地方：
-1. `callbacks.Emit(EventToolStart)` —— 简单的生命周期日志
-2. `ToolNode.eventSink` —— Workflow 级别的执行追踪
-3. `events.EventStore` —— 事件溯源
-
-调试时需要翻三个地方。
-
----
-
-## 九、已知问题与设计缺陷
-
-### 9.1 参数校验缺失（已修复）
-
-早期 `ParameterSchema` 定义了一大堆类型约束，但没有任何代码在 `Execute` 之前做校验。**现已修复**——`output.NewValidator(output.WithSchemaType(...))` 在 leader 与 sub agent 构造时（`cmd/ares/agents.go`）接入，任务结果须符合配置 schema 才放行；sub 事件路径另有 `outputguard.NewGuard().ValidateResult` 兜底，结构性不一致在边界拒绝。
-
-### 9.2 Planner 与 Workflow 未打通
-
-目前 planner 的 `ToolExecutionBridge` 只覆盖了 agent 级别的工具调用。Workflow 里的 ToolNode 还没有接入 planner fallback。如果 workflow 中的 LLM 调用了一个不存在的工具，会直接失败，不会尝试 planner 兜底。
-
-### 9.3 MCP 命名冲突风险
-
-`NewMCPTool` 的命名是 `"mcp.{serverName}.{toolName}"`。LLM 可能不理解 `mcp.` 前缀，生成的 tool call 里可能不带这个前缀。
-
-### 9.4 内置工具自动注册的缺口（已修复）
-
-早期 `NewRegistry()` 返回空注册表，需要手动调用 `RegisterBuiltinTools()`。现已修复——`NewRegistry()` 构造时自动注册全部内置工具。
-
-### 9.5 Capability Fabric 工具（skill_* 五件套，0.3.0 新增）
-
-`internal/ares_skills.CatalogTools(catalog)`（serve 启动经 `wireSkillCatalog` 注册）向 LLM 暴露五个 catalog 工具，是 Capability Fabric 的 Level-0/1/2 渐进披露入口：
-
-| 工具 | 披露级别 | 行为 |
-|------|----------|------|
-| `skill_search` | Level-0 | 关键词检索 metadata（id/name/description/source/version），只返回常驻摘要 |
-| `skill_load` | Level-1 | 按 id 加载完整 SKILL.md 指令体（按需，不进常驻 context） |
-| `skill_activate` | Level-2 | 解析声明工具并**懒连接** MCP server（`idem=false`，连接有副作用不可盲目重试） |
-| `skill_list` | Level-0 | 全量 metadata 概览（无排序） |
-| `skill_experience` | 学习源 | 查询 task_pattern → 历史最佳 skill（relevance prior，永不执行） |
-
-关键点：`skill_search`/`skill_load` 的 `skillView` 刻意省略本地 `Path`/`Hash`（不向 LLM 泄露文件系统路径）；`skill_activate` 是 MCP server 的唯一连接时机——**1000 个工具也不进 context**。`skill_activate` 结果同时披露该 skill 的 **references 资源文件列表**（`catalog.ListReferences`，Level-2 披露）：LLM 可见技能引用了哪些资源文件（规则/模板/提示片段），内容按需经 loader 加载，路径穿越防护（拒绝 `/` `\` `..`）不变。
-
-> **E2E 守护（0.3.0）**：`TestE2ESkillActivateConnectsRealMCPServer`（`internal/ares_skills/e2e_mcp_test.go`）把真实 ares_mcp MCPServer 以 **re-exec 子进程 + stdio** 方式跑起来，skill 声明 `mcp` 工具 → `Catalog.Activate` → `MCPManager.ConnectServer`（真实 JSON-RPC 跨进程）→ 远端工具注册 → 远程调用返回结果——完整链路不依赖 `fakeMCPConnector`。
-
----
-
-## 十、总结
-
-四条路径，一种归宿：
-
-| 路径 | 触发条件 | 典型场景 | 状态 |
-|---|---|---|---|
-| Path 1: LLM 驱动 | LLM 给出 tool_name | 标准对话 | ✅ 完善 |
-| Path 2: Planner 兜底 | LLM 没给工具名 / 工具不存在 | 新工具 / LLM 未知 | ✅ 已实现 |
-| Path 3: Workflow Graph | Workflow 编排 | 确定性业务流程 | ✅ 完善 |
-| Path 4: MCP 外部 | 跨进程工具 | 数据库 / 第三方 API | ✅ 完善 |
-
-回头看，工具调用层比工具**定义**层复杂得多。定义一个工具只需要几十行代码和两行注册。但让工具在四条路径下都能被正确调用、参数校验、结果格式化、超时处理、重试策略、事件追踪——这才是真正的复杂度。
-
-Planner 的加入把"LLM 选错了工具怎么办"这个问题解决了。但参数校验这个缺口还在——这是下一轮要啃的硬骨头。
+| 断言 | 符号/文件 | 状态 |
+|---|---|---|
+| 工具来源有三个实现 | `toolsource/toolsource.go`（`StaticSource`/`RegistrySource`/`MultiSource`） | ✅ 已核实 |
+| discover_tools 元工具 | `toolsource/discover_tool.go`，`DiscoverToolsName="discover_tools"`，`maxDiscoverResults=20` | ✅ 已核实 |
+| 展开只在 LLM 主动调 discover_tools 时发生 | `agentloop/engine.go` `expandDiscoveredTools` / `ToolExpander` | ✅ 已核实 |
+| 三个选择器 + 关键词/能力提取 | `selector.go` / `capability_selector.go` | ✅ 已核实 |
+| Registry.Execute 带 ValidateParams | `resources/core/registry.go` | ✅ 已核实，但 agentfabric CallTool 路径不走它 |
+| 全部内置工具目录与标签 | `builtin/builtin.go` `RegisterGeneralTools` | ✅ 已核实 |
+| calculator 的 27 个函数 | `builtin/math/calculator.go` | ✅ 已核实 |
+| planner 6 步流水线 | `planner/*`（doc.go 与实现一致） | ✅ 已核实 |
+| 评分公式（两套 scorer） | `planner/scorer.go` + `planner/evidence.go` | ✅ 已核实 |
+| `arg.` 前缀参数命名空间 | `agentfabric/l2graph.go`（`argMetadataPrefix`/`argsFromPayload`） | ✅ 已核实 |
+| cmd/ares 生产装配 | `cmd/ares`（doc.go 转述） | ⚠️ 待核实 |

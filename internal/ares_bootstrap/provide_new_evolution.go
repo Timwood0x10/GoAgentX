@@ -83,6 +83,15 @@ type NewEvolutionComponents struct {
 	// are created and their DAGs are registered with the runtime manager.
 	liveDAG *engine.MutableDAG
 
+	// toolClassDAG is the L1 capability graph (M5): one node per ToolClass
+	// (toolName#argShape) with enabled/budget/prior metadata. Evolution
+	// structure patches (SetNodeMetadata on L1) constrain L2 growth: the
+	// plannerCognition reads enabled/budget before growing tool nodes.
+	// Unlike liveDAG, this is NOT compiled into taskfabric — it is a
+	// capability catalog, not an execution plan. Nil when no tools are
+	// registered (L1 constraints default to permissive).
+	toolClassDAG *engine.MutableDAG
+
 	// graphExec is the GraphPatchExecutor created at bootstrap time.
 	// UpdateLiveDAG calls SetGraph on it to swap in the live workflow graph,
 	// since Register cannot overwrite an already-registered component key
@@ -457,6 +466,33 @@ func (c *NewEvolutionComponents) UpdateLiveDAG(dag *engine.MutableDAG) error {
 	log.Info("new evolution: live DAG injected into executors",
 		"steps", len(dag.Steps()))
 	return nil
+}
+
+// SetToolClassDAG injects the L1 capability graph (M5). The L1 graph is the
+// evolution system's ToolClass action surface: its nodes are
+// toolName#argShape, and its Metadata (enabled/budget/prior) constrains L2
+// growth. Unlike the live DAG (UpdateLiveDAG), the L1 graph is NOT compiled
+// into taskfabric and does NOT replace the recovery executor — it is a
+// capability catalog, not an execution plan.
+//
+// The L1 graph is stored for the plannerCognition to read at growth time
+// (§6 constraint point: "要不要长出这个节点"). Evolution structure patches
+// (SetNodeMetadata) mutate L1 metadata; the planner reads the mutated values
+// before growing each tool node. A nil dag clears the L1 graph (constraints
+// default to permissive).
+func (c *NewEvolutionComponents) SetToolClassDAG(dag *engine.MutableDAG) {
+	c.toolClassDAG = dag
+	if dag != nil {
+		log.Info("new evolution: L1 ToolClass DAG injected",
+			"nodes", len(dag.Steps()))
+	}
+}
+
+// ToolClassDAG returns the L1 capability graph, or nil when no L1 graph was
+// injected. The plannerCognition reads this to check enabled/budget/prior
+// before growing tool nodes (§6 constraint point).
+func (c *NewEvolutionComponents) ToolClassDAG() *engine.MutableDAG {
+	return c.toolClassDAG
 }
 
 // used when no KnowledgeRuntime is available. It accepts all knowledge patches

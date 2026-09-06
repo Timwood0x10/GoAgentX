@@ -1,99 +1,134 @@
-# ares 架构深度解析（二十七）：上下文管理 — token 预算的三道防线（0.3.x）
+# ares 架构深度解析（二十七）：上下文管理 — 三层上下文、可检查点认知状态与 prompt 门禁（0.3.x）
 
-> 说明：本文基于实际代码（`internal/ares_memory/context/cleaner.go`、`internal/ares_memory/manager_impl.go`、`internal/knowledge/skills`），是 docs 系列中上下文管理层的专门篇。
+> 说明：本文基于实际代码（`internal/agentfabric/context.go` + `agent.go` 的三层上下文与 `CognitiveState`、`internal/llm` 的 `maxPromptLength` prompt 长度门禁、`internal/ares_memory` 的会话记忆），是 docs 系列中上下文管理层的专门篇。
 
 ## 一、为什么上下文管理是 Agent 的命门
 
-LLM 的 context window 是硬约束：Agent 每轮对话都会累积历史，工具调用结果（尤其 `tool_result`）动辄几百上千 token，几十轮下来轻松击穿窗口。
+LLM 的 context window 是硬约束：Agent 每轮对话都会累积历史，工具调用结果动辄几百上千 token，几十轮下来很容易击穿窗口。ARES 没有把"把所有东西塞进窗口"当作策略，而是用几条**相互独立、各管一段**的真实机制守住预算，它们分别落在三层里：
 
-ARES 用**三道防线**控制 token 预算：
+| 层次 | 真实机制 | 位置 | 管什么 |
+|------|----------|------|--------|
+| ① 认知状态层 | 三层上下文隔离（Task Shared / Agent Private / IPC） | `internal/agentfabric/context.go` | 谁能看到什么，私有不外泄 |
+| ② 持久化层 | 版本化 `CognitiveState` + 可检查点 | `internal/agentfabric/agent.go` / `context.go` | 只持久化可检查点状态，不依赖隐藏 CoT |
+| ③ 会话层 | 会话记忆（TTL / LRU / 结构化消息） | `internal/ares_memory` | 历史如何被组织、保留与清理 |
+| ④ 调用层 | `maxPromptLength` 硬门禁 | `internal/llm` | 过长的 prompt 在 LLM 调用前直接拒绝 |
 
-| 防线 | 机制 | 位置 | 解决什么 |
-|------|------|------|----------|
-| ① turn 分组 | `TurnID` 关联会话消息 | `internal/ares_memory/context` | 让"一轮对话"成为可整体处理的单元 |
-| ② 差分压缩 | `ContextCleaner` 角色感知压缩 | `internal/ares_memory/context/cleaner.go` | 工具噪声、重复内容的 token 削减 |
-| ③ 渐进披露 | skills Level-0 常驻 + body 按需 | `internal/knowledge/skills` + memoryManager | 100 个技能 ≠ 100 份完整指令 |
+## 二、三层上下文：Task Shared / Agent Private / IPC
 
-## 二、ContextCleaner：角色感知的差分压缩
-
-`internal/ares_memory/context/cleaner.go` 的 `ContextCleaner` 是第二道防线的核心。它的设计洞察是：**不同类型的消息对 token 的价值密度不同**，压缩策略必须按角色差异化：
+`internal/agentfabric/context.go` 定义了对隔离的硬性要求（design §13：Context three layers，不要共用一个大脑）：`ContextLayer` 枚举三档：
 
 ```go
-// ContextCleaner intelligently cleans conversation context before LLM calls.
-// It applies differential compression based on message role:
-//   - tool_call / tool_result → aggressively compressed to first sentence
-//   - assistant with ToolCalls → treated as tool-like content
-//   - pure assistant reasoning → code blocks compressed, content truncated
-//   - user / system → straightforward truncation
-type ContextCleaner struct {
-    mu          sync.Mutex
-    stats       CleanerStats          // 工具调用数 + 节省字节统计
-    codePattern *regexp.Regexp        // ```...``` 代码块识别
+type ContextLayer int
+
+const (
+    ContextTaskShared ContextLayer = iota // 共享任务状态：目标/约束/产物/决策/依赖/检查点，所有 Agent 必须可见
+    ContextAgentPrivate                    // Agent 私有状态：推理/观测/假设/草稿；绝不外泄
+    ContextIPC                             // Agent 间消息通道；由 IPC 支柱（P4）承载，本层是存储面
+)
+```
+
+Fabric 提供读写入口并**以"深拷贝"保证隔离**：
+
+- `SetTaskContext` / `TaskContext`：绑定时给 Agent 一份任务的 Task Shared State 副本，Agent 永远改不到调用方的 map。
+- `SetPrivate` / `Private`：私有草稿层，**绝不泄漏到 Task Shared State 或其它 Agent**（§13 不变量 #5/6）。
+- `ContextView`：只读快照，把 `TaskShared` 与 `Private` 一起取出，正是为了验证"私有不从 Task 泄漏"。
+
+区分 **Fabric 存什么**：`agent.go` 的 `Agent` 只持有 `taskContext` 与 `privateContext`；IPC 层不落在 Fabric，而是由 `internal/agentipc` 的 `Message` / `Bus` 承载（即上一篇的 peer 消息总线）。
+
+```mermaid
+graph TD
+    subgraph Agent A
+        TA[Task Shared 共享状态]
+        PA[Private A 私有草稿]
+    end
+    subgraph Agent B
+        TB[Task Shared 共享状态]
+        PB[Private B 私有草稿]
+    end
+    IPC[IPC Messages 消息通道] 
+    TA -.-|同一任务共享| TB
+    TA -.->|任务上下文副本| IPC
+    IPC -.->|协作消息| TB
+    PA -.->|绝不外泄| X[仅 Agent A]
+    PB -.->|绝不外泄| Y[仅 Agent B]
+```
+
+## 三、CognitiveState：版本化、可检查点
+
+Agent 的"认知内容"被显式建模为 `internal/agentfabric/agent.go` 的 `CognitiveState`——它是**可独立持久化**的状态，Runtime **不依赖隐藏的 chain-of-thought**，只依赖这份持久状态（§13 不变量 #5）：
+
+```go
+const CognitiveStateSchemaVersion = 1
+
+type CognitiveState struct {
+    SchemaVersion int   // 结构版本；0 = legacy（pre-A2），DecodeCognitiveState 允许兼容
+    Context       any   // 活跃推理上下文（任务目标 + 约束）
+    Observation   any   // 来自环境/工具的最新观测
+    WorkingMemory any   // 中间推理草稿
+    Decision      any   // 当前决策/假设
+    ToolState     any   // 活动工具状态（打开的文件、连接…）
+    Checkpoint    any   // 持久进度指针（执行 Task 时关联 taskfabric Checkpoint）
 }
 ```
 
-**四类角色四种策略**：
+配套的版本化编解码与持久化（`context.go`）：
 
-| 消息角色 | 压缩策略 | 理由 |
-|----------|----------|------|
-| `tool_call` / `tool_result` | **激进压到首句** | 工具往返是最大噪声源：结果里 90% 是分页/重复，首句概括足矣 |
-| `assistant` + ToolCalls | 按工具类内容处理 | 带工具调用的推理通常不需要完整保留 |
-| 纯 `assistant` 推理 | **代码块压缩 + 内容截断** | 推理步骤可截断，代码块用正则识别后压缩 |
-| `user` / `system` | 直接截断 | 用户输入是语义锚点，策略保守 |
+- `SetCognitiveState`：写入；`SchemaVersion==0` 的 legacy 状态在边界处被升级为当前版本，保证每条落库状态都带版本。
+- `DecodeCognitiveState`：单一路径解码。对原生结构、`map[string]any`（JSON 往返后）与 nil 都能处理；**遇到未来版本返回 `ErrCognitiveStateSchemaVersion`**，拒绝静默误读，调用方须迁移或拒绝恢复。
+- `CheckpointCognitive`：返回认知快照用于持久存储——返回的是拷贝，改它不影响存活 Agent。
 
-关键实现细节：
-- **保留全部字段**：`Clean` 返回新切片时保留 `Time`、`TurnID` 等元数据——压缩的是内容，不是结构
-- **原切片不可变**：`Returns a new slice with compressed content; original slice is not modified`——零副作用，可安全重试
-- **统计可观测**：`CleanerStats`（工具调用数 + 节省字节数）内部跟踪，压缩效果可度量
+```mermaid
+graph LR
+    A[Agent 运行 产生认知] -->|SetCognitiveState| S[(Fabric 认知 + 三层状态)]
+    S -->|CheckpointCognitive 快照拷贝| P[(持久存储 schema_version=1)]
+    P -->|DecodeCognitiveState| R[Recover / 恢复]
+    R -.->|未来版本拒绝| E[ErrCognitiveStateSchemaVersion]
+```
 
-## 三、turn 分组：让"一轮对话"成为整体
+## 四、会话记忆：历史如何保留与回收
 
-上下文压缩的粒度不是单条消息，而是 **turn（一轮对话）**。`internal/ares_memory/context` 层用 `TurnID` 把一次交互（用户输入 + Agent 的思考 + 工具往返 + 最终回复）关联成组：
+LLM 输入要带上的历史来自 `internal/ares_memory` 的会话记忆。核心实现是 `internal/ares_memory/context/session.go` 的 `SessionMemory`：
 
-- **结构化消息**：`AddStructuredMessage` 带 `TurnID`/`ToolCallID`/`ToolCalls` 元数据写入会话，保留完整 turn 结构（供 turn-aware cleaning 使用）
-- **清理以 turn 为单位**：压缩/截断按 turn 边界处理，不会把一轮对话的中间态切得支离破碎
-- **蒸馏复用**：`manager_impl.go` 的 `buildCleanedDistillationMessages` 在蒸馏前也走清理——同一套 turn 分组语义贯穿"清理"与"蒸馏"两个消费方
+- **有界 + TTL**：`NewSessionMemory(maxSize, ttl)`，超过 `maxSize` 时 `evictOldest`（按 `AccessedAt` LRU 驱逐最旧会话）；后台 `Cleanup` 任务按半个 TTL 周期扫描，把超过 `ttl` 未访问（`now - AccessedAt > ttl`）的会话清除。
+- **深拷贝返回**：`Get` / `GetMessages` 返回副本，调用方改不到内部 session 状态。
+- **原生消息结构**：`Message` 携带 `TurnID`、`ToolCallID`、`ToolCalls`、`EventKind`、`ParentID`、`ArtifactRefs`——一轮对话的结构元数据被保留，供 turn-aware 的消费方使用。
 
-## 四、渐进披露：100 个技能 ≠ 100 份完整指令
+对外统一接口 `MemoryManager`（`manager.go`）暴露 `CreateSession` / `AddMessage` / `AddStructuredMessage`（带 TurnID 等元数据）/ `GetMessages` / `BuildPromptMessages` / `DeleteSession`，以及 `GetLatestSessionForAgent`（从检查点取 Agent 最近会话；不持久化检查点的后端返回 `ErrAgentCheckpointNotSupported`）。配置面由 `MemoryConfig` 对齐：`MaxHistory`（保留的最大轮数）、`SessionTTL`、`MaxSessions`，默认值见 `DefaultMemoryConfig()`。
 
-第三道防线在知识层：`internal/knowledge/skills.Registry` 只让 **name + 一句话描述**常驻上下文（Level-0），完整 SKILL.md 指令体（Level-1）按需加载。
+> 注：会话记忆管的是"历史怎么留、留多少、多久淘汰"，但它本身**不做 token 削减**——真正的硬门禁在下一节的 prompt 长度校验。两者是独立防线。
 
-memoryManager 的挂载（`manager_impl.go`）：
+## 五、maxPromptLength：LLM 调用前的最后一道硬门禁
+
+`internal/llm` 在把 prompt 提交给 provider 之前做一次**显式的长度校验**（`generate.go`）：
 
 ```go
-// SetSkillsRegistry attaches a skills registry for progressive disclosure.
-// When set, BuildContext prepends a resident "Available skills" block listing
-// each skill's name and description only; full skill details are fetched on
-// demand by ID via the registry.
-func (m *memoryManager) SetSkillsRegistry(reg *skills.Registry) {
-    m.skillsRegistry = reg
+// 默认上限：8192（internal/llm/client.go）
+const maxPromptLength = 8192
+
+// 配置面：config.MaxPromptLength（yaml: max_prompt_length，0 = 用默认值）
+func (c *Client) promptMaxLength() int {
+    if c.config != nil && c.config.MaxPromptLength > 0 {
+        return c.config.MaxPromptLength
+    }
+    return maxPromptLength
+}
+
+// 校验：数的是 rune（utf8.RuneCountInString），不是字节——
+// CJK 等多字节字符不会因字节数误被判越界（M8）。
+if utf8.RuneCountInString(prompt) > c.promptMaxLength() {
+    return fmt.Errorf("prompt exceeds maximum length of %d characters", c.promptMaxLength())
 }
 ```
 
-- **常驻块**：`BuildContext` 顶部注入 "Available skills"（每个技能 ~100 token 的 name+描述）
-- **按需取**：`LoadDetail` 返回完整 body，只在 Agent 明确需要时才取
-- **Capability Fabric 升级**（0.3.0）：`internal/ares_skills` 的 `SeedRegistry` 把 skill 目录索引灌进同一 registry，且 `skill_load` 工具负责按需取 body——三阶段渐进披露（metadata → SKILL.md → resources）在 0.3.0 完整闭环
-
-## 五、生产接线
-
-`ContextCleaner` 在两条生产路径注入：
-
-```go
-// manager_impl.go
-ctxCleaner: memctx.NewContextCleaner()   // 经典 memoryManager
-
-// production_manager.go
-ctxCleaner: memctx.NewContextCleaner()   // production 变体
-```
-
-`BuildContext` 组装时：常驻 skills 块（若已 seed）→ 会话历史经 `ContextCleaner.Clean` 压缩 → 拼接成最终 prompt。压缩在 **LLM 调用前**执行（`before LLM calls`），保证每次请求都吃最小的上下文。
+要点：这是**前置守卫**——超限的 prompt 在到达 provider 前就被拒绝，而不是硬塞进窗口后靠 provider 截断。它不等于"压缩"；真正控制历史体积的是第二节、第三节与第四节（三层隔离限制可见范围、检查点状态天然是"最精简的心智模型"、会话留白由 TTL/轮数约束）。
 
 ## 六、总结
 
-| 防线 | 机制 | 度量 |
-|------|------|------|
-| turn 分组 | `TurnID` 结构化消息 | 一轮对话一个整体 |
-| 差分压缩 | role-aware `ContextCleaner` | `CleanerStats` 节省字节 |
-| 渐进披露 | skills Level-0 常驻 | 100 skills ≈ 100 × ~100 token |
+| 防线 | 机制 | 度量 / 保证 |
+|------|------|-------------|
+| 三层隔离 | `ContextLayer` Task Shared / Agent Private / IPC | 私有永不外泄（`ContextView` 可验证） |
+| 认知可检查点 | `CognitiveState` + `SchemaVersion` | 只持久化可检查点状态；未来版本拒绝 |
+| 会话记忆 | `SessionMemory`（TTL + LRU + 结构化 `Message`） | 历史有界、留白、可整体访问 |
+| prompt 门禁 | `maxPromptLength`（默认 8192，按 rune） | 超限在 LLM 调用前拒绝 |
 
-**设计主线：上下文不是"塞进窗口"而是"预算管理"。** 三条防线各管一段——分组管结构、压缩管噪声、披露管知识——合起来让 Agent 在有限窗口里装下"历史 + 工具往返 + 技能知识"三类内容。这也是 Capability Fabric"不把所有 Skill 内容塞给 LLM"原则在上下文层的呼应。
+**设计主线：上下文管理不是一个"万能裁剪器"，而是四条独立、正交、每一条都可单独验证的防线——隔离决定谁看到什么，可检查点决定持久化最小集，会话记忆决定历史形态，prompt 门禁兜底长度边界。** 它们合起来让 Agent 的"历史 + 工具往返 + 各自可见状态"在有限窗口里被显式地预算管理，而不是推给 provider 做隐式截断。

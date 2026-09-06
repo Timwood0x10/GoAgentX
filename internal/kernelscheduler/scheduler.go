@@ -960,6 +960,7 @@ func (s *Scheduler) buildQuantumStep(
 				Payload:          meta.Payload,
 				UsedExperienceID: meta.UsedExperienceID,
 				StrategyID:       meta.StrategyID,
+				SessionID:        meta.SessionID,
 				StepCheckpoint:   out.Checkpoint,
 			}), false, nil
 		}
@@ -1082,6 +1083,9 @@ func (s *Scheduler) ToModelTask(tk *taskfabric.Task) *models.Task {
 	// fabric's own events do — RuntimeObserver attributes fitness samples by
 	// it, and a promote mid-task must not re-credit the new strategy.
 	t.StrategyID = dc.StrategyID
+	// M2: SessionID rides to the executor so the plannerCognition can look
+	// up the per-session L2 graph registry.
+	t.SessionID = dc.SessionID
 	// A resumed quantum observes where the previous step left off (Bug 3):
 	// the step checkpoint is surfaced to the executor as payload["checkpoint"].
 	if dc.StepCheckpoint != nil {
