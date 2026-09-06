@@ -142,3 +142,33 @@ func TestSessionNodeID(t *testing.T) {
 	require.Equal(t, "sess/s1/d1/grep#0", SessionNodeID("s1", 1, "grep", 0))
 	require.Equal(t, "sess/s1/d2/read#1", SessionNodeID("s1", 2, "read", 1))
 }
+
+// TestSessionIDFromNode pins the ID inverse the reaper keep-set relies on:
+// every builder's output round-trips back to its session ID, and anything
+// that is not a session-scoped node is rejected (so the reaper never keeps
+// a task it cannot attribute to a live session).
+func TestSessionIDFromNode(t *testing.T) {
+	tests := []struct {
+		name   string
+		nodeID string
+		want   string
+		wantOK bool
+	}{
+		{"root", SessionRootID("s1"), "s1", true},
+		{"node", SessionNodeID("s1", 2, "grep", 7), "s1", true},
+		{"session id with slash-free dashes", "sess/adm-1/root", "adm-1", true},
+		{"non-session id", "plain/task", "", false},
+		{"bare prefix", "sess/", "", false},
+		{"missing terminator", "sess/s1", "", false},
+		{"empty session id", "sess//root", "", false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, ok := SessionIDFromNode(tt.nodeID)
+			if ok != tt.wantOK || got != tt.want {
+				t.Errorf("SessionIDFromNode(%q) = (%q, %v), want (%q, %v)",
+					tt.nodeID, got, ok, tt.want, tt.wantOK)
+			}
+		})
+	}
+}

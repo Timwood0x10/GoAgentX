@@ -100,15 +100,24 @@ func TestM3_AssembleContextFromGraphPath(t *testing.T) {
 	require.True(t, out.Done)
 
 	// The LLM received context assembled from the graph path:
-	// [user: root prompt, tool: grep output].
+	// [user: root prompt, assistant: grep tool call, tool: grep output].
+	// The assistant+tool pairing is load-bearing: a bare tool message with
+	// no preceding assistant tool_call violates the provider contract
+	// (observed live as the model repeating the same call every round).
 	chatClient.mu.Lock()
 	defer chatClient.mu.Unlock()
 	require.Equal(t, 1, chatClient.calls, "LLM called once")
-	require.Len(t, chatClient.messages, 2, "context has root prompt + grep output")
+	require.Len(t, chatClient.messages, 3, "context has root prompt + assistant tool call + tool output")
 	require.Equal(t, "user", chatClient.messages[0].Role)
 	require.Equal(t, "analyze the system", chatClient.messages[0].Content)
-	require.Equal(t, roleTool, chatClient.messages[1].Role)
-	require.Contains(t, chatClient.messages[1].Content, "found 3 errors")
+	require.Equal(t, "assistant", chatClient.messages[1].Role)
+	require.Len(t, chatClient.messages[1].ToolCalls, 1, "assistant message carries the reconstructed call")
+	require.Equal(t, "grep", chatClient.messages[1].ToolCalls[0].Function.Name)
+	require.Contains(t, chatClient.messages[1].ToolCalls[0].Function.Arguments, "error")
+	require.Equal(t, roleTool, chatClient.messages[2].Role)
+	require.Contains(t, chatClient.messages[2].Content, "found 3 errors")
+	require.Equal(t, chatClient.messages[1].ToolCalls[0].ID, chatClient.messages[2].ToolCallID,
+		"tool message links back to its assistant call")
 }
 
 // TestM3_FullCapabilityAdvertisement verifies the M3 capability advertisement:
@@ -203,8 +212,16 @@ func TestM3_ContextIsChronological(t *testing.T) {
 	task.SessionID = sessionID
 	msgs, err := planner.(*plannerCognition).assembleContext(ctx, task, g)
 	require.NoError(t, err)
-	require.Len(t, msgs, 3)
+	// [user root, assistant grep-call, tool OLDER, assistant read-call,
+	// tool NEWER]: execution order with the provider-mandated pairing.
+	require.Len(t, msgs, 5)
 	require.Equal(t, "root prompt", msgs[0].Content)
-	require.Equal(t, "OLDER", msgs[1].Content, "execution order: the first tool comes first")
-	require.Equal(t, "NEWER", msgs[2].Content)
+	require.Equal(t, "assistant", msgs[1].Role)
+	require.Equal(t, "grep", msgs[1].ToolCalls[0].Function.Name)
+	require.Equal(t, "OLDER", msgs[2].Content)
+	require.Equal(t, msgs[1].ToolCalls[0].ID, msgs[2].ToolCallID)
+	require.Equal(t, "assistant", msgs[3].Role)
+	require.Equal(t, "read", msgs[3].ToolCalls[0].Function.Name)
+	require.Equal(t, "NEWER", msgs[4].Content, "execution order: the first tool comes first")
+	require.Equal(t, msgs[3].ToolCalls[0].ID, msgs[4].ToolCallID)
 }

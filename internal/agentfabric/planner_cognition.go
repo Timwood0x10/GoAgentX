@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"log/slog"
 	"strconv"
+	"strings"
+	"sync/atomic"
 
 	"github.com/Timwood0x10/ares/api/core"
 	"github.com/Timwood0x10/ares/internal/core/models"
@@ -14,11 +16,11 @@ import (
 	"github.com/Timwood0x10/ares/internal/workflow/engine"
 )
 
-// maxPlanDepth is the default growth-depth upper bound for an L2 session
-// graph (M2-④: 生长深度上界护栏). It caps how many plan-tool rounds a
+// DefaultMaxPlanDepth is the default growth-depth upper bound for an L2
+// session graph (M2-④: 生长深度上界护栏). It caps how many plan-tool rounds a
 // session can run before the planner is forced to answer — preventing
 // unbounded graph growth from a runaway LLM that keeps requesting tools.
-const maxPlanDepth = 10
+const DefaultMaxPlanDepth = 10
 
 // PlannerDeps carries the plannerCognition's dependencies, injected at
 // construction time (M2-①). The planner reads predecessor outputs from the
@@ -42,7 +44,7 @@ type PlannerDeps struct {
 	// node — enabled=false blocks growth, budget=N caps instances per
 	// session. Nil = no L1 graph (constraints default to permissive).
 	L1DAG *engine.MutableDAG
-	// MaxDepth caps the plan-tool growth depth (0 = default maxPlanDepth).
+	// MaxDepth caps the plan-tool growth depth (0 = DefaultMaxPlanDepth).
 	MaxDepth int
 	// Logger is the shared logger.
 	Logger *slog.Logger
@@ -85,9 +87,26 @@ type plannerCognition struct {
 	l1       *engine.MutableDAG // L1 ToolClass graph (M5), nil = permissive
 	maxDepth int
 	logger   *slog.Logger
+	// forcedAnswers counts quanta that hit the growth-depth guard and were
+	// forced into an answer node (M4-B2 canary metric: the depth-exhaustion
+	// rate). One shared planner serves every session, so the counter is
+	// process-wide, not per-session.
+	forcedAnswers atomic.Uint64
 }
 
 var _ Cognition = (*plannerCognition)(nil)
+
+// ForcedAnswers reports how many quanta hit the growth-depth guard and were
+// forced into an answer node (M4-B2 canary metric: the depth-exhaustion
+// rate). One shared planner serves every session, so the count is
+// process-wide. A rising rate under canary means the depth cap is binding
+// real sessions, not just runaways.
+func (c *plannerCognition) ForcedAnswers() uint64 {
+	if c == nil {
+		return 0
+	}
+	return c.forcedAnswers.Load()
+}
 
 // NewPlannerCognition constructs the L2 graph-growing Cognition (M2-①).
 // A nil deps.ChatClient or nil deps.Sessions is a construction error: the
@@ -105,7 +124,7 @@ func NewPlannerCognition(deps PlannerDeps) (Cognition, error) {
 	}
 	maxD := deps.MaxDepth
 	if maxD <= 0 {
-		maxD = maxPlanDepth
+		maxD = DefaultMaxPlanDepth
 	}
 	logger := deps.Logger
 	if logger == nil {
@@ -198,6 +217,7 @@ func (c *plannerCognition) ExecuteStep(ctx context.Context, task *models.Task) (
 	if depth >= c.maxDepth {
 		// Growth-depth upper bound reached: force an answer node so the
 		// session terminates instead of growing unbounded.
+		c.forcedAnswers.Add(1)
 		c.logger.Warn("planner: max plan depth reached, forcing answer",
 			"session", sessionID, "depth", depth, "max", c.maxDepth)
 		return c.growAnswerNode(ctx, g, task, "max plan depth reached")
@@ -255,9 +275,12 @@ func (c *plannerCognition) assembleContext(ctx context.Context, task *models.Tas
 	// Read the session prompt from the root task's envelope.
 	rootID := g.Root()
 	rootPrompt, err := c.readNodeOutput(rootID)
-	if err != nil {
-		// The root may not have completed yet if this is the first plan
-		// quantum; fall back to the payload's "input".
+	if err != nil || strings.TrimSpace(rootPrompt) == "" {
+		// The root may not have completed yet (readNodeOutput reports an
+		// incomplete task as empty, not as an error), or it completed
+		// empty. Either way the payload's "input" is the prompt the
+		// admission path stamped — never send an empty user message, real
+		// providers reject it.
 		rootPrompt, _ = task.Payload["input"].(string)
 	}
 
@@ -266,14 +289,22 @@ func (c *plannerCognition) assembleContext(ctx context.Context, task *models.Tas
 	}
 
 	// Walk the predecessor chain from this plan node back to the root. The
-	// walk is newest-first, so the collected outputs are REVERSED before
+	// walk is newest-first, so the collected nodes are REVERSED before
 	// being appended: the LLM must observe tool results in execution order,
 	// the same order ReAct's Messages[] presented them. Appending in walk
 	// order would invert the history and change what the model concludes.
-	var observed []string
-	predID := g.Predecessor(task.TaskID)
-	for predID != "" && predID != rootID {
-		output, err := c.readNodeOutput(predID)
+	var chain []string
+	for predID := g.Predecessor(task.TaskID); predID != "" && predID != rootID; predID = g.Predecessor(predID) {
+		chain = append(chain, predID)
+	}
+	steps := g.DAG().StepIndex()
+	for i := len(chain) - 1; i >= 0; i-- {
+		nodeID := chain[i]
+		step, ok := steps[nodeID]
+		if !ok || !strings.HasPrefix(step.AgentType, "tool/") {
+			continue
+		}
+		output, err := c.readNodeOutput(nodeID)
 		switch {
 		case err != nil:
 			// A predecessor whose task is gone is a HOLE in the history, not
@@ -281,17 +312,53 @@ func (c *plannerCognition) assembleContext(ctx context.Context, task *models.Tas
 			// (decision C), so losing it silently would let the model plan on
 			// a truncated past. Surface it and keep walking.
 			c.logger.Warn("planner: predecessor output unreadable; context has a hole",
-				"node", predID, "error", err)
+				"node", nodeID, "error", err)
 		case output != "":
-			observed = append(observed, output)
+			messages = append(messages, toolHistoryPair(step, nodeID, output)...)
 		}
-		predID = g.Predecessor(predID)
-	}
-	for i := len(observed) - 1; i >= 0; i-- {
-		messages = append(messages, &core.LLMMessage{Role: roleTool, Content: observed[i]})
 	}
 
 	return messages, nil
+}
+
+// toolHistoryPair renders one executed tool node as the assistant+tool
+// message pair the Chat API requires: the assistant message carries the
+// original tool call (reconstructed from the node's arg.-namespaced
+// Metadata), and the tool message carries its envelope output, linked by
+// the node ID as the tool-call ID.
+//
+// A bare tool message with no preceding assistant tool_call violates the
+// provider contract (OpenAI rejects orphan tool messages; lenient providers
+// accept them but the model loses track of what it already did — observed
+// live as the same grep call repeated every round until the depth cap).
+// ReAct never has this problem because its history IS the live conversation
+// that produced the calls; the planner rebuilds history from the graph, so
+// it must rebuild the pairing too.
+func toolHistoryPair(step *engine.Step, nodeID, output string) []*core.LLMMessage {
+	tool := strings.TrimPrefix(step.AgentType, "tool/")
+	meta := make(map[string]any, len(step.Metadata))
+	for k, v := range step.Metadata {
+		meta[k] = v
+	}
+	argsJSON, err := json.Marshal(argsFromPayload(meta))
+	if err != nil {
+		argsJSON = []byte("{}")
+	}
+	return []*core.LLMMessage{
+		{
+			Role:    "assistant",
+			Content: "",
+			ToolCalls: []core.ToolCall{{
+				ID:   nodeID,
+				Type: "function",
+				Function: core.FunctionCall{
+					Name:      tool,
+					Arguments: string(argsJSON),
+				},
+			}},
+		},
+		{Role: roleTool, Content: output, ToolCallID: nodeID},
+	}
 }
 
 // readNodeOutput reads one node's execution output from its fabric task

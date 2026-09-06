@@ -284,21 +284,7 @@ func (c *Config) validateEvolution() error {
 				c.Evolution.LLMScoring.MaxCallsPerGeneration)
 		}
 	}
-	// The projection worker's knobs are only rejected when it is armed: a
-	// nonsensical value in a disabled block should not block startup, but a
-	// negative interval on an ARMED worker would panic time.NewTicker, and a
-	// negative min_samples silently means "no threshold" — the opposite of what
-	// an operator typing a negative number intends.
-	if c.Evolution.ToolProjection.Enabled {
-		if c.Evolution.ToolProjection.Interval <= 0 {
-			return fmt.Errorf("evolution: tool_projection.interval must be > 0, got %s",
-				c.Evolution.ToolProjection.Interval)
-		}
-		if c.Evolution.ToolProjection.MinSamples < 0 {
-			return fmt.Errorf("evolution: tool_projection.min_samples must be >= 0, got %d",
-				c.Evolution.ToolProjection.MinSamples)
-		}
-	}
+
 	return nil
 }
 
@@ -329,6 +315,14 @@ func (c *Config) validateKernel() error {
 	if c.Kernel.LoopRoundQuanta < 0 {
 		return fmt.Errorf("kernel: loop_round_quanta must be non-negative (0 = default 1), got %d",
 			c.Kernel.LoopRoundQuanta)
+	}
+	if c.Kernel.DAGExecution.MaxPlanDepth < 0 {
+		return fmt.Errorf("kernel: dag_execution.max_plan_depth must be non-negative (0 = planner default), got %d",
+			c.Kernel.DAGExecution.MaxPlanDepth)
+	}
+	if c.Kernel.DAGExecution.ReaperGrace < 0 {
+		return fmt.Errorf("kernel: dag_execution.reaper_grace must be non-negative (0 = default 30s), got %s",
+			c.Kernel.DAGExecution.ReaperGrace)
 	}
 	return nil
 }

@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 // TestLoad tests the Load function.
@@ -1093,6 +1094,128 @@ func TestValidateKernelLoopKnobs(t *testing.T) {
 		cfg.Kernel.LoopRoundQuanta = 4
 		if err := cfg.Validate(); err != nil {
 			t.Errorf("Validate() with positive kernel loop knobs error = %v, want nil", err)
+		}
+	})
+}
+
+// TestValidateKernelDAGExecution covers the dag_execution knobs' validation
+// contract (M4-A1/A2): an absent section is legal (legacy ReAct everywhere,
+// planner default depth) because every field is zero-value-safe, while a
+// negative max_plan_depth is rejected rather than silently normalized — a
+// negative is always an operator mistake, and silently substituting a default
+// would hide it.
+func TestValidateKernelDAGExecution(t *testing.T) {
+	t.Run("absent section is legal", func(t *testing.T) {
+		cfg := validKernelTestConfig()
+		if err := cfg.Validate(); err != nil {
+			t.Errorf("Validate() with absent dag_execution error = %v, want nil", err)
+		}
+		if cfg.Kernel.DAGExecution.Enabled {
+			t.Error("absent dag_execution must default to disabled (legacy ReAct)")
+		}
+		if cfg.Kernel.DAGExecution.MaxPlanDepth != 0 {
+			t.Errorf("absent max_plan_depth = %d, want 0 (planner default)",
+				cfg.Kernel.DAGExecution.MaxPlanDepth)
+		}
+	})
+
+	t.Run("negative max_plan_depth rejected", func(t *testing.T) {
+		cfg := validKernelTestConfig()
+		cfg.Kernel.DAGExecution.MaxPlanDepth = -1
+		err := cfg.Validate()
+		if err == nil {
+			t.Fatal("Validate() with negative max_plan_depth = nil, want error")
+		}
+		if !strings.Contains(err.Error(), "max_plan_depth") {
+			t.Errorf("error %q must name the offending key max_plan_depth", err)
+		}
+	})
+
+	t.Run("negative reaper_grace rejected", func(t *testing.T) {
+		cfg := validKernelTestConfig()
+		cfg.Kernel.DAGExecution.ReaperGrace = -time.Second
+		err := cfg.Validate()
+		if err == nil {
+			t.Fatal("Validate() with negative reaper_grace = nil, want error")
+		}
+		if !strings.Contains(err.Error(), "reaper_grace") {
+			t.Errorf("error %q must name the offending key reaper_grace", err)
+		}
+	})
+
+	t.Run("positive values pass through", func(t *testing.T) {
+		cfg := validKernelTestConfig()
+		cfg.Kernel.DAGExecution.Enabled = true
+		cfg.Kernel.DAGExecution.MaxPlanDepth = 3
+		cfg.Kernel.DAGExecution.ReaperGrace = 90 * time.Second
+		if err := cfg.Validate(); err != nil {
+			t.Errorf("Validate() with positive dag_execution knobs error = %v, want nil", err)
+		}
+	})
+}
+
+// TestLoad_DAGExecutionSection verifies the kernel.dag_execution yaml keys
+// parse into the gate config end to end, and that a file without the section
+// loads with the gate off (shipped behavior unchanged).
+func TestLoad_DAGExecutionSection(t *testing.T) {
+	skeleton := `
+server:
+  host: "localhost"
+  port: 8080
+
+llm:
+  provider: "ollama"
+  model: "llama3.2"
+  timeout: 60
+  max_tokens: 4096
+
+agents:
+  sub: []
+`
+	t.Run("section present", func(t *testing.T) {
+		configPath := filepath.Join(t.TempDir(), "config.yaml")
+		content := skeleton + `
+kernel:
+  dag_execution:
+    enabled: true
+    max_plan_depth: 3
+    reaper_grace: 45s
+`
+		if err := os.WriteFile(configPath, []byte(content), 0644); err != nil {
+			t.Fatalf("Failed to write config file: %v", err)
+		}
+		cfg, err := Load(configPath)
+		if err != nil {
+			t.Fatalf("Load() error = %v", err)
+		}
+		if !cfg.Kernel.DAGExecution.Enabled {
+			t.Error("dag_execution.enabled = false, want true")
+		}
+		if cfg.Kernel.DAGExecution.MaxPlanDepth != 3 {
+			t.Errorf("dag_execution.max_plan_depth = %d, want 3",
+				cfg.Kernel.DAGExecution.MaxPlanDepth)
+		}
+		if cfg.Kernel.DAGExecution.ReaperGrace != 45*time.Second {
+			t.Errorf("dag_execution.reaper_grace = %s, want 45s",
+				cfg.Kernel.DAGExecution.ReaperGrace)
+		}
+	})
+
+	t.Run("section absent stays off", func(t *testing.T) {
+		configPath := filepath.Join(t.TempDir(), "config.yaml")
+		if err := os.WriteFile(configPath, []byte(skeleton), 0644); err != nil {
+			t.Fatalf("Failed to write config file: %v", err)
+		}
+		cfg, err := Load(configPath)
+		if err != nil {
+			t.Fatalf("Load() error = %v", err)
+		}
+		if cfg.Kernel.DAGExecution.Enabled {
+			t.Error("absent dag_execution must load as disabled")
+		}
+		if cfg.Kernel.DAGExecution.MaxPlanDepth != 0 {
+			t.Errorf("absent max_plan_depth = %d, want 0",
+				cfg.Kernel.DAGExecution.MaxPlanDepth)
 		}
 	})
 }

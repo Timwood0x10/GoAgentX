@@ -138,6 +138,31 @@ type KernelConfig struct {
 	// allow_live=true) enables real agent kill/suspend; it is dangerous
 	// and intended only for dedicated chaos testing environments.
 	Chaos ChaosConfig `yaml:"chaos"`
+	// DAGExecution configures the L2 session-graph execution path (M4-A1).
+	// Zero value = legacy ReAct behavior: peers run the chat tool-loop
+	// cognition and the L2 graph machinery stays test-only. Enabled selects
+	// the router cognition that executes tool/answer/root nodes grown on the
+	// session L2 graph. The gate defaults off so shipped behavior is
+	// unchanged until operators flip it deliberately.
+	DAGExecution DAGExecutionConfig `yaml:"dag_execution"`
+}
+
+// DAGExecutionConfig configures the L2 session-graph execution path.
+// Every field is zero-value-safe: an absent dag_execution section behaves
+// exactly like today (ReAct everywhere).
+type DAGExecutionConfig struct {
+	// Enabled selects the L2 session-graph execution body over the ReAct
+	// loop (default false).
+	Enabled bool `yaml:"enabled"`
+	// MaxPlanDepth caps the L2 plan-tool growth depth per session
+	// (0 = default 10). A negative is a config error, rejected by Validate.
+	MaxPlanDepth int `yaml:"max_plan_depth"`
+	// ReaperGrace is the terminal-task reaper's read-window grace: a task of
+	// a RELEASED session is harvested only after its state transition is
+	// older than this (0 = default 30s). Live sessions are never harvested
+	// regardless of age — the registry keep-set gates that. A negative is a
+	// config error, rejected by Validate.
+	ReaperGrace time.Duration `yaml:"reaper_grace"`
 }
 
 // ChaosConfig configures the chaos fault injection subsystem.
@@ -832,12 +857,8 @@ type EvolutionConfig struct {
 	// the task channel feeds the verdict.
 	ChannelFeedback ChannelFeedbackConfig `yaml:"channel_feedback"`
 
-	// ToolProjection configures the periodic ToolStep projection worker (Y1
-	// §12-1): the production trigger that turns the tool-call event log into
-	// per-(tool#arg_shape) fitness evidence. Default: disabled — the projection
-	// then stays an on-demand audit read, matching pre-Y1 behavior.
-	ToolProjection ToolProjectionConfig `yaml:"tool_projection"`
-
+	// M4-D0: evolution.tool_projection removed with its package (was default-disabled; unknown YAML keys are ignored, so
+	// existing config files keep loading).
 	// Gates configures the verify-gate pipeline thresholds (eval-suite
 	// minimum score, manual approval hold). Zero values fall back to code
 	// defaults.
@@ -1020,31 +1041,6 @@ type ChannelFeedbackConfig struct {
 // off, constructing an observer that nothing feeds would be dead wiring.
 func (c ChannelFeedbackConfig) AnyEnabled() bool {
 	return c.CollabEnabled || c.ToolEnabled
-}
-
-// ToolProjectionConfig mirrors the `evolution.tool_projection` YAML block (Y1
-// §12-1). It arms the periodic ToolStep projection worker: the production
-// trigger that turns the tool-call event log into per-(tool#arg_shape) fitness
-// evidence stamped with `tool_step_id`.
-//
-// It is deliberately NOT folded into ChannelFeedbackConfig.ToolEnabled. That
-// switch records ONE evidence record per tool call at call time ("did this call
-// work"); this worker projects the accumulated event log into per-argument-shape
-// success rates ("does this WAY of calling this tool work") — the only producer
-// of the tool_step dimension the scoped fitness read filters on. Enabling one
-// says nothing about the other, so they are independent switches.
-type ToolProjectionConfig struct {
-	// Enabled starts the projection worker. Default: false — the projection
-	// then remains an on-demand audit read, matching pre-Y1 behavior.
-	Enabled bool `yaml:"enabled"`
-	// Interval is the projection period. Zero falls back to
-	// DefaultToolProjectionInterval.
-	Interval time.Duration `yaml:"interval"`
-	// MinSamples drops ToolSteps with fewer calls in the window. A single call
-	// yields a success rate of exactly 0 or 1, which carries no statistical
-	// signal, so the default is above 1 (DefaultToolProjectionMinSamples).
-	// Negative values are rejected by validation.
-	MinSamples int `yaml:"min_samples"`
 }
 
 // EvolutionGateConfig mirrors the `evolution.gates` YAML block.

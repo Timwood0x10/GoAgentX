@@ -59,6 +59,10 @@ type kernelHandle struct {
 	// MutableDAG into taskfabric PlanSteps and records compile provenance
 	// for introspection. Nil when no live DAG is wired.
 	compileCoord *planprojection.CompileCoordinator
+	// sessionReg is the per-session L2 graph registry (M4-B2). Non-nil only
+	// when the DAG execution gate is open; submitPeerTask admits sessions
+	// through it. Nil = legacy path, session payloads stay envelope-only.
+	sessionReg *agentfabric.SessionRegistry
 	// pluginBus is the runtime plugin ecosystem hooked to the scheduler's
 	// quantum boundary (runtime_bridge.go). Nil when the scheduler is absent.
 	pluginBus *ares_runtime.PluginBus

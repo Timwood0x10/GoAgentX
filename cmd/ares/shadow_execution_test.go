@@ -223,3 +223,54 @@ func TestShadowExecutionEndToEnd(t *testing.T) {
 func TestWireShadowExecution_DisabledByDefault(t *testing.T) {
 	wireShadowExecution(nil, nil, nil, nil, nil, nil)
 }
+
+// TestShadowRunner_SkipsL2Tasks pins M4-C1: L2 session tasks are out of scope
+// for strategy-shadow — the planner does not consume strategies, so an A/B
+// verdict would be noise, and running a plan task through the chat body would
+// read it as a recommendation request. The skip is neutral (false, nil): the
+// same non-outcome an over-budget pass reports, so neither arm gains.
+func TestShadowRunner_SkipsL2Tasks(t *testing.T) {
+	ctx := context.Background()
+	runner := &shadowQuantumRunner{factory: &shadowCognitionFactory{
+		chatClient: &shadowChatClient{},
+		llmAdapter: shadowLLMAdapter{},
+		deny:       &shadowDenyBinder{},
+		promptTmpl: "do {{.task_desc}}",
+	}}
+
+	for _, capability := range []string{"ares/plan", "ares/root", "ares/answer", "tool/grep"} {
+		task := models.NewTask("shadow-l2", models.AgentType(capability), nil)
+		completed, err := runner.RunShadow(ctx, task, &mutation.Strategy{ID: "cand-1"})
+		if err != nil {
+			t.Fatalf("RunShadow(%s) error = %v, want neutral skip", capability, err)
+		}
+		if completed {
+			t.Errorf("RunShadow(%s) = true, want false (skipped, not completed)", capability)
+		}
+	}
+	if got := runner.Skipped(); got != 4 {
+		t.Errorf("Skipped() = %d, want 4 (one per declined task)", got)
+	}
+
+	// Legacy capabilities still run the chat arm.
+	legacy := models.NewTask("shadow-legacy", "code", nil)
+	legacy.Payload = map[string]any{"task_desc": "work"}
+	if _, err := runner.RunShadow(ctx, legacy, &mutation.Strategy{ID: "cand-1"}); err != nil {
+		t.Fatalf("legacy task must still run: %v", err)
+	}
+	if got := runner.Skipped(); got != 4 {
+		t.Errorf("Skipped() = %d after legacy run, want still 4", got)
+	}
+}
+
+// TestShadowRunner_NilTaskFailsFast pins fail-loud on unusable input: a nil
+// task previously panicked on payload access; now it errors.
+func TestShadowRunner_NilTaskFailsFast(t *testing.T) {
+	runner := &shadowQuantumRunner{}
+	if _, err := runner.RunShadow(context.Background(), nil, &mutation.Strategy{ID: "cand-1"}); err == nil {
+		t.Error("RunShadow(nil task) must fail, not panic or pass")
+	}
+	if got := runner.Skipped(); got != 0 {
+		t.Errorf("Skipped() = %d after input error, want 0 (errors are not skips)", got)
+	}
+}

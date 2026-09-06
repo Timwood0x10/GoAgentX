@@ -303,3 +303,58 @@ func taskFor(id, capability string, payload map[string]any) *models.Task {
 	task.Payload = payload
 	return task
 }
+
+// TestL2Cognition_AnswerReleasesSession pins M4-B2 teardown: when a router
+// with session wiring executes the terminal node, the session is released —
+// the graph handle drops and the compile subscription stops, so no new nodes
+// can grow into a finished session. A second execution still emits the answer
+// (the release miss is attributable via log, not fatal).
+func TestL2Cognition_AnswerReleasesSession(t *testing.T) {
+	ctx := context.Background()
+	reg := NewSessionRegistry()
+	g, err := reg.InitSession(ctx, "rel-1", "prompt", nil, nil)
+	require.NoError(t, err)
+	require.NotNil(t, g)
+
+	router := NewRouterCognitionWithPlanner(&stubBinder{}, nil, reg, slog.Default())
+	task := taskFor("n9", "ares/answer", map[string]any{"arg.content": "done"})
+	task.SessionID = "rel-1"
+
+	out, err := router.ExecuteStep(ctx, task)
+	require.NoError(t, err)
+	require.True(t, out.Done)
+	require.Equal(t, "done", out.Result.Items[0].Content)
+
+	_, err = reg.GetSession("rel-1")
+	require.ErrorIs(t, err, ErrSessionNotFound, "terminal execution must release the session")
+
+	again, err := router.ExecuteStep(ctx, task)
+	require.NoError(t, err, "re-executing after release must still emit the answer")
+	require.True(t, again.Done)
+}
+
+// TestL2Cognition_AnswerWithoutSessionsKeepsWorking pins that the release is
+// opt-in: routers built without session wiring (legacy + tests) execute the
+// terminal node exactly like before.
+func TestL2Cognition_AnswerWithoutSessionsKeepsWorking(t *testing.T) {
+	router := NewRouterCognition(&stubBinder{}, slog.Default())
+	out, err := router.ExecuteStep(context.Background(),
+		taskFor("n3", "ares/answer", map[string]any{"arg.content": "x"}))
+	require.NoError(t, err)
+	require.True(t, out.Done)
+	require.Equal(t, "x", out.Result.Items[0].Content)
+}
+
+// TestIsL2Capability_PartitionsTraffic pins the canary partition: the L2 set
+// (tool/* instances + three ares/* session nodes) is exactly what gate-on
+// peers advertise, so scheduler routing cannot mix legacy and L2 traffic.
+func TestIsL2Capability_PartitionsTraffic(t *testing.T) {
+	l2 := []string{"tool/grep", "tool/read", "ares/root", "ares/plan", "ares/answer"}
+	for _, c := range l2 {
+		require.True(t, IsL2Capability(c), "%q must route to L2 peers", c)
+	}
+	legacy := []string{"researcher", "worker", "", "tool/", "ares/unknown", "TOOL/grep"}
+	for _, c := range legacy {
+		require.False(t, IsL2Capability(c), "%q must NOT route to L2 peers", c)
+	}
+}

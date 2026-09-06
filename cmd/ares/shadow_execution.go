@@ -9,6 +9,7 @@ import (
 	"context"
 	"errors"
 	"log"
+	"sync/atomic"
 
 	"github.com/Timwood0x10/ares/internal/agentfabric"
 	"github.com/Timwood0x10/ares/internal/agents"
@@ -113,10 +114,40 @@ func (f *shadowCognitionFactory) For(strategy *mutation.Strategy) (agentfabric.C
 // payload["checkpoint"]).
 type shadowQuantumRunner struct {
 	factory *shadowCognitionFactory
+	// skipped counts buffered tasks the runner declined as out-of-scope
+	// (M4-C1 below). Same observability rationale as the planner's
+	// ForcedAnswers: a silently-skipped sample class would bias every
+	// judgment built on the buffer.
+	skipped atomic.Uint64
+}
+
+// Skipped reports how many buffered tasks were declined as out-of-scope for
+// strategy-shadow (M4-C1: L2 session tasks).
+func (r *shadowQuantumRunner) Skipped() uint64 {
+	if r == nil {
+		return 0
+	}
+	return r.skipped.Load()
 }
 
 // RunShadow implements evolution.ShadowRunner.
 func (r *shadowQuantumRunner) RunShadow(ctx context.Context, task *models.Task, strategy *mutation.Strategy) (bool, error) {
+	if task == nil {
+		return false, errors.New("shadow execution: nil task")
+	}
+	if agentfabric.IsL2Capability(string(task.AgentType)) {
+		// M4-C1: L2 session tasks are out of scope for strategy-shadow.
+		// Strategies judge ReAct prompts; the planner does not consume
+		// strategies, so an A/B verdict on an L2 task would be noise, not
+		// signal — and running it through the chat body would be worse
+		// (a plan task read as a recommendation request). L2 coverage
+		// comes from the B1 dual-path comparison and B2 canary metrics,
+		// not from here. The skip is neutral (false, nil): the same
+		// non-outcome an over-budget pass reports, so neither arm gains.
+		r.skipped.Add(1)
+		log.Printf("shadow: skip L2 task %q (%s) — out of scope for strategy judgment", task.TaskID, task.AgentType)
+		return false, nil
+	}
 	cog, err := r.factory.For(strategy)
 	if err != nil {
 		return false, err

@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"sync"
 
 	"github.com/Timwood0x10/ares/internal/workflow/engine"
@@ -44,6 +45,11 @@ type sessionEntry struct {
 // plannerCognition that the session has ended (or was never admitted), so
 // it can surface the error instead of silently growing into a phantom graph.
 var ErrSessionNotFound = errors.New("agentfabric: session not found")
+
+// ErrSessionAlreadyExists is returned by InitSession when the session was
+// admitted before. Concurrent admitters use errors.Is to tell "someone else
+// won the race, the session is usable" apart from a real failure.
+var ErrSessionAlreadyExists = errors.New("agentfabric: session already initialized")
 
 // NewSessionRegistry creates an empty per-session L2 graph registry.
 func NewSessionRegistry() *SessionRegistry {
@@ -86,7 +92,7 @@ func (r *SessionRegistry) InitSession(
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if _, exists := r.sessions[sessionID]; exists {
-		return nil, fmt.Errorf("agentfabric: session registry: session %q already initialized", sessionID)
+		return nil, fmt.Errorf("%w: %q", ErrSessionAlreadyExists, sessionID)
 	}
 
 	rootID := SessionRootID(sessionID)
@@ -160,7 +166,7 @@ func (r *SessionRegistry) SessionIDs() []string {
 // yields the same root ID) so a recompiled graph's root task is a 1:1 match
 // to the original — the rebuild-idempotency test pins this property.
 func SessionRootID(sessionID string) string {
-	return "sess/" + sessionID + "/root"
+	return sessionIDPrefix + sessionID + "/root"
 }
 
 // SessionNodeID builds a deterministic instance node ID for a tool execution
@@ -169,4 +175,25 @@ func SessionRootID(sessionID string) string {
 // rebuilds.
 func SessionNodeID(sessionID string, depth int, tool string, seq int) string {
 	return fmt.Sprintf("sess/%s/d%d/%s#%d", sessionID, depth, tool, seq)
+}
+
+// sessionIDPrefix is the shared stem of every L2 session node/task ID
+// (SessionRootID / SessionNodeID). The terminal-task reaper filters on it.
+const sessionIDPrefix = "sess/"
+
+// SessionIDFromNode extracts the owning session ID from an L2 node/task ID
+// ("sess/<sessionID>/…" → sessionID). It is the inverse of the ID builders
+// above, so the reaper's keep-set can map a fabric task ID back to the
+// registry key without re-deriving the format. Returns ok=false for any ID
+// that is not a session-scoped node.
+func SessionIDFromNode(nodeID string) (string, bool) {
+	rest := strings.TrimPrefix(nodeID, sessionIDPrefix)
+	if rest == nodeID { // no prefix
+		return "", false
+	}
+	sid, _, found := strings.Cut(rest, "/")
+	if !found || sid == "" {
+		return "", false
+	}
+	return sid, true
 }

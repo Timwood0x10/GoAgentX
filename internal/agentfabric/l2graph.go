@@ -76,6 +76,29 @@ func (g *L2Graph) Root() string { return g.root }
 // to count plan nodes and by AddToolNode to stamp the right AgentType.
 const planAgentType = "ares/plan"
 
+// answerAgentType is the L2 capability for terminal answer nodes.
+const answerAgentType = "ares/answer"
+
+// rootAgentType is the L2 capability for session admission roots.
+const rootAgentType = "ares/root"
+
+// IsL2Capability reports whether a capability is dispatched by the L2
+// session router (M4-C1/C4): tool/<name> instances and the ares/root,
+// ares/plan, ares/answer session nodes. Everything else is legacy ReAct
+// traffic. The two sets partition scheduler routing by construction —
+// canary peers advertise only the L2 set, legacy peers only primary types.
+func IsL2Capability(capability string) bool {
+	if strings.HasPrefix(capability, "tool/") {
+		return len(capability) > len("tool/")
+	}
+	switch capability {
+	case rootAgentType, planAgentType, answerAgentType:
+		return true
+	default:
+		return false
+	}
+}
+
 // PlanDepth returns the current plan-tool growth depth of the L2 graph
 // (M2-④: 生长深度上界护栏). Depth is the number of plan nodes in the graph
 // minus the root (which is an admission node, not a plan node). The planner
@@ -193,7 +216,7 @@ func (g *L2Graph) AddToolNode(ctx context.Context, id, tool string, args map[str
 	var agentType string
 	switch tool {
 	case "answer":
-		agentType = "ares/answer"
+		agentType = answerAgentType
 	case "plan":
 		agentType = planAgentType
 	default:
@@ -252,7 +275,10 @@ func (g DAGExecution) Select(chat, router Cognition) Cognition {
 type routerCognition struct {
 	binder  ToolBinder
 	planner Cognition // optional: ares/plan dispatch body (M2)
-	logger  *slog.Logger
+	// sessions is released by the answer body when the terminal node
+	// completes (M4-B2). Nil unless built with session wiring.
+	sessions *SessionRegistry
+	logger   *slog.Logger
 }
 
 var _ Cognition = (*routerCognition)(nil)
@@ -270,9 +296,10 @@ func NewRouterCognition(binder ToolBinder, logger *slog.Logger) Cognition {
 // NewRouterCognitionWithPlanner builds a router that also dispatches ares/plan
 // to the given planner Cognition. This is the M2 production constructor: the
 // planner carries session-scoped dependencies (L2 graph registry, fabric
-// reader, LLM client) that the router itself does not own.
-func NewRouterCognitionWithPlanner(binder ToolBinder, planner Cognition, logger *slog.Logger) Cognition {
-	return &routerCognition{binder: binder, planner: planner, logger: logger}
+// reader, LLM client) that the router itself does not own. sessions wires
+// session teardown into the answer body (nil = no release, test path).
+func NewRouterCognitionWithPlanner(binder ToolBinder, planner Cognition, sessions *SessionRegistry, logger *slog.Logger) Cognition {
+	return &routerCognition{binder: binder, planner: planner, sessions: sessions, logger: logger}
 }
 
 // ExecuteStep routes by task.AgentType (the node's capability). Tool nodes
@@ -287,9 +314,9 @@ func (r *routerCognition) ExecuteStep(ctx context.Context, task *models.Task) (*
 			return nil, fmt.Errorf("agentfabric: tool node %q has no binder", name)
 		}
 		return (&toolCognition{tool: tool, binder: r.binder, logger: r.logger}).ExecuteStep(ctx, task)
-	case name == "ares/answer":
-		return (&answerCognition{logger: r.logger}).ExecuteStep(ctx, task)
-	case name == "ares/plan":
+	case name == answerAgentType:
+		return (&answerCognition{logger: r.logger, sessions: r.sessions}).ExecuteStep(ctx, task)
+	case name == planAgentType:
 		// The planner cognition is injected by the session wiring (it
 		// carries the L2 graph + fabric handles); the router does not
 		// construct it because it needs session-scoped dependencies.
@@ -299,7 +326,7 @@ func (r *routerCognition) ExecuteStep(ctx context.Context, task *models.Task) (*
 			return r.planner.ExecuteStep(ctx, task)
 		}
 		return nil, fmt.Errorf("agentfabric: plan node %q has no planner cognition", name)
-	case name == "ares/root":
+	case name == rootAgentType:
 		return (&rootCognition{}).ExecuteStep(ctx, task)
 	default:
 		return nil, fmt.Errorf("agentfabric: unsupported L2 capability %q", name)
@@ -377,6 +404,10 @@ const unansweredBody = "no answer content supplied"
 // execution instead of looking successful.
 type answerCognition struct {
 	logger *slog.Logger
+	// sessions releases the L2 graph when the terminal node completes
+	// (M4-B2: session teardown). Nil on routers without session wiring —
+	// the legacy path never releases what it never admitted.
+	sessions *SessionRegistry
 }
 
 var _ Cognition = (*answerCognition)(nil)
@@ -395,6 +426,19 @@ func (c *answerCognition) ExecuteStep(_ context.Context, task *models.Task) (*St
 	}
 	result := models.NewTaskResult(task.TaskID, task.AgentType)
 	result.SetSuccess([]*models.RecommendItem{{ItemID: task.TaskID, Content: body}}, "answer node terminated session")
+	if c.sessions != nil && strings.TrimSpace(task.SessionID) != "" {
+		// The session ends here: drop the graph handle and stop the
+		// incremental-compile subscription so no new nodes can grow into
+		// a finished session (the reaper harvests the tasks). A release
+		// miss (already released) is attributable via the log, not fatal:
+		// the postcondition — no live session — already holds.
+		if err := c.sessions.ReleaseSession(task.SessionID); err != nil {
+			if c.logger != nil {
+				c.logger.Warn("agentfabric: answer released an unknown session",
+					"session", task.SessionID, "error", err)
+			}
+		}
+	}
 	return &StepOutcome{Done: true, Result: result}, nil
 }
 

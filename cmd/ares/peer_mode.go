@@ -142,12 +142,14 @@ func createPeerAgents(
 		kernel.fabric = kernel.fabric.WithConfidenceSource(expSrc)
 	}
 
+	// M4-C3: the static sub.Agent executor pool is gone. Its entries were
+	// dead in peer mode — the scheduler skips static registrations whenever
+	// the agent fabric is wired (the fabric's live population is the single
+	// candidate source) and recovery-bound tasks resolve through
+	// RegisterExecutorForTask instead. The map stays non-nil because the
+	// scheduler copies it at construction; an empty pool simply means
+	// "fabric only", which the drain path was designed for.
 	kernel.executors = make(map[string]CapabilityExecutor, len(subAgents))
-	for _, a := range subAgents {
-		if a != nil {
-			kernel.executors[a.ID()] = a // sub.Agent satisfies CapabilityExecutor
-		}
-	}
 
 	// Build the candidate list for the fabric dispatcher. The full declared
 	// capability set (Caps) is offered to the scorer so a task matching ANY
@@ -293,8 +295,9 @@ func createPeerAgents(
 	}
 	kernel.agents = agents
 
-	// The DAG execution gate. Zero value = legacy ReAct behavior (chat
-	// cognition for every peer, L2 machinery test-only).
+	// The DAG execution gate (M4-A1: kernel.dag_execution in config).
+	// Zero/absent config = legacy ReAct behavior (chat cognition for every
+	// peer, L2 machinery test-only).
 	//
 	// M3: when Enabled, peers advertise the FULL capability set the L2
 	// router needs (ares/root, ares/plan, ares/answer, tool/<name> for
@@ -302,10 +305,7 @@ func createPeerAgents(
 	// registry is wired per-peer so the plannerCognition can look up its
 	// L2 graph. Both prerequisites (M2 session wiring + M3 capability
 	// advertisement) now land here.
-	//
-	// TODO(tech-debt): bind Enabled to config so operators can flip it
-	// without code changes. Until then it stays off in production.
-	peerDAGExecution := agentfabric.DAGExecution{}
+	peerDAGExecution := resolveDAGExecution(cfg.Kernel.DAGExecution)
 	// The router body carries the planner when the gate is open; the
 	// planner needs session-scoped dependencies (registry, fabric reader)
 	// that are constructed here.
@@ -328,30 +328,41 @@ func createPeerAgents(
 			Sessions:   sessionReg,
 			Fabric:     kernel.fabric,
 			L1DAG:      l1DAG,
-			Logger:     slog.Default(),
+			// M4-A2: operator-tunable growth-depth guard (0/absent = default).
+			MaxDepth: resolveMaxPlanDepth(cfg.Kernel.DAGExecution),
+			Logger:   slog.Default(),
 		})
 		if err != nil {
 			return nil, nil, fmt.Errorf("peer mode: create planner cognition: %w", err)
 		}
-		peerRouter = agentfabric.NewRouterCognitionWithPlanner(toolBinder, planner, slog.Default())
+		peerRouter = agentfabric.NewRouterCognitionWithPlanner(toolBinder, planner, sessionReg, slog.Default())
 	}
 
-	// M3: build the full capability set when the gate is open.
-	// Legacy path declares only the primary type; the L2 path adds
-	// ares/root, ares/plan, ares/answer, and tool/<name> for every
-	// bound tool so the scheduler can route every L2 node type to this
-	// peer.
-	var fullCaps []string
-	if peerDAGExecution.Enabled {
-		fullCaps = []string{
-			"ares/root",
-			"ares/plan",
-			"ares/answer",
-		}
-		for _, name := range toolBinder.ListTools() {
-			fullCaps = append(fullCaps, "tool/"+name)
-		}
+	// M4-B2: retain the registry on the kernel so the submission path can
+	// admit sessions. Nil when the gate is off — legacy behavior unchanged.
+	kernel.sessionReg = sessionReg
+
+	// P0-1: terminal-task reaper for L2 session tasks. Every grown node is
+	// a fabric task and the fabric never self-harvests, so without this
+	// loop the in-memory task map grows monotonically across a long-lived
+	// serve (§9's named cost). The registry is the keep-set authority: a
+	// live session's tasks are its readable history (decision C) and are
+	// never harvested; only tasks of released sessions die, after the
+	// configured grace window. Gate off = no registry = nothing to reap.
+	if sessionReg != nil {
+		sessionReaper := taskfabric.NewReaperWithKeep(kernel.fabric, "sess/",
+			resolveReaperGrace(cfg.Kernel.DAGExecution), sessionKeepSet(sessionReg))
+		runBackground(ctx, comp, "l2-reaper", func(loopCtx context.Context) error {
+			sessionReaper.Run(loopCtx.Done(), time.Minute)
+			return nil
+		})
+		log.Printf("peer mode: L2 session task reaper wired (grace %s)",
+			sessionReaper.GracePeriod())
 	}
+
+	// M3: the L2 capability set is built per-peer below via
+	// peerCapabilities (canary partition: legacy primary-type tasks match
+	// only gate-off peers, ares/* tasks only gate-on peers).
 
 	// C1: configured sub-agents ARE the fabric's dynamic population — each is
 	// spawned WITH its execution body (ChatCognition) and its distilled
@@ -374,7 +385,7 @@ func createPeerAgents(
 		}
 		caps := []string{string(sa.Type())}
 		if peerDAGExecution.Enabled {
-			caps = fullCaps
+			caps = peerCapabilities(string(sa.Type()), true, toolBinder.ListTools())
 		}
 		if _, err := agents.Spawn(ctx, agentfabric.SpawnSpec{
 			Identity:     sa.ID(),
@@ -413,14 +424,12 @@ func createPeerAgents(
 			agent := newPeerExecutor(agentID, models.AgentType(capability), llmAdapter, chatClient, toolBinder, cfg, strategySrc)
 			return &peerExecutorAdapter{agent: agent}
 		},
-		func(agentID string, executor agentsyscall.Executor) {
-			// Adapt agentsyscall.Executor to CapabilityExecutor for the scheduler.
-			// The peerExecutorAdapter wraps sub.Agent and satisfies both
-			// agentsyscall.Executor and CapabilityExecutor.
-			if se, ok := executor.(*peerExecutorAdapter); ok {
-				sched.RegisterExecutor(agentID, se.agent)
-			}
-		},
+		// M4-C3: no scheduler registration here. The static pool is
+		// skipped whenever the agent fabric is wired, so registering
+		// syscall-spawned agents was a no-op for normal drains — and the
+		// agentsyscall.Executor half (the factory return above, which
+		// powers spawn_agent/create_task/ask_agent) is untouched.
+		func(string, agentsyscall.Executor) {},
 		// GAP-2: plan loops started via the create_plan loop option must be
 		// bounded by the serve lifetime, not the individual tool call.
 		agentsyscall.WithLoopLifetime(ctx),
@@ -487,6 +496,17 @@ func createPeerAgents(
 				sched.RegisterExecutorForTask(taskID, agentID, executor)
 			},
 			func(agentID, capability string) CapabilityExecutor {
+				// M4-C3 remainder: recovery-bound tasks bypass the candidate
+				// pool, so the canary partition cannot isolate them — dispatch
+				// per task. L2 session tasks resume on the gate-selected
+				// router; everything else keeps the legacy ReAct executor.
+				if body := selectRecoveryBody(peerDAGExecution, peerRouter, capability); body != nil {
+					exec, err := newCognitionExecutor(agentID, models.AgentType(capability), body)
+					if err == nil {
+						return exec
+					}
+					log.Printf("peer mode: recovery executor L2 dispatch failed, falling back to legacy: %v", err)
+				}
 				return newPeerExecutor(agentID, models.AgentType(capability), llmAdapter, chatClient, toolBinder, cfg, strategySrc)
 			},
 			sched.HasCapableExecutor,
@@ -606,6 +626,18 @@ func loadExperiencePrior(ctx context.Context, expRepo repositories.ExperienceRep
 func submitPeerTask(ctx context.Context, kernel *kernelHandle, capability string, payload map[string]any) (string, error) {
 	if kernel == nil || kernel.fabric == nil {
 		return "", errors.New("peer mode: kernel fabric not wired")
+	}
+	// M4-B2: a session-scoped submission admits its L2 session first, so the
+	// planner's first quantum finds a live graph. Fail-fast comes before any
+	// task is created: an unadmittable session must not leave an unrunnable
+	// task behind. Session-less submissions skip this entirely (legacy path).
+	var sessionID, prompt string
+	if payload != nil {
+		sessionID, _ = payload["session_id"].(string)
+		prompt, _ = payload["input"].(string)
+	}
+	if err := ensureSessionAdmission(ctx, kernel, sessionID, prompt); err != nil {
+		return "", err
 	}
 	taskID := fmt.Sprintf("peer-task-%s-%d", capability, peerTaskSeq.Add(1))
 

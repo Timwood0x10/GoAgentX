@@ -233,9 +233,11 @@
 | **S2 影子对拍** | 复用 `shadow_execution.go`（`errShadowToolDenied` 在接口层拒掉工具调用），L2 路径跑任务副本，只比对工具序列，零生产副作用 | B1 |
 | **S3 生长护栏 + 可观测** | 深度上界、强制收敛、会话终止原因 | **永久**——D 之后唯一还在的一层 |
 
-**S3 的现存缺口（D 前必须补）**：深度耗尽已有强制收敛——`planner_cognition.go:203-209` 命中 `depth >= maxDepth` 时 warn 并 `growAnswerNode(..., "max plan depth reached")`，等价于 ReAct 的 `chat_cognition.go:248-255` 降级纯文本。但 `maxPlanDepth = 10`（`planner_cognition.go:19-23`）**未接配置**（`MaxDepth` 仅出现在 `:47/48/108`），而 ReAct 的 `MaxRounds` 是可配的（`peer_agents.go:113` → `subCfg.MaxToolRounds`）。直接删 ReAct 会把「可运维调参的上限」换成「硬编码上限」，是运维能力回退。
+**S3 的缺口已补（A2 落地）**：深度耗尽已有强制收敛——`planner_cognition.go` 命中 `depth >= maxDepth` 时 warn 并 `growAnswerNode(..., "max plan depth reached")`，等价于 ReAct 的 `chat_cognition.go:248-255` 降级纯文本。上限现已可配（`kernel.dag_execution.max_plan_depth`，默认 `agentfabric.DefaultMaxPlanDepth = 10`），与 ReAct 的 `MaxRounds` 可配（`peer_agents.go:113` → `subCfg.MaxToolRounds`）对等，无运维能力回退。
 
 #### A 阶段 — 装回滚手柄（可逆，不改默认行为）
+
+**落地（2026-09-06）：A1 ✅ / A2 ✅。** 配置节 `kernel.dag_execution`（`ares_config/config.go:DAGExecutionConfig`）：`enabled` 默认 false，缺省与今天逐字节一致；`max_plan_depth` 默认 0 = planner 默认（`agentfabric.DefaultMaxPlanDepth = 10`，原未导出 `maxPlanDepth` 已导出为单一真相源）。`peer_mode.go` 经 `resolveDAGExecution` / `resolveMaxPlanDepth`（`cmd/ares/dag_execution.go`）接线，`MaxDepth` 传入 `PlannerDeps`；原 `TODO(tech-debt)` 已摘（做完即删）。负 `max_plan_depth` 被 `Validate` 拒绝；resolver 与 planner 双层兜底（非正 → 默认），护栏永不被误关。
 
 | # | 任务 | 验收 |
 |---|---|---|
@@ -243,30 +245,62 @@
 | A2 | `MaxDepth` 接配置 `kernel.dag_execution.max_plan_depth`（默认 10） | 配置 3 时第 3 层强制收敛为 answer 节点，不再生长 |
 | A3 | 会话可观测：图深度、节点数、终止原因（正常收敛 / 深度耗尽） | 深度耗尽各产生一次带 session id 的 warn + 一次计数 |
 
+测试：`TestValidateKernelDAGExecution`（缺省合法/负值拒绝/正值通过）+ `TestLoad_DAGExecutionSection`（yaml 键端到端；缺节保持关闭）+ `TestResolveDAGExecution` / `TestResolveMaxPlanDepth`（表驱动：缺省关、显式开、自定义透传、负值回默认）。planner 行为本身已有 `TestPlannerCognition_MaxDepthForcesAnswer` 覆盖。
+
 #### B 阶段 — 生产对拍（可逆，唯一能消除 P2 的一步）
 
 | # | 任务 | 验收 / 门 |
 |---|---|---|
-| B1 | 影子对拍：同一请求两条路都跑，工具调用被 `errShadowToolDenied` 拦下，比对工具名序列 | 真实请求上序列一致率达标；不一致样本全部归档，逐条定性 |
+| B1 | 影子对拍：同一请求两条路都跑，工具调用被拦下，比对工具名序列 | **机制落地 ✅（见下）**；真实请求采样待闸门开启后（P2），不一致样本逐条定性 |
+
+**B1 落地（2026-09-06）：对拍机制 ✅ / 真实流量采样 ⏳。** `agentfabric.CompareDualPath`（`shadow_compare.go`）：同一请求经 legacy chat 体与 planner 体双跑，arm binder 只广告 schema、调用全部拒绝并记录（零副作用），比对工具名序列；分歧进 `MismatchSample`（verdict 内 + `MismatchArchive` 双归档），永不只记日志。这补上了 `TestM4_DualPathBehaviorConsistency` 的缺口——那个测试只跑了 L2 单臂（注释明写"不跑 chat 体"），而本机制双臂真跑。测试：`TestShadowCompare_MatchOnSameScript`（同脚本序列一致、LLM 轮次相等、零样本）+ `TestShadowCompare_MismatchIsArchived`（分歧 verdict +归档各一条）+ `TestShadowCompare_ZeroSideEffects`（生产面零调用）+ `TestShadowCompare_RequiresInput`（缺件 fail-fast）。`cmd/ares/shadow_execution.go` 的策略级 A/B 不动——那是另一轴（策略间比），本机制是执行体轴；生产采样挂钩待 A1 开闸后的真实任务流。
 | B2 | 灰度：部分 peer `Enabled=true`，真实工具调用 | 工具调用次数 / 时延 / 失败率与 ReAct 基线对齐；深度耗尽率低于阈值 |
+
+**B2 落地（2026-09-06）：灰度机制 ✅ / 仿真金丝雀 ✅ / 活体金丝雀 ✅（真模型，真 API）。** 开闸前补上了三块缺件，缺一件开闸即故障：
+
+| # | 缺件 | 落点 | 测试 |
+|---|---|---|---|
+| B2-1 | 生产会话准入（`InitSession` 零生产调用方——开闸后 planner 首量子必 `ErrSessionNotFound`） | `ensureSessionAdmission`（`cmd/ares/session_admission.go`）：有 `session_id` + 闸门开 → 幂等准入（多轮复用，不 duplicate root）→ 编译 root → 提交的任务自然流向 planner；失败 fail-fast（无半建任务、无半准入会话）；订阅用 `context.WithoutCancel`（请求 ctx 会随 handler 消亡） | `TestSubmitPeerTask_AdmitsSessionFirst` / `ResubmitReusesSession` / `SessionlessUnchanged` / `GateOffIgnoresSession` / `AdmissionFailureCreatesNothing` |
+| B2-2 | 会话释放（answer 执行后图句柄不 drop = 订阅泄漏） | `NewRouterCognitionWithPlanner` 加 `sessions` 参 → answer 体执行成功后 `ReleaseSession`（miss 只 warn；nil = legacy 不变） | `TestL2Cognition_AnswerReleasesSession` / `AnswerWithoutSessionsKeepsWorking` |
+| B2-3 | C4 提前：开闸 peer 的能力集**替换**（不含 primary）——经核查这是隔离机制本身，不是 bug：legacy 主能力任务只匹配关闸 peer，`ares/*` 只匹配开闸 peer；且调度器在 fabric 已接线时**唯一**候选源就是 fabric 活体（`scheduler.go` C1 注释），静态 `sub.Agent` 池够不着 `ares/*` | `peerCapabilities` 纯函数锁定该分区（开闸集**不得**含 primary，含了就是把 legacy 流量吸进金丝雀） | `TestPeerCapabilities_PartitionTraffic` |
+| B2-4 | 深度耗尽计数（B2 验收要"率"，只有 warn 日志给不出数） | `plannerCognition.ForcedAnswers()`（atomic，进程级；读口预留，metrics 端点另接） | `MaxDepthForcesAnswer` 内断言 0→1 |
+
+**仿真金丝雀数字**（`TestCanary_FullStackL2Sessions`，5 会话并发 × 真实调度器 × echo 工具，脚本 LLM）：会话完成 5/5，工具调用 9/9 成功（成功率 100%），单会话时延 60–100ms，`ForcedAnswers` 0。另含 0 工具轮次、单轮多工具两种形状。**附带真修**：仿真抓到 planner 根回退缺口——根未完成时 `readNodeOutput` 返回 `("", nil)` 不触发回退，导致首量子发空 user 消息（真实 provider 直接 400）；已改为 `err != nil || 空白 → 回退 payload input`。
+
+**活体金丝雀数字**（`TestCanaryLiveLLM`，`//go:build e2e`，agnes flash 真模型 + echo 工具零副作用，同一 prompt 双臂真跑）：连续两次 `legacy_seq=["grep"] dag_seq=["grep"]`，3s 内完成，`ForcedAnswers` 0，终端答案非空。跑之前抓到两个真问题：① fixture 的 `ParameterSchema` 漏顶层 `Type: "object"`（生产 schema 都有，provider 400 证明）；② planner 历史缺 assistant 配对（首轮修完重跑仍 5× 重复，才定位到 CompareDualPath 的 DAG 臂不执行工具、前驱全是空洞——harness 局限，不是 planner 问题；活体改走全栈后消失）。结论：真模型在配对历史下首轮即收敛，无重复调用。
+
+**金丝雀约束（运维必读）**：开闸 peer 只收 `ares/*` 会话流量；legacy 主能力任务不得提交给金丝雀拓扑（分区保证它们落到关闸 peer，但提交端仍应分流）。`submitPeerTask` 的 L2 会话提交 `capability` 必须用 `ares/plan`（提交的任务即首个 plan 量子；planner 对非图 plan ID 有 root 回退，已测）。生产对数指标：`EventToolCallCompleted.Success` 分组成功率（金丝雀 vs 基线）+ `ForcedAnswers` 计数/会话数。任一超阈 → 关配置重启（S1），停在双跑。
 
 **门**：B2 不通过就停在双跑，不进 C。这是 §5 M4 前置「否则停在双跑」的落地含义。
 
 #### C 阶段 — 为删除清场（可逆）
 
-| # | 任务 | 验收 |
+**落地（2026-09-06）：C1 ✅ / C2 ✅（冻结，非迁移）/ C3 ✅（死注册摘除 + 恢复绑定 L2 化）/ C4 ✅（已提前至 B2-3）。** 执行中纠正了两处原计划：
+
+| # | 任务 | 落地 |
 |---|---|---|
-| C1 | `shadow_execution.go:90` 改用 router（影子执行本不该依赖具体执行体） | 影子判决行为不变 |
-| C2 | `introspect/dashboard.go:261` 同上 | 面板行为不变 |
-| C3 | 摘掉 `peer_mode.go:145-148` 的 `sub.Agent` 执行池注册 | 调度器不再有第二条 ReAct 路 |
-| C4 | 能力广告分叉（`peer_mode.go:344-354`、`:375-378`）塌成一条前，验一次外部 capability 不被误路由：`actions.go:415 req.Capability` → `submitPeerTask:606` → `:624` | 放宽后每个 peer 都广告 `ares/*` + `tool/*`，既有外部提交的 capability 仍落到正确 peer |
-| — | 收口检查 | `NewChatCognition` 的生产构造点只剩闸门后那一处 |
+| C1 | 影子执行不再依赖"具体执行体能跑一切"的假设 | 原计划"改用 router"**不可行**：router 跑 L2 任务会经 planner 向**活会话图**长节点（生产副作用），且 planner 不消费策略、A/B 无意义。实际做法：`shadowQuantumRunner` 按 `agentfabric.IsL2Capability` 跳过 L2 任务（中性 `(false, nil)` + `Skipped()` 计数 + 日志），legacy 判决行为逐字节不变。L2 覆盖归 B1 对拍 + B2 金丝雀，不管策略影子要。测试：`TestShadowRunner_SkipsL2Tasks`（4 种 L2 cap 全跳过、计数 4、legacy 照跑）+ `TestShadowRunner_NilTaskFailsFast`（nil 由 panic 改显式错误） |
+| C2 | `introspect/dashboard.go:261` | **冻结，不迁**：唯一调用方是 `examples/30-introspect-panel-demo`（demo 运行时，非生产服务），其 agent 是任意 capability，router 接不下来。D 阶段删 `chat_cognition.go` 时一并处理该 example（迁 L2 cap 或删例）。 |
+| C3 | 摘 `sub.Agent` 静态池注册 + 恢复绑定按能力分发 | 摘了两处**死注册**：`peer_mode.go` 批量池（fabric 接线时调度器跳过静态池，`scheduler.go` C1 注释为证）+ syscall-spawn 回调里的 `sched.RegisterExecutor`（同一原因；`agentsyscall.Executor` 那一半保留，协作工具靠它）。`kernel.executors` 保持非空 map 传参（scheduler 拷贝，无别名风险）。**恢复绑定已 L2 化**（C3 余量关闭）：`RegisterExecutorForTask` 的工厂按任务能力分发——L2 cap 经 `selectRecoveryBody` 走 `peerRouter` 的 `cognitionExecutor` 适配器（`Done/Checkpoint/Result` 逐字段直通），其余走原 `newPeerExecutor`；`peerRouter` 为空或失败时回退 legacy，任务永不因分发本身被 stranded。测试：`TestSelectRecoveryBody`（6 格：关闸/L2/legacy/空 router 全覆盖）+ `TestNewCognitionExecutor_TranslatesOutcome`（直通 + 错误透传 + 空体构造失败）。 |
+| C4 | 分区验证（已提前至 B2-3） | `peerCapabilities` + `TestPeerCapabilities_PartitionTraffic` 锁定：开闸集永不含 primary。 |
+| — | 收口检查 | `NewChatCognition` 生产构造点：闸门后 1 处（`peer_mode.go`）+ 策略影子 1 处（测量 harness，C1 后只跑 legacy）+ demo 1 处（冻结）+ B1 对拍 harness 1 处（非服务流量）。**D 仍删不动**：见下。 |
+
+**D 阻塞（书面）：D0 已删 ✅；D1–D4 未动手——测绘后确认计划低估了范围，动手删即违规，原因如下。**
+
+1. **B2 无生产 Numbers**：仿真 + 活体基线已有，生产对数是运维动作，还没跑 → 按本计划"门"条款停在双跑。
+2. **§8-6 第一句已裁决 ✅（2026-09-06，用户授权代签）**：见"§8-6 的处置"末段。裁决不代替验收，D 的机械前提不变。
+3. **D1–D3 的真实 blast radius（2026-09-06 实测，超出原"D 四行表"）**：
+   - `sub.Agent` 是 peer 身份类型（`createPeerAgents` 返回 `[]sub.Agent`，`buildPeerRegistry`、`wireEvolutionIPC`、`peerExecutorAdapter`、`agentsyscall` 全链路依赖），其引擎正是要删的 `sub.TaskExecutor` 循环。删循环 = 重写协作栈（peer 生成/syscall/IPC/恢复），不是机械删除。
+   - Legacy 主能力流量仍在被服务：删闸门+chat 后 router 拒收 primary cap，legacy 提交任务将饿死（非失败，是无候选者）。M4 语义上 L2-only 世界要求客户端先迁移，未发生。
+   - 策略影子（`shadow_execution.go`）删 chat 即编译中断；其长期归宿（M5/M6 fitness 接管）属进化闭环，不属 M4——D 若动它等于越权删进化功能。
+   - 结论：D1–D4 的前置不是"一行 grep"，而是"协作栈 L2 化 + 客户端迁移 + 影子退役"三个项目。本计划 D 表的"约 2300 行"估计只覆盖了本体，未覆盖生态。
+4. **D 范围增补**：`examples/30`（C2 余量：D 删 `chat_cognition.go` 时一并迁 L2 cap 或删例）。恢复绑定余量已关闭（C3）。
 
 #### D 阶段 — 删除（不可逆，单个提交内完成）
 
 | # | 对象 | 位置 |
 |---|---|---|
-| D0 | `toolprojection` 投影器 + `tool_projection_worker.go` + 配置键 | 与 ReAct 无关、无生产调用方，**可独立先做**。包外 `toolprojection.ToolStepID` 只被测试调用（`ares_evolution/tool_dimension_transmission_test.go:216-217`）；生产侧 `ToolStepID` 命中是 `feedback` / `fitness_aggregator` 的**同名字段**，不是这个函数 |
+| D0 | `toolprojection` 投影器 + `tool_projection_worker.go` + 配置键 | **已删 ✅（2026-09-06）**：整包 + worker（含测试）+ `ToolProjectionConfig`（字段/默认值/校验/单测）+ 传导链测试。核实后删除：worker 默认关闭、`WindowToolStep` 零生产调用方（M6 走普通 `Window`）、包外函数调用方只有测试、yaml 宽松解析（旧配置文件照常加载）。`rg "toolprojection" -g '*.go'` 已归零（同名字段 `ToolStepID` 在 `feedback`/`fitness_aggregator` 是独立字段，未动）。 |
 | D1 | `chatStepState` + `chatStep` + `decodeChatStepState` | `chat_cognition.go:78` 起 |
 | D2 | 两处 `stepSchemaVersion` + 两处 `defaultMaxToolRounds` | `chat_cognition.go:47/43`、`sub/executor.go:40/36` |
 | D3 | `chatCognition` 整体 + `sub/executor.go` 工具循环 | 收敛到 §2.1 三执行体 |
@@ -280,6 +314,8 @@
 #### §8-6 的处置
 
 第一句（`DAGExecution` 默认关）随 D 作废：闸门是过渡工具，路径只剩一条时它没有语义，且保留它同时违反 code_rules_v2 §5.1（禁止并存两套执行循环）与本文 §7（不留「以防万一」的旁路）。§8-6 的措辞本身自带有效期——「M1.5–M5 落地后外部行为与今天一致」。第二句（`tool_weight` 默认 0）**不受影响**，属 M6 进化侧（`ares_config/config.go:1015` → `evolution_lifecycle_config.go:94`）。
+
+**裁决（2026-09-06，用户授权代签）：第一句在 D 提交中废止。** 依据：① 副作用清单已列且可接受——回滚手柄降级为 revert+重部署（D 前打 tag + runbook 入发布说明，明账交换）；能力面放宽已由分区测试锁定（`TestPeerCapabilities_PartitionTraffic`），放宽本身正是金丝雀隔离的机制。② 保留的代价更大：永久双轨违反 §5.1 与 §7，且 §8-6 第一句的字面有效期（M1.5–M5）在 D 完成时届满。③ D 的机械前提（B2 数、C 收口）在本裁决之后仍逐项执行，裁决本身不代替任何验收。
 
 **不在 M4 范围**：`buildLiveAgentDAG` / `buildEvolutionDAG` 重写属 M5。
 

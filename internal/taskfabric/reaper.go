@@ -25,16 +25,20 @@ import (
 // The reaper runs as a managed background loop (like runCollabGCLoop), exited
 // by closing its done channel. It is NOT on the scheduler drain path.
 //
-// TODO(tech-debt): no production caller wires this reaper yet, so terminal L2
-// session tasks still accumulate. Wiring it needs the keep-set from
-// agentfabric.SessionRegistry.SessionIDs (harvest only tasks whose session is
-// gone) rather than the wall-clock grace below — a session that outlives the
-// grace period would otherwise have its early predecessors harvested while the
-// planner still reads their envelopes for context assembly (decision C).
+// Keep-set (P0-1): wall-clock grace alone is unsafe for a session that
+// outlives the grace period — its early predecessors would be harvested while
+// the planner still reads their envelopes for context assembly (decision C).
+// A wired keep predicate makes the session registry the authority: a task
+// whose owning session is still live is NEVER harvested, no matter its age;
+// grace then only protects the read window racing a session's release.
 type Reaper struct {
 	fabric      *Fabric
 	prefix      string
 	gracePeriod time.Duration
+	// keep reports whether a task's owning session is still live. Nil =
+	// grace-only harvesting (legacy semantics, safe only when sessions are
+	// shorter than the grace window).
+	keep func(taskID string) bool
 }
 
 // NewReaper creates a terminal-task reaper scoped to the given session
@@ -42,14 +46,33 @@ type Reaper struct {
 // ("sess/<sessionID>/"); non-matching tasks are skipped. A gracePeriod of 0
 // defaults to 30s.
 func NewReaper(fabric *Fabric, prefix string, gracePeriod time.Duration) *Reaper {
+	return NewReaperWithKeep(fabric, prefix, gracePeriod, nil)
+}
+
+// NewReaperWithKeep creates a reaper whose harvesting is additionally gated
+// by a keep predicate: Sweep skips every task for which keep returns true
+// (the owning session is still live), regardless of the grace period. A nil
+// keep degrades to grace-only harvesting (NewReaper semantics).
+func NewReaperWithKeep(fabric *Fabric, prefix string, gracePeriod time.Duration, keep func(taskID string) bool) *Reaper {
 	if gracePeriod <= 0 {
 		gracePeriod = 30 * time.Second
 	}
-	return &Reaper{fabric: fabric, prefix: prefix, gracePeriod: gracePeriod}
+	return &Reaper{fabric: fabric, prefix: prefix, gracePeriod: gracePeriod, keep: keep}
+}
+
+// GracePeriod reports the effective read-window grace after construction
+// defaults are applied. Exposed for startup logging so operators can confirm
+// what the reaper actually runs with.
+func (r *Reaper) GracePeriod() time.Duration {
+	if r == nil {
+		return 0
+	}
+	return r.gracePeriod
 }
 
 // Sweep performs one harvesting pass: every terminal task whose ID starts
-// with the reaper's prefix and whose UpdatedAt is older than the grace
+// with the reaper's prefix, whose owning session is NOT kept live by the
+// keep predicate (when wired), and whose UpdatedAt is older than the grace
 // period is deleted. Returns the number of tasks harvested.
 //
 // In-flight tasks (LEASED/RUNNING/SUSPENDED) are refused by Delete's guard
@@ -63,6 +86,12 @@ func (r *Reaper) Sweep() int {
 	now := time.Now()
 	for _, id := range r.fabric.IDs() {
 		if r.prefix != "" && !strings.HasPrefix(id, r.prefix) {
+			continue
+		}
+		// Keep-set: a live session's tasks are its readable history
+		// (decision C — the envelope is the only place output lives).
+		// Age is irrelevant while the session is alive.
+		if r.keep != nil && r.keep(id) {
 			continue
 		}
 		tk, err := r.fabric.Task(id)

@@ -47,21 +47,7 @@ const (
 	DefaultEvolutionSelectionStrategy = "tournament"
 )
 
-// DefaultToolProjection* are the defaults for the periodic ToolStep projection
-// worker (`evolution.tool_projection`).
-//
-// The interval is minutes, not seconds: the worker aggregates a WINDOW of tool
-// calls into per-argument-shape success rates, and a window that closes too fast
-// contains one or two calls per shape — a success rate of 0 or 1 that says
-// nothing. It is also not hours, because evolution must see a bad tool pattern
-// while the strategy that produced it is still active.
-//
-// MinSamples is 3 for the same reason from the other direction: below it, a
-// single failure swings the rate by 50 percentage points or more.
-const (
-	DefaultToolProjectionInterval   = 10 * time.Minute
-	DefaultToolProjectionMinSamples = 3
-)
+// M4-D0: DefaultToolProjection* removed with their package.
 
 // NewMinimalConfig builds a fully-runnable Config from only the LLM endpoint
 // details, so a user does not need a YAML file to start the runtime: everything
@@ -313,16 +299,7 @@ func (c *Config) setDefaults() {
 	if c.Evolution.LLMScoring.MaxCallsPerGeneration == 0 {
 		c.Evolution.LLMScoring.MaxCallsPerGeneration = 100
 	}
-	// Tool projection defaults — opt-in via Enabled (default false). The
-	// window knobs are filled regardless so an operator who flips only
-	// `enabled: true` gets the sane window rather than a 0s ticker (which
-	// panics) and MinSamples=0 (which publishes single-call 0/1 rates).
-	if c.Evolution.ToolProjection.Interval == 0 {
-		c.Evolution.ToolProjection.Interval = DefaultToolProjectionInterval
-	}
-	if c.Evolution.ToolProjection.MinSamples == 0 {
-		c.Evolution.ToolProjection.MinSamples = DefaultToolProjectionMinSamples
-	}
+	// M4-D0: tool_projection defaults removed with their package.
 	// Discovery defaults — opt-in via Enabled (default false). When enabled
 	// but Interval is unset, default to 5 minutes between discovery cycles.
 	if c.Discovery.Interval == 0 {

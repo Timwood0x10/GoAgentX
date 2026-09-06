@@ -485,12 +485,11 @@ func wireGAEvolution(ctx context.Context, cfg *ares_config.Config, comp *Compone
 	// unattributable, i.e. dead wiring that looks live.
 	newEvol.ChannelFeedback = startChannelFeedback(ctx, comp, newEvol, wired.ActiveStrategyManager, cfg.Evolution.ChannelFeedback)
 
-	// Y1 §12-1: the production trigger for the ToolStep projection. Separate
-	// from the recorder above — that writes one record per tool call, this
-	// projects the event log into per-argument-shape success rates, the only
-	// producer of the tool_step fitness dimension.
-	startToolProjectionWorker(ctx, comp, newEvol, cfg.Evolution.ToolProjection)
-
+	// M4-D0: the ToolStep projection worker is deleted with its package (default-disabled, zero production readers of
+	// WindowToolStep). The per-(tool#arg_shape) fitness dimension is
+	// superseded by the L1 ToolClass graph (M5) fed from L2 execution stats
+	// (M6) — same key shape (toolName#argShape), live source instead of a
+	// batch-projected one.
 	// In the full configuration, attach the GA adapter to the existing
 	// old-system scheduler; otherwise the GA system's own scheduler
 	// (registered above on the LLM callback registry) drives it.

@@ -259,6 +259,8 @@ func TestPlannerCognition_MaxDepthForcesAnswer(t *testing.T) {
 	require.NoError(t, err)
 	require.True(t, out.Done)
 	require.Equal(t, 1, g.PlanDepth(), "one plan node grown")
+	require.Equal(t, uint64(0), planner.(*plannerCognition).ForcedAnswers(),
+		"a growing quantum must not move the depth-exhaustion counter")
 
 	// Round 2 (depth 1 >= 1): forced answer, no more tool nodes.
 	plan2ID := SessionNodeID(sessionID, 1, "plan", 0)
@@ -274,6 +276,8 @@ func TestPlannerCognition_MaxDepthForcesAnswer(t *testing.T) {
 	// An answer node was grown.
 	answerID := SessionNodeID(sessionID, 2, "answer", 0)
 	waitForTaskExists(t, fabric, answerID, 2*time.Second)
+	require.Equal(t, uint64(1), planner.(*plannerCognition).ForcedAnswers(),
+		"exactly one quantum hit the depth guard (M4-B2 canary metric)")
 }
 
 // TestReaper_HarvestsTerminalTasks verifies the M2-⑤ reaper: terminal tasks
