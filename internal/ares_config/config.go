@@ -1055,6 +1055,11 @@ type EvolutionGateConfig struct {
 	// (ares_eval.TestSuite schema: {name, description, test_cases: [...]}).
 	// Empty string disables the G3 gate (it degrades to pass-through).
 	EvalSuite string `yaml:"eval_suite"`
+	// EvalStrict fails the G3 gate closed when eval infrastructure is
+	// missing (E3). Default false preserves backward compatibility;
+	// production should set it true so an unwired gate cannot silently
+	// pass every candidate.
+	EvalStrict bool `yaml:"eval_strict"`
 }
 
 // LLMScoringConfig configures the opt-in LLM-backed strategy scorer for the

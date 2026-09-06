@@ -513,6 +513,21 @@ func (m *MutableDAG) StepIndex() map[string]*Step {
 	return idx
 }
 
+// NodeMetadata returns a copy of one node's Metadata under read lock (M5).
+// The planner reads L1 enabled/budget/prior through this — never by holding
+// a *Step pointer across the lock boundary — so a concurrent SetNodeMetadata
+// (evolution patch) cannot race the read. ok=false when the node is unknown.
+func (m *MutableDAG) NodeMetadata(nodeID string) (map[string]string, bool) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	step, ok := m.steps[nodeID]
+	if !ok {
+		return nil, false
+	}
+	return cloneMetadata(step.Metadata), true
+}
+
 // Subscribe returns a channel for graph change events.
 // The returned channel is never closed unless Unsubscribe is called with
 // the corresponding subscription ID. Prefer SubscribeWithID when the caller

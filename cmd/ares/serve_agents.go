@@ -314,6 +314,26 @@ func setupPeerRegistry(
 		log.Printf("peer registry wired through evolution-aware IPC: %d agents registered", len(reg.IDs()))
 	default:
 		reg = buildPeerRegistry(subAgents)
+		// §11.1 fix: ask_agent is advertised on the binder in every serve
+		// path, so the default (non-evolution) branch must also wire the
+		// collaboration primitive — otherwise the tool is advertised but
+		// every call fails loud. Route through the plain peer registry
+		// (no evolution observation here; the Y.2 channel stays disarmed
+		// until the evolution branch is taken).
+		if kernel != nil && kernel.syscalls != nil {
+			plainReg := reg
+			kernel.syscalls.SetAskAgent(func(ctx context.Context, from, to, topic string, payload any) error {
+				body := map[string]any{"topic": topic}
+				if m, ok := payload.(map[string]any); ok {
+					body["payload"] = m
+				} else if payload != nil {
+					body["payload"] = payload
+				}
+				msg := ahp.NewTaskMessage(from, to, "", "", body)
+				return plainReg.Send(ctx, to, msg)
+			})
+			log.Printf("serve: ask_agent syscall wired to plain peer registry (%d agents)", len(reg.IDs()))
+		}
 		log.Printf("peer registry wired: %d agents registered", len(reg.IDs()))
 	}
 	// Retain the registry on the kernel handle at construction time (N4: the

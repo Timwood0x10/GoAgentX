@@ -159,6 +159,7 @@ const roleTool = "tool"
 const (
 	l1MetaEnabled = "enabled"
 	l1MetaBudget  = "budget"
+	l1MetaPrior   = "prior"
 )
 
 // l1ToolClassID builds the L1 ToolClass node ID for a tool: toolName + "#" +
@@ -227,6 +228,15 @@ func (c *plannerCognition) ExecuteStep(ctx context.Context, task *models.Task) (
 	prompt, err := c.assembleContext(ctx, task, g)
 	if err != nil {
 		return nil, fmt.Errorf("agentfabric: planner cognition: assemble context: %w", err)
+	}
+
+	// M5: inject L1 prior hints as a system message (prompt-only, never a
+	// growth block). Deterministic order; absent when no priors are set.
+	if priors := c.l1Priors(); len(priors) > 0 {
+		prompt = append(prompt, &core.LLMMessage{
+			Role:    "system",
+			Content: "evolution priors (hints only, tool choice stays with you):\n- " + strings.Join(priors, "\n- "),
+		})
 	}
 
 	// Build the tool schemas for the LLM.
@@ -477,18 +487,18 @@ func (c *plannerCognition) growToolNodes(
 // isToolEnabled reads the L1 ToolClass graph's "enabled" metadata for the
 // given tool. Returns true (permissive) when the L1 graph is nil, the node
 // is not found, or the metadata is missing/empty. Returns false only when
-// the L1 node explicitly sets enabled="false".
+// the L1 node explicitly sets enabled="false". Reads through NodeMetadata
+// (locked copy) so a concurrent evolution SetNodeMetadata cannot race.
 func (c *plannerCognition) isToolEnabled(toolName string) bool {
 	if c.l1 == nil {
 		return true
 	}
 	nodeID := c.l1ToolClassID(toolName)
-	steps := c.l1.StepIndex()
-	step, ok := steps[nodeID]
+	md, ok := c.l1.NodeMetadata(nodeID)
 	if !ok {
 		return true // unknown ToolClass → permissive
 	}
-	val, ok := step.Metadata[l1MetaEnabled]
+	val, ok := md[l1MetaEnabled]
 	if !ok || val == "" {
 		return true
 	}
@@ -506,12 +516,11 @@ func (c *plannerCognition) toolBudgetRemaining(g *L2Graph, toolName string) bool
 		return true
 	}
 	nodeID := c.l1ToolClassID(toolName)
-	steps := c.l1.StepIndex()
-	step, ok := steps[nodeID]
+	md, ok := c.l1.NodeMetadata(nodeID)
 	if !ok {
 		return true // unknown ToolClass → permissive
 	}
-	budgetStr, ok := step.Metadata[l1MetaBudget]
+	budgetStr, ok := md[l1MetaBudget]
 	if !ok || budgetStr == "" || budgetStr == "0" {
 		return true // unlimited
 	}
@@ -521,6 +530,37 @@ func (c *plannerCognition) toolBudgetRemaining(g *L2Graph, toolName string) bool
 	}
 	count := g.CountToolClass(toolName)
 	return count < budget
+}
+
+// l1ToolPrior returns the L1 ToolClass "prior" hint for the given tool (M5).
+// Empty means no hint. prior is prompt-only (§6): it never blocks growth,
+// only guides the LLM. Reads through NodeMetadata (locked copy).
+func (c *plannerCognition) l1ToolPrior(toolName string) string {
+	if c.l1 == nil {
+		return ""
+	}
+	nodeID := c.l1ToolClassID(toolName)
+	md, ok := c.l1.NodeMetadata(nodeID)
+	if !ok {
+		return ""
+	}
+	return strings.TrimSpace(md[l1MetaPrior])
+}
+
+// l1Priors collects the non-empty prior hints for every known tool schema,
+// sorted by tool name for determinism. Used to inject evolution guidance
+// into the planner prompt (§6: prior只进提示词).
+func (c *plannerCognition) l1Priors() []string {
+	if c.l1 == nil || c.binder == nil {
+		return nil
+	}
+	var priors []string
+	for _, s := range c.binder.GetToolSchemas() {
+		if p := c.l1ToolPrior(s.Name); p != "" {
+			priors = append(priors, s.Name+": "+p)
+		}
+	}
+	return priors
 }
 
 // growAnswerNode grows a terminal answer node carrying the final response and

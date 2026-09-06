@@ -89,9 +89,31 @@ func (b *observedToolBinder) CallTool(ctx context.Context, name string, args map
 		Caller:     kernelctx.CallerID(ctx),
 		Outcome:    toolCallOutcome(ctx, err),
 		Latency:    time.Since(started),
-		ToolStepID: toolStepID(name, args),
+		ToolStepID: b.toolClassIDForCall(name, args),
 	})
 	return result, err
+}
+
+// toolClassIDForCall builds the M6 attribution key: toolName#schemaShape,
+// where schemaShape comes from the tool's DECLARED schema (shared
+// resources.ToolArgShape) — the same derivation the L1 graph builder and
+// the planner constraint check use. A call that omits an optional parameter
+// must still attribute to the L1 node, so an args-derived shape (which would
+// miss the node and fall through to permissive) is only the fallback when
+// the tool has no known schema.
+func (b *observedToolBinder) toolClassIDForCall(name string, args map[string]any) string {
+	if b.ToolBinder != nil {
+		for _, s := range b.ToolBinder.GetToolSchemas() {
+			if s.Name == name {
+				shape := resources.ToolArgShape(s)
+				if shape == "" {
+					return name
+				}
+				return name + "#" + shape
+			}
+		}
+	}
+	return toolStepID(name, args)
 }
 
 // toolStepID builds the process-level attribution key (Y1 C3): toolName#argShape,

@@ -159,7 +159,19 @@ type sourceStat struct {
 
 // Window computes the aggregate fitness over recent evidence for the given
 // strategy ID. Returns Ok=false when insufficient evidence exists, so callers
-// can apply a conservative cold-start policy.
+// can apply a conservative cold-start policy. Without a time range it queries
+// the most recent WindowSize records per source (legacy behavior). Callers
+// that compare two strategies (deployment staging Evaluate) MUST use WindowAt
+// with a shared [since, until] anchor instead — two independent Window calls
+// can straddle concurrent evidence writes and distort the delta (E1).
+func (a *RuntimeFitnessAggregator) Window(ctx context.Context, strategyID string) WindowResult {
+	return a.WindowAt(ctx, strategyID, time.Time{}, time.Time{})
+}
+
+// WindowAt is Window scoped to the [since, until] evidence time range (E1).
+// Zero since/until disables that bound (matching MemoryStore/PostgresStore
+// semantics). Both bounds SHOULD be non-zero for staging comparisons so the
+// shadow and baseline sides read the same snapshot.
 //
 // The aggregation:
 //  1. Queries KindFitness evidence for each configured source.
@@ -197,7 +209,7 @@ type sourceStat struct {
 // while the strategy's own fitness sample set is unchanged — partially
 // defeating the decorrelation. Callers needing the overall newest timestamp
 // can take the max over PerSource.
-func (a *RuntimeFitnessAggregator) Window(ctx context.Context, strategyID string) WindowResult {
+func (a *RuntimeFitnessAggregator) WindowAt(ctx context.Context, strategyID string, since, until time.Time) WindowResult {
 	// Read cfg and store under the SAME lock: SetStore may run concurrently
 	// with Window (bootstrap injects the shared store after construction),
 	// and an unlocked store read is a data race.
@@ -235,7 +247,7 @@ func (a *RuntimeFitnessAggregator) Window(ctx context.Context, strategyID string
 	}
 
 	// Also query dimension_eval evidence.
-	dimMean, dimCount, dimLastAt := a.querySourceMean(ctx, store, "dimension_eval", evidence.KindDimensionEval, cfg.WindowSize, "")
+	dimMean, dimCount, dimLastAt := a.querySourceMeanAt(ctx, store, "dimension_eval", evidence.KindDimensionEval, cfg.WindowSize, "", since, until)
 
 	perSource := make(map[string]sourceStat)
 	totalCount := 0
@@ -253,7 +265,7 @@ func (a *RuntimeFitnessAggregator) Window(ctx context.Context, strategyID string
 			// weight nor sample count (see the optIn field comment).
 			continue
 		}
-		m, c, srcLastAt := a.querySourceMean(ctx, store, src.name, evidence.KindFitness, cfg.WindowSize, src.strategyID)
+		m, c, srcLastAt := a.querySourceMeanAt(ctx, store, src.name, evidence.KindFitness, cfg.WindowSize, src.strategyID, since, until)
 		if c == 0 {
 			continue
 		}
@@ -320,32 +332,35 @@ func (a *RuntimeFitnessAggregator) Window(ctx context.Context, strategyID string
 	return result
 }
 
-// querySourceMean computes the mean fitness value from evidence matching
-// the given source and kind. Only values in [0,1] are accepted (matching
-// recentFitnessSummary's filter), so callers can rely on the [0,1] contract.
-// When strategyID is non-empty, records whose payload strategy_id differs
-// are skipped (the strategy source scopes by candidate); records without a
-// strategy_id payload key are skipped too, because they cannot be attributed.
-// The returned time is the newest in-window record's timestamp (zero when no
-// records matched) — the saturation-safe "did the window advance" signal.
-// The store is passed in (not read from the receiver) so Window can snapshot
-// it under its lock and keep this helper lock-free.
-func (a *RuntimeFitnessAggregator) querySourceMean(ctx context.Context, store evidence.Store, source string, kind evidence.EvidenceKind, limit int, strategyID string) (float64, int, time.Time) {
-	return a.querySourceMeanScoped(ctx, store, source, kind, limit, strategyID, "")
+// querySourceMeanAt computes the mean fitness value from evidence matching
+// the given source and kind within [since, until] (E1). Only values in [0,1]
+// are accepted (matching recentFitnessSummary's filter), so callers can rely
+// on the [0,1] contract. When strategyID is non-empty, records whose payload
+// strategy_id differs are skipped (the strategy source scopes by candidate);
+// records without a strategy_id payload key are skipped too, because they
+// cannot be attributed. The returned time is the newest in-window record's
+// timestamp (zero when no records matched) — the saturation-safe "did the
+// window advance" signal. The store is passed in (not read from the receiver)
+// so WindowAt can snapshot it under its lock and keep this helper lock-free.
+func (a *RuntimeFitnessAggregator) querySourceMeanAt(ctx context.Context, store evidence.Store, source string, kind evidence.EvidenceKind, limit int, strategyID string, since, until time.Time) (float64, int, time.Time) {
+	return a.querySourceMeanScopedAt(ctx, store, source, kind, limit, strategyID, "", since, until)
 }
 
-// querySourceMeanScoped is querySourceMean with an optional tool_step_id
-// sub-filter (Y1 C3). When toolStepID is non-empty, only tool_call evidence
-// whose payload tool_step_id matches is counted — enabling process-level
-// attribution ("this strategy calling the tool THIS way") distinct from the
-// coarse per-strategy bucket.
-func (a *RuntimeFitnessAggregator) querySourceMeanScoped(ctx context.Context, store evidence.Store, source string, kind evidence.EvidenceKind, limit int, strategyID, toolStepID string) (float64, int, time.Time) {
+// querySourceMeanScopedAt is querySourceMeanAt with an optional tool_step_id
+// sub-filter (Y1 C3) and an explicit [since, until] evidence time range (E1).
+// When toolStepID is non-empty, only tool_call evidence whose payload
+// tool_step_id matches is counted — enabling process-level attribution
+// ("this strategy calling the tool THIS way") distinct from the coarse
+// per-strategy bucket.
+func (a *RuntimeFitnessAggregator) querySourceMeanScopedAt(ctx context.Context, store evidence.Store, source string, kind evidence.EvidenceKind, limit int, strategyID, toolStepID string, since, until time.Time) (float64, int, time.Time) {
 	if store == nil {
 		return 0, 0, time.Time{}
 	}
 	evs, err := store.Query(ctx, evidence.Filter{
 		Source: source,
 		Kind:   kind,
+		Since:  since,
+		Until:  until,
 		Limit:  limit,
 	})
 	if err != nil {
@@ -395,8 +410,13 @@ func (a *RuntimeFitnessAggregator) querySourceMeanScoped(ctx context.Context, st
 // and source weights as Window; the returned Ok reflects the tool_step-scoped
 // sample count only when a non-empty strategyID is supplied.
 func (a *RuntimeFitnessAggregator) WindowToolStep(ctx context.Context, strategyID, toolStepID string) WindowResult {
+	return a.WindowToolStepAt(ctx, strategyID, toolStepID, time.Time{}, time.Time{})
+}
+
+// WindowToolStepAt is WindowToolStep scoped to [since, until] (E1/M6).
+func (a *RuntimeFitnessAggregator) WindowToolStepAt(ctx context.Context, strategyID, toolStepID string, since, until time.Time) WindowResult {
 	if toolStepID == "" {
-		return a.Window(ctx, strategyID)
+		return a.WindowAt(ctx, strategyID, since, until)
 	}
 	a.mu.RLock()
 	cfg := a.cfg
@@ -406,7 +426,7 @@ func (a *RuntimeFitnessAggregator) WindowToolStep(ctx context.Context, strategyI
 		return WindowResult{Mean: cfg.ColdStartScore, PerSource: map[string]sourceStat{}}
 	}
 
-	m, c, lastAt := a.querySourceMeanScoped(ctx, store, toolCallEvidenceSource, evidence.KindFitness, cfg.WindowSize, strategyID, toolStepID)
+	m, c, lastAt := a.querySourceMeanScopedAt(ctx, store, toolCallEvidenceSource, evidence.KindFitness, cfg.WindowSize, strategyID, toolStepID, since, until)
 	result := WindowResult{PerSource: map[string]sourceStat{}}
 	if c == 0 {
 		result.Mean = cfg.ColdStartScore

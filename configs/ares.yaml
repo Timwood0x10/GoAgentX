@@ -242,6 +242,7 @@ evolution:
   # gates: the remaining verify-gate thresholds.
   # gates:
   #   eval_min_score: 0.7             # minimum G3 eval-suite score
+  #   eval_strict: false              # true = G3 fails closed when eval infra is missing (E3)
   #   # require_manual_approval holds every candidate in SHADOW until an
   #   # operator calls POST /api/evolution/approve.
   #   require_manual_approval: false
@@ -302,6 +303,17 @@ kernel:
   #   stops and logs once; task scheduling is unaffected. Negative is a
   #   config error.
   # loop_max_iterations: 0
+  #
+  # dag_execution: L2 session-graph execution gate (M4, default CLOSED).
+  #   Absent or enabled:false → legacy ReAct behavior, byte-identical to
+  #   today. To canary the L2 path: set enabled:true on a subset of peers,
+  #   compare EventToolCallCompleted success rate + planner ForcedAnswers
+  #   against the ReAct baseline, then cut over. Rollback = set false +
+  #   restart (S1). Do NOT enable in production until the B2 numbers pass.
+  # dag_execution:
+  #   enabled: false
+  #   max_plan_depth: 10              # growth-depth guard (0 = default 10)
+  #   reaper_grace: 30s               # terminal-task reaper grace (0 = 30s)
 
 # ── Tool system ──────────────────────────────────────────────
 tools:

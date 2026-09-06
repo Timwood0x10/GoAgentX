@@ -327,6 +327,8 @@
 
 - **验收**：`enabled=false` → 该类节点不再长出；`budget=1` → 最多 1 个实例；`ask_agent` 同受约束（协作 ACT 在此闭合）；L1 节点数不随 LLM 参数微变增长。
 
+- **落地（2026-09-06）**：`enabled/budget` 约束已有；补齐三项余量——`prior` 只进提示词（`planner_cognition.go: l1ToolPrior/l1Priors`，system 消息注入，永不阻断生长）+ L1 读经 `MutableDAG.NodeMetadata` 锁内拷贝（进化 `SetNodeMetadata` 热更新无竞态，`-race` 绿）+ `ask_agent` 默认分支亦接线（`setupPeerRegistry` default 经 plain peer registry `Send`，§11.1 缺口关闭）。`buildToolClassDAG` 即 L1 构造体（与 agent 拓扑的 `buildLiveAgentDAG` 并存：live 图仍编译进 fabric，L1 永不编译——意图已满足，不重写 live 构造）。
+
 ### M6 — 统计回灌 fitness
 
 - **目标**：L2 执行结果决定 L1 基因优劣。
@@ -336,6 +338,8 @@
 - **验收**：两个仅 L1 Metadata 不同的基因，成功率高的一侧被 GA promote（需 `tool_weight > 0`）。
 
 - **前置**：§6.1 三项。
+
+- **落地（2026-09-06，信号链）**：归因键对齐——`observedToolBinder` 按声明 schema 形写 `tool_step_id`（缺省可选参数不再 miss L1 节点，未知工具回退实参形）；`WindowToolStep`/`Window` 经 `WindowAt` 同窗可查；`TestM6_ToolClassSuccessRateSeparatesStrategies` 锁定 9/10 vs 2/10 分化且 `tool_weight>0` 时 aggregate 同向。GA promote 端到端沿用既有进化回路，不另建 flaky 大闭环测试。
 
 ***
 
@@ -370,6 +374,8 @@
 
 - E3：`StrictMode`（`ares_evolution/gate_eval.go:36`）生产从不置真（`eval_gate_wiring.go:113` 只覆盖 `MinScore`）；三种缺失的区分只被拼进返回字符串（`:131`），文件连 logger 都没 import；未配置即 `return true`（`:135`/`:176`），无任何运维可见信号。
 
+**落地（2026-09-06）：三项全闭。** E1：`WindowAt` + `querySourceMeanAt/ScopedAt` 透传 `Since/Until`，`deploymentStagingRuntime.Evaluate` 取单锚（`until=now, since=now-1h`）双臂同窗（`TestAggregator_WindowAt_SharesSingleTimeAnchor` + `TestDeploymentStaging_EvaluateSharesSingleTimeAnchor`）。E2：`deploymentAdapter.Deploy` 晋升成功后同步接 `MonitorAndRollback`，回滚 surfacing 为 error（`TestDeploymentAdapter_PromoteThenRollbackOnRegression`：记录翻转 + executor 指针还原）。E3：`EvalGate` 注入 logger（缺啥 warn 啥 + `skipped_count`），`evolution.gates.eval_strict` 打通生产（`TestEvalGate_SkipEmitsWarnPerMissingComponent`；`StrictMode=true` + registry nil → false 沿用旧测试）。
+
 ***
 
 ## 7. 死亡清单（收敛的实质）
@@ -385,7 +391,7 @@
 | `tool_projection_worker.go` + 配置键                    | `ares_bootstrap/tool_projection_worker.go`，启动点 `bootstrap_steps.go:492`，配置 `cfg.Evolution.ToolProjection` | **删**（连启动点与配置键一起摘）                    | `toolprojection` 唯一引用方                                                              |
 | `buildLiveAgentDAG`（节点=agent）                        | `cmd/ares/serve_live_dag.go:30`                                                                           | **重写**为 L1 能力图构造（M5，含解绑 `CompileDAG`） | 节点语义错，是分散的根源                                                                        |
 | `buildEvolutionDAG` 合成 input→process→output          | `ares_bootstrap/bootstrap.go:664`                                                                         | **删**                                 | 占位图，L1 真图取代                                                                         |
-| `workflow/graph.ToolNode`                            | `workflow/graph/node.go:77`                                                                               | **降级**为 `toolCognition` 内部实现或删        | 不在执行主路径                                                                             |
+| `workflow/graph.ToolNode`                            | `workflow/graph/node.go:77`                                                                               | **已删 ✅（2026-09-06）**：零生产/测试调用方，`NewToolNode` 全仓无引用（`rg` 归零），连 `hashInput` 一并摘 | 不在执行主路径                                                                             |
 | `agentloop/engine.go` ReAct                          | `agentloop/engine.go:250`，仅 `sdk/` 引用                                                                     | **冻结**为 legacy 兼容壳，不接主线               | 无生产 cmd 引用，动它是纯风险。注意其 `Request.ToolWhitelist`（`:210`）生产从不赋值、且无零交集回退——不要把它当已接线的第三执行体 |
 
 `internal/ares_evolution`（v1）与 `internal/evolution`（v2）并存**不在本计划范围**。主线只要求：新代码只接 v2 + `MutableDAG`，不再往 v1 加东西。

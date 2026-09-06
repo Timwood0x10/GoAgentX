@@ -89,6 +89,7 @@ func buildEvalGate(
 	client ares_eval.LLMClient,
 	suitePath string,
 	minScore float64,
+	strict bool,
 ) (*evolution.EvalGate, error) {
 	if registry == nil || client == nil || strings.TrimSpace(suitePath) == "" {
 		// Gate intentionally absent — the pipeline runs without G3. This is
@@ -114,6 +115,8 @@ func buildEvalGate(
 	if minScore > 0 {
 		gateCfg.MinScore = minScore
 	}
+	// E3: production opts into fail-closed via evolution.gates.eval_strict.
+	gateCfg.StrictMode = strict
 	gate := evolution.NewEvalGate(registry, runner, *suite, gateCfg,
 		evolution.WithEvalGateBeforeRun(exec.setCandidate),
 	)

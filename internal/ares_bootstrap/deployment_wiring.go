@@ -4,11 +4,19 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"time"
 
 	evolution "github.com/Timwood0x10/ares/internal/ares_evolution"
 	"github.com/Timwood0x10/ares/internal/evolution/deployment"
 	"github.com/Timwood0x10/ares/internal/evolution/patch"
 )
+
+// defaultEvalEvidenceWindow bounds the staging comparison to recent evidence
+// (E1). Both shadow and baseline sides share the same [since, until] so the
+// delta cannot be distorted by evidence written between two independent
+// queries. One hour covers the judgment window while excluding stale history
+// from previous strategies.
+const defaultEvalEvidenceWindow = time.Hour
 
 // deploymentStagingRuntime is a shadow runtime used by the DeploymentPipeline.
 // It NEVER mutates live state — Apply is a read-only preflight (the patch must
@@ -116,15 +124,20 @@ func (r *deploymentStagingRuntime) Evaluate(ctx context.Context) (shadow float64
 	if r.currentPatchStrategy == "" || activeStrategyID == "" {
 		return r.coldStartScore, r.coldStartScore, nil
 	}
+	// E1: take one time anchor and sample both sides with the SAME
+	// [since, until] so concurrent evidence writes between two queries cannot
+	// skew the delta. Both bounds are non-zero by construction.
+	until := time.Now()
+	since := until.Add(-defaultEvalEvidenceWindow)
 	// Shadow: scoped to the staged patch's strategy.
-	shadowRes := r.agg.Window(ctx, r.currentPatchStrategy)
+	shadowRes := r.agg.WindowAt(ctx, r.currentPatchStrategy, since, until)
 	if shadowRes.Count == 0 {
 		shadow = r.coldStartScore
 	} else {
 		shadow = shadowRes.Mean
 	}
-	// Baseline: scoped to the active strategy, same store snapshot.
-	baselineRes := r.agg.Window(ctx, activeStrategyID)
+	// Baseline: scoped to the active strategy, same time anchor.
+	baselineRes := r.agg.WindowAt(ctx, activeStrategyID, since, until)
 	if baselineRes.Count == 0 {
 		baseline = r.coldStartScore
 	} else {
@@ -244,6 +257,17 @@ func (a *deploymentAdapter) Deploy(ctx context.Context, p patch.RuntimePatch) er
 	// history reflects reality: only DeploymentPromoted counts as success.
 	if rec != nil && rec.Status != deployment.DeploymentPromoted {
 		return fmt.Errorf("deployment not applied (status %s): %s", rec.Status, rec.Reason)
+	}
+	// E2: post-promotion regression watch. MonitorAndRollback waits the
+	// configured evaluation window, re-samples live fitness, and rolls the
+	// live executor back on regression. A rollback is a normal outcome here,
+	// surfaced as an error so the Coordinator does not record success.
+	monitored, err := a.dp.MonitorAndRollback(ctx, rec)
+	if err != nil {
+		return fmt.Errorf("deployment post-promotion monitor: %w", err)
+	}
+	if monitored != nil && monitored.Status != deployment.DeploymentPromoted {
+		return fmt.Errorf("deployment rolled back post-promotion (status %s): %s", monitored.Status, monitored.Reason)
 	}
 	return nil
 }

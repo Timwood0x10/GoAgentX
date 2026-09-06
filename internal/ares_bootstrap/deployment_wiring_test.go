@@ -12,6 +12,7 @@ package ares_bootstrap
 import (
 	"context"
 	"encoding/json"
+	"sync"
 	"testing"
 	"time"
 
@@ -225,6 +226,73 @@ func TestDeploymentStaging_UnattributedPatchIsNotMeasurable(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, 0.0, shadow-baseline,
 		"missing baseline attribution must not produce a positive delta")
+}
+
+// anchorRecordingStore captures Query filters for the E1 time-anchor test.
+type anchorRecordingStore struct {
+	inner   *evidence.MemoryStore
+	mu      sync.Mutex
+	filters []evidence.Filter
+}
+
+func (s *anchorRecordingStore) Append(ctx context.Context, e evidence.Evidence) error {
+	return s.inner.Append(ctx, e)
+}
+
+func (s *anchorRecordingStore) Query(ctx context.Context, f evidence.Filter) ([]evidence.Evidence, error) {
+	s.mu.Lock()
+	s.filters = append(s.filters, f)
+	s.mu.Unlock()
+	return s.inner.Query(ctx, f)
+}
+
+func (s *anchorRecordingStore) Aggregate(ctx context.Context, f evidence.Filter, fn evidence.AggregateFn) (float64, error) {
+	return s.inner.Aggregate(ctx, f, fn)
+}
+
+func (s *anchorRecordingStore) captured() []evidence.Filter {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]evidence.Filter(nil), s.filters...)
+}
+
+// TestDeploymentStaging_EvaluateSharesSingleTimeAnchor locks E1: Evaluate
+// samples shadow and baseline with the SAME non-zero [since, until] so
+// concurrent evidence writes cannot skew the delta.
+func TestDeploymentStaging_EvaluateSharesSingleTimeAnchor(t *testing.T) {
+	ctx := context.Background()
+	inner := evidence.NewMemoryStore()
+	rec := &anchorRecordingStore{inner: inner}
+	agg := evolution.NewRuntimeFitnessAggregator(rec, evolution.DefaultAggregatorConfig())
+	memStore := buildMemoryManager()
+	reg := patch.NewRegistry()
+	require.NoError(t, reg.RegisterComponent(aresmemory.NewMemoryPatchExecutor(memStore)))
+	r := &deploymentStagingRuntime{reg: reg, agg: agg, coldStartScore: 0.5}
+
+	asmStore := evolution.NewMemoryStrategyStore(0)
+	asm, err := evolution.NewActiveStrategyManager(asmStore, nil)
+	require.NoError(t, err)
+	require.NoError(t, asm.Deploy(ctx, &mutation.Strategy{ID: "active", Version: 1}))
+	r.asm = asm
+
+	seedStrategyEvidence(t, inner, "candidate", 0.9, 5)
+	seedStrategyEvidence(t, inner, "active", 0.3, 5)
+	_, err = r.Apply(ctx, patch.RuntimePatch{Type: patch.PatchChangePlanner, Target: "memory", StrategyID: "candidate"})
+	require.NoError(t, err)
+	_, _, err = r.Evaluate(ctx)
+	require.NoError(t, err)
+
+	filters := rec.captured()
+	require.NotEmpty(t, filters, "Evaluate must query evidence with a time anchor")
+	for _, f := range filters {
+		assert.False(t, f.Since.IsZero(), "Since must be non-zero")
+		assert.False(t, f.Until.IsZero(), "Until must be non-zero")
+	}
+	base := filters[0]
+	for _, f := range filters[1:] {
+		assert.True(t, f.Since.Equal(base.Since), "all queries share Since, got %v vs %v", f.Since, base.Since)
+		assert.True(t, f.Until.Equal(base.Until), "all queries share Until, got %v vs %v", f.Until, base.Until)
+	}
 }
 
 // seedStrategyEvidence writes n fitness evidence records for the given

@@ -15,6 +15,7 @@ package evolution
 import (
 	"context"
 	"fmt"
+	"log/slog"
 	"strings"
 
 	"github.com/Timwood0x10/ares/internal/ares_eval"
@@ -56,6 +57,9 @@ type EvalGate struct {
 	// skippedCount tracks how many times the gate was skipped due to
 	// missing infrastructure. Exposed via SkippedCount for observability.
 	skippedCount int
+	// logger receives a structured warn on every skip (E3) so a
+	// misconfigured G3 gate is operator-visible instead of a silent pass.
+	logger *slog.Logger
 	// beforeRun, when set, is invoked with the candidate right before the
 	// suite runs — the seam that lets the executor run test cases THROUGH
 	// the candidate strategy (e.g. apply its prompt template) so the score
@@ -75,6 +79,16 @@ func WithEvalGateBeforeRun(fn func(*mutation.Strategy)) EvalGateOption {
 	}
 }
 
+// WithEvalGateLogger overrides the skip-warning sink (E3). Default is
+// slog.Default(); tests inject a buffered handler to assert the warn.
+func WithEvalGateLogger(l *slog.Logger) EvalGateOption {
+	return func(g *EvalGate) {
+		if l != nil {
+			g.logger = l
+		}
+	}
+}
+
 // NewEvalGate creates a G3 eval-suite gate. Any nil argument makes the gate
 // a pass-through (always passes), so the pipeline degrades gracefully.
 func NewEvalGate(
@@ -89,6 +103,7 @@ func NewEvalGate(
 		runner:   runner,
 		suite:    suite,
 		cfg:      cfg,
+		logger:   slog.Default(),
 	}
 	for _, opt := range opts {
 		opt(g)
@@ -129,6 +144,10 @@ func (g *EvalGate) Check(ctx context.Context, cand *mutation.Strategy, _ *mutati
 			missing = append(missing, "test suite")
 		}
 		reason := fmt.Sprintf("eval suite not configured (missing: %s), skipping", strings.Join(missing, ", "))
+		g.logger.WarnContext(ctx, "eval gate skipped: eval infrastructure missing",
+			"missing", strings.Join(missing, ","),
+			"strict_mode", g.cfg.StrictMode,
+			"skipped_count", g.skippedCount)
 		if g.cfg.StrictMode {
 			return false, 0, fmt.Sprintf("strict mode: %s — rejected", reason)
 		}
@@ -170,6 +189,9 @@ func (g *EvalGate) Check(ctx context.Context, cand *mutation.Strategy, _ *mutati
 	if evalCount == 0 {
 		g.skippedCount++
 		reason := "no evaluators produced results, skipping"
+		g.logger.WarnContext(ctx, "eval gate skipped: no evaluator results",
+			"strict_mode", g.cfg.StrictMode,
+			"skipped_count", g.skippedCount)
 		if g.cfg.StrictMode {
 			return false, 0, fmt.Sprintf("strict mode: %s — rejected", reason)
 		}

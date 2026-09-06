@@ -411,14 +411,17 @@ func wireGAEvolution(ctx context.Context, cfg *ares_config.Config, comp *Compone
 			minScore = wiredLifecycleCfg.Gates.EvalMinScore
 		}
 		suitePath := ""
+		strict := false
 		if gaCfg.Lifecycle != nil {
 			suitePath = cfg.Evolution.Gates.EvalSuite
+			strict = cfg.Evolution.Gates.EvalStrict
 		}
 		evalGate, gerr := buildEvalGate(
 			comp.Evolution.EvaluatorRegistry,
 			comp.Evolution.EvalLLMClient,
 			suitePath,
 			minScore,
+			strict,
 		)
 		if gerr != nil && !errors.Is(gerr, errEvalGateNotConfigured) {
 			// A CONFIGURED but broken suite fails bootstrap (fail closed);
@@ -428,7 +431,8 @@ func wireGAEvolution(ctx context.Context, cfg *ares_config.Config, comp *Compone
 		if evalGate != nil {
 			evolution.WithLifecycleGates(evalGate)(wired.Lifecycle)
 			log.InfoContext(ctx, "bootstrap: G3 eval gate wired",
-				"suite", suitePath, "min_score", minScore)
+				"suite", suitePath, "min_score", minScore, "strict_mode", strict,
+				"skipped_count", evalGate.SkippedCount())
 		}
 	}
 

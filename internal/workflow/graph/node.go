@@ -4,18 +4,10 @@ package graph
 
 import (
 	"context"
-	"crypto/sha256"
-	"encoding/json"
 	"fmt"
-	"sort"
-	"strings"
-	"time"
 
 	"github.com/Timwood0x10/ares/internal/agents/base"
-	"github.com/Timwood0x10/ares/internal/ares_events"
 	"github.com/Timwood0x10/ares/internal/errors"
-	"github.com/Timwood0x10/ares/internal/tools/resources/core"
-	"github.com/Timwood0x10/ares/internal/truncate"
 )
 
 // Node represents an executable unit in the graph.
@@ -74,163 +66,6 @@ func (n *AgentNode) ID() string {
 	return n.agent.ID()
 }
 
-// ToolNode wraps an existing tool to be used as a node.
-// It supports optional lifecycle hooks for structured message recording
-// and event emission during tool execution. When a ToolExecutionBridge is
-// provided, it serves as a fallback if the tool is not found or fails.
-type ToolNode struct {
-	tool        core.Tool
-	nodeID      string
-	executionID string
-	eventSink   func(ctx context.Context, eventType ares_events.EventType, payload map[string]any)
-	bridge      interface {
-		Execute(ctx context.Context, toolName string, params map[string]interface{}, userRequest string) (core.Result, error)
-	}
-	userRequest string
-}
-
-// WithNodeID sets the node identifier for event payload correlation.
-func (n *ToolNode) WithNodeID(id string) *ToolNode {
-	n.nodeID = id
-	return n
-}
-
-// WithExecutionID sets the execution/graph instance identifier for event correlation.
-func (n *ToolNode) WithExecutionID(id string) *ToolNode {
-	n.executionID = id
-	return n
-}
-
-// NewToolNode creates a new tool node.
-//
-// Args:
-// tool - tool instance, must not be nil.
-// Returns new tool node or error.
-func NewToolNode(tool core.Tool) (*ToolNode, error) {
-	if tool == nil {
-		return nil, errors.New("tool cannot be nil")
-	}
-	return &ToolNode{tool: tool}, nil
-}
-
-// WithEventSink attaches an event sink for lifecycle ares_events.
-// The sink is called before and after tool execution with EventToolCallStarted
-// and EventToolCallCompleted ares_events respectively.
-func (n *ToolNode) WithEventSink(sink func(ctx context.Context, eventType ares_events.EventType, payload map[string]any)) *ToolNode {
-	n.eventSink = sink
-	return n
-}
-
-// WithBridge attaches a ToolExecutionBridge for planner fallback support.
-// When provided, if the tool execution fails with a registered-tool error,
-// the bridge attempts to resolve and execute via the Capability Planner.
-// The userRequest is the original natural-language request used for
-// planner-based intent resolution.
-func (n *ToolNode) WithBridge(bridge interface {
-	Execute(ctx context.Context, toolName string, params map[string]interface{}, userRequest string) (core.Result, error)
-}, userRequest string) *ToolNode {
-	n.bridge = bridge
-	n.userRequest = userRequest
-	return n
-}
-
-// Execute runs the tool node with optional lifecycle hooks.
-// Before execution, emits EventToolCallStarted; after execution,
-// emits EventToolCallCompleted with the result summary.
-// The event payload includes correlation IDs for ReAct Runtime Trace.
-func (n *ToolNode) Execute(ctx context.Context, state *State) error {
-	if n == nil || n.tool == nil {
-		return errors.New("tool node is not initialized")
-	}
-
-	startTime := time.Now()
-	toolName := n.tool.Name()
-	// nodeID drives the state key and event correlation IDs. It prefers the
-	// custom ID set via WithNodeID so that two packages reusing the same tool
-	// do not collide on the "node.<id>" state key; it falls back to the tool
-	// name only when no custom node ID is configured, preserving backward
-	// compatibility for callers that never set one.
-	nodeID := n.nodeID
-	if nodeID == "" {
-		nodeID = toolName
-	}
-	// Generate deterministic input hash (used for both tool_call_id and event payload).
-	params := state.ToParams()
-	inputHash := hashInput(params)
-
-	// tool_call_id: deterministic so event replay produces the same ID.
-	toolCallID := fmt.Sprintf("tool_%s_%s", nodeID, inputHash)
-
-	// Pre-execution hook: emit tool call started event with correlation IDs.
-	if n.eventSink != nil {
-		n.eventSink(ctx, ares_events.EventToolCallStarted, map[string]any{
-			"tool":         toolName,
-			"tool_call_id": toolCallID,
-			"node_id":      nodeID,
-			"execution_id": n.executionID,
-			"input_hash":   inputHash,
-			"timestamp":    startTime,
-		})
-	}
-
-	result, err := n.tool.Execute(ctx, params)
-
-	// If the tool failed and we have a bridge fallback, try it.
-	if err != nil && n.bridge != nil {
-		br, bErr := n.bridge.Execute(ctx, toolName, params, n.userRequest)
-		if bErr == nil && br.Success {
-			result = br
-			err = nil
-		}
-	}
-
-	durationMs := time.Since(startTime).Milliseconds()
-
-	// Post-execution hook: emit tool call completed event with structured result.
-	if n.eventSink != nil {
-		payload := map[string]any{
-			"tool":         toolName,
-			"tool_call_id": toolCallID,
-			"node_id":      nodeID,
-			"execution_id": n.executionID,
-			"input_hash":   inputHash,
-			"duration_ms":  durationMs,
-			"timestamp":    time.Now(),
-		}
-		switch {
-		case err != nil:
-			payload["status"] = "error"
-			payload["error"] = err.Error()
-		case !result.Success:
-			payload["status"] = "failed"
-			payload["summary"] = truncate.WithEllipsis(result.Error, 200)
-		default:
-			payload["status"] = "success"
-			payload["summary"] = truncate.WithEllipsis(fmt.Sprintf("%v", result.Data), 200)
-		}
-		n.eventSink(ctx, ares_events.EventToolCallCompleted, payload)
-	}
-
-	if err != nil {
-		return errors.Wrapf(err, "tool %s execution failed", toolName)
-	}
-
-	if result.Success {
-		state.Set("node."+nodeID, result.Data)
-	} else {
-		state.Set("node."+nodeID, result.Error)
-	}
-	return nil
-}
-
-// ID returns the tool name.
-func (n *ToolNode) ID() string {
-	if n == nil || n.tool == nil {
-		return ""
-	}
-	return n.tool.Name()
-}
-
 // FuncNode wraps a simple function to be used as a node.
 type FuncNode struct {
 	id string
@@ -273,34 +108,4 @@ func (n *FuncNode) ID() string {
 		return ""
 	}
 	return n.id
-}
-
-// hashInput generates a deterministic hash from tool input parameters.
-// json.Marshal sorts object keys (including nested maps) lexicographically,
-// so the hash is stable regardless of Go's non-deterministic map iteration
-// order. The previous fmt.Sprintf("%v", map) form produced different hashes
-// across runs for the same input, which broke tool_call_id correlation and
-// caching.
-func hashInput(params map[string]any) string {
-	data, err := json.Marshal(params)
-	if err != nil {
-		// Fallback: deterministic best-effort serialization keyed by sorted keys.
-		// json.Marshal fails here only for unsupported types (e.g. channels or
-		// funcs), which should not appear in tool params.
-		keys := make([]string, 0, len(params))
-		for k := range params {
-			keys = append(keys, k)
-		}
-		sort.Strings(keys)
-		var sb strings.Builder
-		for _, k := range keys {
-			sb.WriteString(k)
-			sb.WriteString("=")
-			fmt.Fprintf(&sb, "%v", params[k])
-			sb.WriteString(";")
-		}
-		data = []byte(sb.String())
-	}
-	h := sha256.Sum256(data)
-	return fmt.Sprintf("%x", h[:8])
 }
