@@ -11,7 +11,7 @@ import (
 	"github.com/Timwood0x10/ares/api/core"
 	"github.com/Timwood0x10/ares/api/tools"
 	ares_events "github.com/Timwood0x10/ares/internal/ares_events"
-	"github.com/Timwood0x10/ares/internal/kernelctx"
+	kctx "github.com/Timwood0x10/ares/internal/kernel/ctx"
 	"github.com/Timwood0x10/ares/internal/tools/toolsource"
 )
 
@@ -108,7 +108,7 @@ type callerCaptureExecutor struct {
 }
 
 func (c *callerCaptureExecutor) Execute(ctx context.Context, _ string, _ map[string]any) (tools.Result, error) {
-	c.caller = kernelctx.CallerID(ctx)
+	c.caller = kctx.CallerID(ctx)
 	return tools.Result{Success: true, Data: "ok"}, nil
 }
 

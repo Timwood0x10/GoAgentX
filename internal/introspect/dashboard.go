@@ -22,7 +22,7 @@ import (
 	"github.com/Timwood0x10/ares/internal/ares_config"
 	"github.com/Timwood0x10/ares/internal/ares_events"
 	"github.com/Timwood0x10/ares/internal/aresrecovery"
-	"github.com/Timwood0x10/ares/internal/kernelscheduler"
+	"github.com/Timwood0x10/ares/internal/kernel"
 	"github.com/Timwood0x10/ares/internal/llm"
 	"github.com/Timwood0x10/ares/internal/llm/output"
 	"github.com/Timwood0x10/ares/internal/logger"
@@ -72,7 +72,7 @@ type Dashboard struct {
 	store  ares_events.EventStore
 	tasks  *taskfabric.Fabric
 	agents *agentfabric.Fabric
-	sched  *kernelscheduler.Scheduler
+	sched  *kernel.Scheduler
 	panel  *Store
 	bus    *agentipc.Bus
 	collab *CollabReporter
@@ -158,8 +158,8 @@ func NewDashboard(ctx context.Context, cfg DashboardConfig) (*Dashboard, error) 
 	}
 
 	// Scheduler.
-	tracker := kernelscheduler.NewLoadTracker()
-	sched := kernelscheduler.New(d.tasks, map[string]kernelscheduler.CapabilityExecutor{}, tracker)
+	tracker := kernel.NewLoadTracker()
+	sched := kernel.New(d.tasks, map[string]kernel.CapabilityExecutor{}, tracker)
 	sched.WithEventStore(d.store).
 		WithAgentFabric(d.agents).
 		WithGovernance(d.agents).
@@ -422,7 +422,7 @@ func (d *Dashboard) Peers() []string {
 
 // Scheduler returns the underlying kernel scheduler (read-only access for
 // observability consumers).
-func (d *Dashboard) Scheduler() *kernelscheduler.Scheduler { return d.sched }
+func (d *Dashboard) Scheduler() *kernel.Scheduler { return d.sched }
 
 // fabricEventSink forwards agentfabric lifecycle records onto the shared event
 // bus so the panel's activity feed sees agent deaths/revivals immediately.

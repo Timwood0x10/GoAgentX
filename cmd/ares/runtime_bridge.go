@@ -9,10 +9,10 @@ import (
 
 	"github.com/Timwood0x10/ares/internal/ares_events"
 	"github.com/Timwood0x10/ares/internal/ares_runtime"
-	"github.com/Timwood0x10/ares/internal/kernelscheduler"
+	"github.com/Timwood0x10/ares/internal/kernel"
 )
 
-// pluginBusHook adapts ares_runtime.PluginBus to the kernelscheduler.QuantumHook
+// pluginBusHook adapts ares_runtime.PluginBus to the kernel.QuantumHook
 // contract, so the runtime plugin ecosystem (observer/checkpoint/tool/...)
 // participates in the Agent OS scheduling loop without the kernel depending on
 // the runtime package (the adapter lives in the cmd assembly layer — the only
@@ -72,7 +72,7 @@ func newPluginBusHook(bus *ares_runtime.PluginBus, loop *ares_runtime.LoopPlugin
 	}
 }
 
-// BeforeQuantum implements kernelscheduler.QuantumHook: projects the quantum
+// BeforeQuantum implements kernel.QuantumHook: projects the quantum
 // onto the bus as a before-step hook invocation.
 func (h *pluginBusHook) BeforeQuantum(ctx context.Context, taskID, agentID string) error {
 	return h.bus.BeforeStep(ctx, taskID, &ares_runtime.Step{
@@ -84,7 +84,7 @@ func (h *pluginBusHook) BeforeQuantum(ctx context.Context, taskID, agentID strin
 	})
 }
 
-// AfterQuantum implements kernelscheduler.QuantumHook: projects the quantum
+// AfterQuantum implements kernel.QuantumHook: projects the quantum
 // outcome onto the bus as an after-step hook invocation, then advances the
 // loop clock. Both paths are observational — the hook never blocks or fails
 // the scheduler.
@@ -199,7 +199,7 @@ func (h *pluginBusHook) driveLoopRound(ctx context.Context) {
 // Returns:
 //
 //	*ares_runtime.PluginBus - the started bus (nil when nothing to wire).
-func startPluginBus(ctx context.Context, store ares_events.EventStore, sched *kernelscheduler.Scheduler, loopCfg kernelLoopConfig) *ares_runtime.PluginBus {
+func startPluginBus(ctx context.Context, store ares_events.EventStore, sched *kernel.Scheduler, loopCfg kernelLoopConfig) *ares_runtime.PluginBus {
 	if sched == nil {
 		return nil
 	}

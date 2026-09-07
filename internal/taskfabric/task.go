@@ -30,7 +30,7 @@ type Task struct {
 	// Origin is the agent ID that created the task ("" = root: user-submitted
 	// or system-bootstrapped, no agent caller). It is Kernel-validated: the
 	// create_task syscall stamps the caller from the tool context
-	// (kernelctx.CallerID), never from LLM-supplied arguments, so provenance
+	// (kernel.CallerID), never from LLM-supplied arguments, so provenance
 	// such as "B.origin = A" is auditable end-to-end (plan D1-5).
 	Origin string
 	// Quantum counts how many execution quanta (agent steps) this task has

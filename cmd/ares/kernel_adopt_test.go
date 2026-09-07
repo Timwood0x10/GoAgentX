@@ -14,7 +14,7 @@ import (
 	"github.com/Timwood0x10/ares/internal/ares_bootstrap"
 	"github.com/Timwood0x10/ares/internal/ares_events"
 	"github.com/Timwood0x10/ares/internal/aresrecovery"
-	"github.com/Timwood0x10/ares/internal/system_runtime"
+	"github.com/Timwood0x10/ares/internal/kernel"
 	"github.com/Timwood0x10/ares/internal/taskfabric"
 )
 
@@ -42,13 +42,13 @@ func TestKernelAdopt_SixPillarsAdoptedAndStopped(t *testing.T) {
 	dual, _ := wireKernelDispatcher(nil)
 	k.dual = dual
 
-	reg := system_runtime.NewRegistry()
+	reg := kernel.NewRegistry()
 	// eventstore is the fabrics' dependency; register it so Adopt's
 	// dependency validation passes.
-	if err := reg.Register(&stubComponent{name: "eventstore"}, system_runtime.ModeRequired); err != nil {
+	if err := reg.Register(&stubComponent{name: "eventstore"}, kernel.ModeRequired); err != nil {
 		t.Fatalf("register: %v", err)
 	}
-	orch := system_runtime.NewOrchestrator(reg, ctx)
+	orch := kernel.NewOrchestrator(reg, ctx)
 	if err := orch.Start(ctx); err != nil {
 		t.Fatalf("orchestrator start: %v", err)
 	}
@@ -71,11 +71,11 @@ func TestKernelAdopt_SixPillarsAdoptedAndStopped(t *testing.T) {
 	}
 
 	// Second orchestrator with a real running scheduler: all 6 pillars.
-	reg2 := system_runtime.NewRegistry()
-	if err := reg2.Register(&stubComponent{name: "eventstore"}, system_runtime.ModeRequired); err != nil {
+	reg2 := kernel.NewRegistry()
+	if err := reg2.Register(&stubComponent{name: "eventstore"}, kernel.ModeRequired); err != nil {
 		t.Fatalf("register: %v", err)
 	}
-	orch2 := system_runtime.NewOrchestrator(reg2, ctx)
+	orch2 := kernel.NewOrchestrator(reg2, ctx)
 	if err := orch2.Start(ctx); err != nil {
 		t.Fatalf("orchestrator start 2: %v", err)
 	}
@@ -116,7 +116,7 @@ func TestKernelAdopt_SixPillarsAdoptedAndStopped(t *testing.T) {
 		if !ok {
 			t.Fatalf("pillar %q missing after adopt", name)
 		}
-		if st.State != system_runtime.StateReady {
+		if st.State != kernel.StateReady {
 			t.Fatalf("pillar %q expected Ready, got %s (%s)", name, st.State, st.Reason)
 		}
 	}
@@ -129,11 +129,11 @@ func TestKernelAdopt_SchedulerNotRunningReportsDegraded(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	reg := system_runtime.NewRegistry()
-	if err := reg.Register(&stubComponent{name: "eventstore"}, system_runtime.ModeRequired); err != nil {
+	reg := kernel.NewRegistry()
+	if err := reg.Register(&stubComponent{name: "eventstore"}, kernel.ModeRequired); err != nil {
 		t.Fatalf("register: %v", err)
 	}
-	orch := system_runtime.NewOrchestrator(reg, ctx)
+	orch := kernel.NewOrchestrator(reg, ctx)
 	if err := orch.Start(ctx); err != nil {
 		t.Fatalf("orchestrator start: %v", err)
 	}
@@ -158,7 +158,7 @@ func TestKernelAdopt_SchedulerNotRunningReportsDegraded(t *testing.T) {
 	if !ok {
 		t.Fatal("scheduler pillar missing after adopt")
 	}
-	if st.State != system_runtime.StateDegraded {
+	if st.State != kernel.StateDegraded {
 		t.Fatalf("non-running scheduler must be Degraded, got %s", st.State)
 	}
 	if !strings.Contains(st.Reason, "drain loop") {
@@ -187,8 +187,8 @@ func TestRunBackground_UsesSystemRuntime(t *testing.T) {
 	defer cancel()
 
 	comp := &ares_bootstrap.Components{}
-	reg := system_runtime.NewRegistry()
-	orch := system_runtime.NewOrchestrator(reg, ctx)
+	reg := kernel.NewRegistry()
+	orch := kernel.NewOrchestrator(reg, ctx)
 	if err := orch.Start(ctx); err != nil {
 		t.Fatalf("orchestrator start: %v", err)
 	}
@@ -237,14 +237,14 @@ func TestKernelAdopt_FailedAdoptionPropagates(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	reg := system_runtime.NewRegistry()
-	if err := reg.Register(&stubComponent{name: "eventstore"}, system_runtime.ModeRequired); err != nil {
+	reg := kernel.NewRegistry()
+	if err := reg.Register(&stubComponent{name: "eventstore"}, kernel.ModeRequired); err != nil {
 		t.Fatalf("register: %v", err)
 	}
-	if err := reg.Register(&stubComponent{name: sysCompTaskFabric}, system_runtime.ModeRequired); err != nil {
+	if err := reg.Register(&stubComponent{name: sysCompTaskFabric}, kernel.ModeRequired); err != nil {
 		t.Fatalf("register: %v", err)
 	}
-	orch := system_runtime.NewOrchestrator(reg, ctx)
+	orch := kernel.NewOrchestrator(reg, ctx)
 	if err := orch.Start(ctx); err != nil {
 		t.Fatalf("orchestrator start: %v", err)
 	}

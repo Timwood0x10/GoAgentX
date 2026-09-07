@@ -6,7 +6,7 @@ import (
 	"fmt"
 	"sort"
 
-	"github.com/Timwood0x10/ares/internal/kernelctx"
+	kctx "github.com/Timwood0x10/ares/internal/kernel/ctx"
 	"github.com/Timwood0x10/ares/internal/taskfabric"
 )
 
@@ -52,7 +52,7 @@ type CreatePlanArgs struct {
 	// Nil (the default) compiles a single batch, as before.
 	Loop *PlanLoopArgs `json:"loop,omitempty"`
 	// NOTE: no creator argument — the Kernel stamps every task's Origin from
-	// the tool context (kernelctx.CallerID), identical to CreateTask.
+	// the tool context (kctx.CallerID), identical to CreateTask.
 }
 
 // PlanLoopArgs is the LLM-facing round-loop spec for create_plan. Until is
@@ -111,7 +111,7 @@ func (k *Kernel) CreatePlan(ctx context.Context, args CreatePlanArgs) (*CreatePl
 	if len(args.Steps) == 0 {
 		return nil, errors.New("agentsyscall: plan requires at least one step")
 	}
-	origin := kernelctx.CallerID(ctx)
+	origin := kctx.CallerID(ctx)
 	steps := make([]taskfabric.PlanStep, 0, len(args.Steps))
 	for _, s := range args.Steps {
 		if s.Capability == "" {

@@ -10,7 +10,7 @@ import (
 
 	"github.com/Timwood0x10/ares/internal/agentfabric"
 	"github.com/Timwood0x10/ares/internal/ares_events"
-	"github.com/Timwood0x10/ares/internal/kernelscheduler"
+	"github.com/Timwood0x10/ares/internal/kernel"
 	"github.com/Timwood0x10/ares/internal/taskfabric"
 )
 
@@ -18,8 +18,8 @@ import (
 // domains into one frame and increments the sequence.
 func TestCollectorAssemblesDomains(t *testing.T) {
 	c := NewCollector(Sources{
-		Kernel: func() kernelscheduler.SchedulerSnapshot {
-			return kernelscheduler.SchedulerSnapshot{Scheduled: 7, ReadyTasks: 2}
+		Kernel: func() kernel.SchedulerSnapshot {
+			return kernel.SchedulerSnapshot{Scheduled: 7, ReadyTasks: 2}
 		},
 		Fabric: func() []taskfabric.LeaseEntry {
 			return []taskfabric.LeaseEntry{{TaskID: "t-1", State: taskfabric.StateReady}}
@@ -140,9 +140,9 @@ func TestConcurrentCollectSetLatest(t *testing.T) {
 func TestSnapshotJSONContract(t *testing.T) {
 	var store Store
 	store.Set(Snapshot{
-		Kernel: kernelscheduler.SchedulerSnapshot{
+		Kernel: kernel.SchedulerSnapshot{
 			Scheduled: 1, ReadyTasks: 1,
-			Load: kernelscheduler.LoadTrackerSnapshot{Agents: []kernelscheduler.AgentLoadSnapshot{
+			Load: kernel.LoadTrackerSnapshot{Agents: []kernel.AgentLoadSnapshot{
 				{AgentID: "a", Done: 3, Ok: 2, Load: 0.5},
 			}},
 		},

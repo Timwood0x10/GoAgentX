@@ -26,7 +26,7 @@ type PlanStep struct {
 	// Payload carries the step's input metadata (surfaced via the checkpoint
 	// envelope to the executor).
 	Payload map[string]any
-	// Origin is the provenance stamped by the Kernel (kernelctx.CallerID) —
+	// Origin is the provenance stamped by the Kernel (kernel.CallerID) —
 	// never supplied by the LLM (same contract as CreateTask). json:"-"
 	// keeps it out of every LLM-facing schema.
 	Origin string `json:"-"`

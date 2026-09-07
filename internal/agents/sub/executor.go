@@ -15,7 +15,7 @@ import (
 	"github.com/Timwood0x10/ares/internal/ares_events"
 	"github.com/Timwood0x10/ares/internal/core/models"
 	"github.com/Timwood0x10/ares/internal/errors"
-	"github.com/Timwood0x10/ares/internal/kernelctx"
+	kctx "github.com/Timwood0x10/ares/internal/kernel/ctx"
 	"github.com/Timwood0x10/ares/internal/llm/output"
 	resources "github.com/Timwood0x10/ares/internal/tools/resources/core"
 )
@@ -1041,7 +1041,7 @@ func (e *taskExecutor) executeToolCall(ctx context.Context, tc core.ToolCall, ag
 	// Stamp the caller identity into the tool context BEFORE invoking the
 	// tool, so Kernel syscalls (agentsyscall) can enforce provenance
 	// (Task.Origin / ParentID) from the context, never from LLM args.
-	result, err := e.toolBinder.CallTool(kernelctx.WithCallerID(ctx, agentID), tc.Function.Name, args)
+	result, err := e.toolBinder.CallTool(kctx.WithCallerID(ctx, agentID), tc.Function.Name, args)
 	if err != nil {
 		return "", err
 	}

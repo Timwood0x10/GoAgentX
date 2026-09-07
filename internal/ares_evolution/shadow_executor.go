@@ -144,7 +144,7 @@ func NewShadowExecutor(store evidence.Store, runner ShadowRunner, sampleSize int
 	return &ShadowExecutor{store: store, runner: runner, sampleSize: sampleSize, nowFn: time.Now}, nil
 }
 
-// OnTaskFinalized implements kernelscheduler.ShadowExecutionHook structurally:
+// OnTaskFinalized implements kernel.ShadowExecutionHook structurally:
 // it buffers the finalized task for later shadow sampling. Non-blocking by
 // contract — a full buffer drops the OLDEST entry so the buffer keeps
 // tracking recent traffic.

@@ -14,7 +14,7 @@ import (
 	"github.com/Timwood0x10/ares/internal/agentsyscall"
 	"github.com/Timwood0x10/ares/internal/ares_events"
 	"github.com/Timwood0x10/ares/internal/core/models"
-	"github.com/Timwood0x10/ares/internal/kernelctx"
+	kctx "github.com/Timwood0x10/ares/internal/kernel/ctx"
 	"github.com/Timwood0x10/ares/internal/taskfabric"
 )
 
@@ -146,10 +146,10 @@ func TestW2Case2AutonomousDecomposition(t *testing.T) {
 	// Simulate the LLM's cognition: agent A decides to split.
 	// In production this is a tool call from the LLM, executed with the
 	// caller stamped into the context by the execution body
-	// (kernelctx.WithCallerID); here we stamp it directly to verify the
+	// (kctx.WithCallerID); here we stamp it directly to verify the
 	// Kernel path stamps provenance ("B.origin = A").
 	subTaskPayload := map[string]any{"task_desc": "write unit tests for module X"}
-	taskResult, err := kernelSyscall.CreateTask(kernelctx.WithCallerID(ctx, "agent-A"), agentsyscall.CreateTaskArgs{
+	taskResult, err := kernelSyscall.CreateTask(kctx.WithCallerID(ctx, "agent-A"), agentsyscall.CreateTaskArgs{
 		Capability: "coder",
 		Payload:    subTaskPayload,
 	})
@@ -223,7 +223,7 @@ func TestW2Case3ParentDeathChildContinues(t *testing.T) {
 	// is stamped into the context (as the tool execution bodies do), so the
 	// Kernel attributes the sub-task to it.
 	kernelSyscall := agentsyscall.NewKernel(agentsFab, fabric, nil, nil)
-	taskResult, err := kernelSyscall.CreateTask(kernelctx.WithCallerID(ctx, "parent-A"), agentsyscall.CreateTaskArgs{
+	taskResult, err := kernelSyscall.CreateTask(kctx.WithCallerID(ctx, "parent-A"), agentsyscall.CreateTaskArgs{
 		Capability: "coder",
 		Payload:    map[string]any{"task_desc": "review code"},
 	})

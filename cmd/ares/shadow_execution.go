@@ -180,7 +180,7 @@ func (r *shadowQuantumRunner) RunShadow(ctx context.Context, task *models.Task, 
 //
 // Attach points (structural, no import between the two layers):
 //   - sched.WithShadowExecutionHook: finalized tasks land in the executor's
-//     buffer (kernelscheduler.ShadowExecutionHook).
+//     buffer (kernel.ShadowExecutionHook).
 //   - sampler.SetExecutionFeeder: candidate judgments run the isolated A/B
 //     pass before the replay fallback (evolution.ShadowExecutionFeeder).
 func wireShadowExecution(

@@ -20,7 +20,7 @@ import (
 	"github.com/Timwood0x10/ares/internal/ares_config"
 	ares_memory "github.com/Timwood0x10/ares/internal/ares_memory"
 	"github.com/Timwood0x10/ares/internal/ares_runtime"
-	"github.com/Timwood0x10/ares/internal/system_runtime"
+	"github.com/Timwood0x10/ares/internal/kernel"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -176,7 +176,7 @@ func TestClosure_KnowledgeRetrievalEnabled_MissingWriteDeps_NotReady(t *testing.
 
 	status, ok := comp.ComponentStatus(sysCompKnowledge)
 	require.True(t, ok, "knowledge component must be registered in System Runtime")
-	assert.Equal(t, system_runtime.StateDegraded, status.State,
+	assert.Equal(t, kernel.StateDegraded, status.State,
 		"knowledge component must report Degraded when AKG write deps are missing (F03)")
 	assert.NotEmpty(t, status.Reason, "Degraded state must carry a reason")
 }

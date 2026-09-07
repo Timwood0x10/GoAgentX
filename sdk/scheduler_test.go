@@ -8,7 +8,7 @@ import (
 	"github.com/Timwood0x10/ares/api/core"
 	"github.com/Timwood0x10/ares/internal/agents/sub"
 	"github.com/Timwood0x10/ares/internal/core/models"
-	"github.com/Timwood0x10/ares/internal/kernelscheduler"
+	"github.com/Timwood0x10/ares/internal/kernel"
 )
 
 // countingExecutor wraps a sdkAgentExecutor and counts scheduler-driven
@@ -19,7 +19,7 @@ type countingExecutor struct {
 	executed atomic.Int64
 }
 
-var _ kernelscheduler.CapabilityExecutor = (*countingExecutor)(nil)
+var _ kernel.CapabilityExecutor = (*countingExecutor)(nil)
 
 func (c *countingExecutor) ID() string { return c.inner.ID() }
 

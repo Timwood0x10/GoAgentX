@@ -46,13 +46,12 @@ import (
 	ares_events "github.com/Timwood0x10/ares/internal/ares_events"
 	aresexp "github.com/Timwood0x10/ares/internal/ares_experience"
 	memory "github.com/Timwood0x10/ares/internal/ares_memory"
-	"github.com/Timwood0x10/ares/internal/kernelscheduler"
+	"github.com/Timwood0x10/ares/internal/kernel"
 	"github.com/Timwood0x10/ares/internal/knowledge"
 	"github.com/Timwood0x10/ares/internal/knowledge/adapter"
 	khruntime "github.com/Timwood0x10/ares/internal/knowledge/runtime"
 	"github.com/Timwood0x10/ares/internal/storage/postgres"
 	"github.com/Timwood0x10/ares/internal/storage/postgres/repositories"
-	"github.com/Timwood0x10/ares/internal/system_runtime"
 	"github.com/Timwood0x10/ares/internal/taskfabric"
 )
 
@@ -173,12 +172,12 @@ type Runtime struct {
 	// the registered agent. Guarded by agentMu (same lock as
 	// agentByCapability). The map is passed BY REFERENCE to the shared
 	// scheduler, so late RegisterAgent calls are visible to the next drain.
-	sdkExecutors map[string]kernelscheduler.CapabilityExecutor
+	sdkExecutors map[string]kernel.CapabilityExecutor
 	// sdkFabric is the runtime's own Task Fabric; sched is the shared
-	// kernelscheduler.Scheduler driving submitted tasks (the SAME engine the
+	// kernel.Scheduler driving submitted tasks (the SAME engine the
 	// kernel uses). Lazily started on the first Submit; schedOnce guards it.
 	sdkFabric   *taskfabric.Fabric
-	sched       *kernelscheduler.Scheduler
+	sched       *kernel.Scheduler
 	schedOnce   sync.Once
 	schedCtx    context.Context
 	schedCancel context.CancelFunc
@@ -387,7 +386,7 @@ func New(opts ...Option) (*Runtime, error) {
 		distillSvc:        distillSvc,
 		akgBridge:         akgBridge,
 		agentByCapability: make(map[string]*Agent),
-		sdkExecutors:      make(map[string]kernelscheduler.CapabilityExecutor),
+		sdkExecutors:      make(map[string]kernel.CapabilityExecutor),
 	}
 	// Transfer Bootstrap ctx ownership to the Runtime on the success path so
 	// the deferred cancel above does not fire; Close owns cancellation now.
@@ -450,9 +449,9 @@ func (r *Runtime) Close() {
 // the Runtime is not backed by Bootstrap (SDK-only options) or when
 // Bootstrap failed before wiring completed — callers can always consume
 // a valid value without nil guards.
-func (r *Runtime) Snapshot() system_runtime.Snapshot {
+func (r *Runtime) Snapshot() kernel.Snapshot {
 	if r.bootstrap == nil {
-		return system_runtime.Snapshot{}
+		return kernel.Snapshot{}
 	}
 	return r.bootstrap.Snapshot()
 }

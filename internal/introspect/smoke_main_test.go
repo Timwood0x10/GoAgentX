@@ -9,7 +9,7 @@ import (
 	"time"
 
 	"github.com/Timwood0x10/ares/internal/agentfabric"
-	"github.com/Timwood0x10/ares/internal/kernelscheduler"
+	"github.com/Timwood0x10/ares/internal/kernel"
 	"github.com/Timwood0x10/ares/internal/taskfabric"
 )
 
@@ -20,12 +20,12 @@ func TestSmokeServePanel(t *testing.T) {
 	store.Set(Snapshot{
 		TS:  time.Now(),
 		Seq: 42,
-		Kernel: kernelscheduler.SchedulerSnapshot{
+		Kernel: kernel.SchedulerSnapshot{
 			PollInterval: 500 * time.Millisecond, PreemptInterval: time.Second,
 			TTL: 5 * time.Minute, MaxConcurrent: 8,
 			Executors: 4, BoundExecutors: 1, Scheduled: 128, ReadyTasks: 3,
 			EventDriven: true, GovernanceWired: true, AgentFabricWired: true,
-			Load: kernelscheduler.LoadTrackerSnapshot{Agents: []kernelscheduler.AgentLoadSnapshot{
+			Load: kernel.LoadTrackerSnapshot{Agents: []kernel.AgentLoadSnapshot{
 				{AgentID: "coder-1", Done: 40, Ok: 38, Load: 0.75},
 				{AgentID: "reviewer-1", Done: 12, Ok: 9, Load: 0.25},
 			}},

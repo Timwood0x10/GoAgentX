@@ -8,7 +8,7 @@ import (
 
 	"github.com/Timwood0x10/ares/internal/agentfabric"
 	"github.com/Timwood0x10/ares/internal/core/models"
-	"github.com/Timwood0x10/ares/internal/kernelctx"
+	kctx "github.com/Timwood0x10/ares/internal/kernel/ctx"
 	"github.com/Timwood0x10/ares/internal/taskfabric"
 )
 
@@ -219,13 +219,13 @@ func TestCreateTaskCreatesTaskInFabric(t *testing.T) {
 }
 
 // TestCreateTaskStampsCallerOrigin verifies the create_task syscall records
-// the CALLER from the tool context (kernelctx.CallerID) as Task.Origin — the
+// the CALLER from the tool context (kctx.CallerID) as Task.Origin — the
 // Kernel-enforced provenance, not an LLM-supplied argument.
 func TestCreateTaskStampsCallerOrigin(t *testing.T) {
 	fabric := taskfabric.NewFabric()
 	kernel := NewKernel(nil, fabric, nil, nil)
 
-	ctx := kernelctx.WithCallerID(context.Background(), "agent-A")
+	ctx := kctx.WithCallerID(context.Background(), "agent-A")
 	result, err := kernel.CreateTask(ctx, CreateTaskArgs{
 		Capability: "coder",
 		Payload:    map[string]any{"task_desc": "write tests"},
@@ -263,7 +263,7 @@ func TestSpawnAgentEnforcesContextCaller(t *testing.T) {
 
 	// LLM claims parent "spoofed-parent"; the context proves the real caller
 	// is agent-A. The Kernel must trust the context.
-	ctx := kernelctx.WithCallerID(context.Background(), "agent-A")
+	ctx := kctx.WithCallerID(context.Background(), "agent-A")
 	result, err := kernel.SpawnAgent(ctx, SpawnAgentArgs{
 		Capability: "coder",
 		ParentID:   "spoofed-parent",
@@ -315,7 +315,7 @@ func TestBindToolsRegistersBothTools(t *testing.T) {
 	// create_task — carry the caller in the context exactly as the tool
 	// execution bodies do (sub executor / chat cognition / agentloop
 	// engine), and verify the Kernel stamps it as Task.Origin.
-	taskResult, err := binder.call(kernelctx.WithCallerID(ctx, "agent-A"), CreateTaskTool, map[string]any{
+	taskResult, err := binder.call(kctx.WithCallerID(ctx, "agent-A"), CreateTaskTool, map[string]any{
 		"capability": "coder",
 		"payload":    map[string]any{"task_desc": "review code"},
 	})
@@ -390,7 +390,7 @@ func TestToolSchemasReturnsBoth(t *testing.T) {
 // and leave the collaboration loop open.
 func TestAskAgent_NotWiredFailsLoud(t *testing.T) {
 	_, err := NewKernel(nil, nil, nil, nil).AskAgent(
-		kernelctx.WithCallerID(context.Background(), "agent-A"),
+		kctx.WithCallerID(context.Background(), "agent-A"),
 		AskAgentArgs{To: "agent-B", Topic: "delegate-task"},
 	)
 	if err == nil {
@@ -404,7 +404,7 @@ func TestAskAgent_EmptyTargetRejected(t *testing.T) {
 	kernel := NewKernel(nil, nil, nil, nil, WithAskAgent(func(ctx context.Context, from, to, topic string, payload any) error {
 		return nil
 	}))
-	if _, err := kernel.AskAgent(kernelctx.WithCallerID(context.Background(), "agent-A"), AskAgentArgs{To: ""}); err == nil {
+	if _, err := kernel.AskAgent(kctx.WithCallerID(context.Background(), "agent-A"), AskAgentArgs{To: ""}); err == nil {
 		t.Fatal("ask_agent with empty target must be rejected")
 	}
 }
@@ -421,7 +421,7 @@ func TestAskAgent_ForwardsToPrimitive(t *testing.T) {
 		return nil
 	}))
 
-	res, err := kernel.AskAgent(kernelctx.WithCallerID(context.Background(), "agent-A"), AskAgentArgs{
+	res, err := kernel.AskAgent(kctx.WithCallerID(context.Background(), "agent-A"), AskAgentArgs{
 		To:      "agent-B",
 		Topic:   "delegate-task",
 		Payload: map[string]any{"task_desc": "please review"},
@@ -453,7 +453,7 @@ func TestAskAgent_BoundToBinder(t *testing.T) {
 	BindTools(binder, kernel)
 
 	res, err := binder.call(
-		kernelctx.WithCallerID(context.Background(), "agent-A"),
+		kctx.WithCallerID(context.Background(), "agent-A"),
 		AskAgentTool,
 		map[string]any{"to": "agent-B", "topic": "pipeline-stage", "payload": map[string]any{"x": 1}},
 	)

@@ -10,7 +10,7 @@ import (
 
 	"github.com/Timwood0x10/ares/internal/agentfabric"
 	"github.com/Timwood0x10/ares/internal/core/models"
-	"github.com/Timwood0x10/ares/internal/kernelctx"
+	kctx "github.com/Timwood0x10/ares/internal/kernel/ctx"
 	"github.com/Timwood0x10/ares/internal/taskfabric"
 )
 
@@ -220,7 +220,7 @@ type SpawnAgentArgs struct {
 	// Resources are optional resource hints for quota validation.
 	Resources map[string]any `json:"resources,omitempty"`
 	// ParentID is the spawning agent's ID (for provenance). Kernel-enforced:
-	// when the tool context carries a caller (kernelctx.CallerID), that ID
+	// when the tool context carries a caller (kctx.CallerID), that ID
 	// wins and this field is ignored, so an LLM can never forge parentage;
 	// the value is used only for direct/Kernel-internal calls without a
 	// context identity. Empty parent = root spawn.
@@ -275,7 +275,7 @@ func (k *Kernel) SpawnAgent(ctx context.Context, args SpawnAgentArgs) (*SpawnAge
 	// (bootstrap wiring, existing syscall tests) working with no context
 	// identity.
 	parentID := args.ParentID
-	if caller := kernelctx.CallerID(ctx); caller != "" {
+	if caller := kctx.CallerID(ctx); caller != "" {
 		parentID = caller
 	}
 
@@ -329,7 +329,7 @@ type CreateTaskArgs struct {
 	// Payload carries opaque task data (e.g. task_desc, profile).
 	Payload map[string]any `json:"payload,omitempty"`
 	// NOTE: there is deliberately no "creator" argument. The Kernel stamps
-	// Task.Origin from the tool context (kernelctx.CallerID) so provenance
+	// Task.Origin from the tool context (kctx.CallerID) so provenance
 	// is enforced by the Kernel — an LLM cannot forge a creator via params.
 }
 
@@ -359,9 +359,9 @@ func (k *Kernel) CreateTask(ctx context.Context, args CreateTaskArgs) (*CreateTa
 		Dependencies: args.Dependencies,
 		RetryPolicy:  taskfabric.RetryPolicy{MaxRetries: 2},
 		// Origin is Kernel-enforced: stamped from the tool context caller
-		// (kernelctx.CallerID), never from LLM-supplied arguments. Empty =
+		// (kctx.CallerID), never from LLM-supplied arguments. Empty =
 		// root call (no agent caller in context).
-		Origin: kernelctx.CallerID(ctx),
+		Origin: kctx.CallerID(ctx),
 		Checkpoint: &taskfabric.CheckpointEnvelope{
 			Payload: args.Payload,
 		},
@@ -415,7 +415,7 @@ func (k *Kernel) AskAgent(ctx context.Context, a AskAgentArgs) (*AskAgentResult,
 	if k.askAgent == nil {
 		return nil, errors.New("agentsyscall: ask_agent not wired (no collaboration IPC) — the agent cannot ask until serve injects it")
 	}
-	from := kernelctx.CallerID(ctx)
+	from := kctx.CallerID(ctx)
 	if err := k.askAgent(ctx, from, a.To, a.Topic, a.Payload); err != nil {
 		return nil, fmt.Errorf("agentsyscall: ask_agent to %s failed: %w", a.To, err)
 	}

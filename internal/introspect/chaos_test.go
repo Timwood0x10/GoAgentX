@@ -5,7 +5,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/Timwood0x10/ares/internal/kernelscheduler"
+	"github.com/Timwood0x10/ares/internal/kernel"
 	"github.com/Timwood0x10/ares/internal/taskfabric"
 )
 
@@ -75,7 +75,7 @@ func TestChaosReporterConcurrent(t *testing.T) {
 // when present and is omitted when nil.
 func TestCollectorChaosSource(t *testing.T) {
 	withChaos := NewCollector(Sources{
-		Kernel: func() kernelscheduler.SchedulerSnapshot { return kernelscheduler.SchedulerSnapshot{} },
+		Kernel: func() kernel.SchedulerSnapshot { return kernel.SchedulerSnapshot{} },
 		Fabric: func() []taskfabric.LeaseEntry { return nil },
 		Chaos:  func() ChaosStatus { return ChaosStatus{Enabled: true, Mode: "shadow"} },
 	})
@@ -85,7 +85,7 @@ func TestCollectorChaosSource(t *testing.T) {
 	}
 
 	noChaos := NewCollector(Sources{
-		Kernel: func() kernelscheduler.SchedulerSnapshot { return kernelscheduler.SchedulerSnapshot{} },
+		Kernel: func() kernel.SchedulerSnapshot { return kernel.SchedulerSnapshot{} },
 		Fabric: func() []taskfabric.LeaseEntry { return nil },
 	})
 	if noChaos.Collect().Chaos != nil {

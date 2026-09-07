@@ -15,14 +15,14 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/Timwood0x10/ares/internal/ares_bootstrap"
-	"github.com/Timwood0x10/ares/internal/system_runtime"
+	"github.com/Timwood0x10/ares/internal/kernel"
 )
 
 // sdkGraphEdge captures one graph edge (name, mode, sorted deps) for
 // equivalence comparison.
 type sdkGraphEdge struct {
 	name string
-	mode system_runtime.Mode
+	mode kernel.Mode
 	deps []string
 }
 

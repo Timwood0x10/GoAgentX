@@ -29,7 +29,7 @@ import (
 
 	"github.com/Timwood0x10/ares/internal/errors"
 	"github.com/Timwood0x10/ares/internal/feedback"
-	"github.com/Timwood0x10/ares/internal/kernelctx"
+	kctx "github.com/Timwood0x10/ares/internal/kernel/ctx"
 	resources "github.com/Timwood0x10/ares/internal/tools/resources/core"
 )
 
@@ -86,7 +86,7 @@ func (b *observedToolBinder) CallTool(ctx context.Context, name string, args map
 	result, err := b.ToolBinder.CallTool(ctx, name, args)
 	b.obs.OnToolCall(feedback.ToolCallOutcome{
 		Tool:       name,
-		Caller:     kernelctx.CallerID(ctx),
+		Caller:     kctx.CallerID(ctx),
 		Outcome:    toolCallOutcome(ctx, err),
 		Latency:    time.Since(started),
 		ToolStepID: b.toolClassIDForCall(name, args),

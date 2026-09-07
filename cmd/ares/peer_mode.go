@@ -656,7 +656,7 @@ func submitPeerTask(ctx context.Context, kernel *kernelHandle, capability string
 		Capability: capability,
 		// Origin stays "" — this is a root task (user-submitted work), no
 		// agent caller. Agent-created tasks get their Origin from the
-		// create_task syscall's tool context (kernelctx.CallerID).
+		// create_task syscall's tool context (kernel.CallerID).
 		RetryPolicy: taskfabric.RetryPolicy{MaxRetries: 2},
 		Checkpoint:  env,
 	}

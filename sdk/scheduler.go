@@ -8,7 +8,7 @@ import (
 
 	"github.com/Timwood0x10/ares/internal/agents/sub"
 	"github.com/Timwood0x10/ares/internal/core/models"
-	"github.com/Timwood0x10/ares/internal/kernelscheduler"
+	"github.com/Timwood0x10/ares/internal/kernel"
 	"github.com/Timwood0x10/ares/internal/taskfabric"
 )
 
@@ -17,7 +17,7 @@ import (
 // shared kernelscheduler, not a divergent direct-run path). The SDK is a
 // peer-runtime facade over the SAME scheduling engine the kernel uses:
 //
-//	Submit → fabric.Create → kernelscheduler.Scheduler (Schedule → Acquire →
+//	Submit → fabric.Create → kernel.Scheduler (Schedule → Acquire →
 //	RunQuantum via the registered sdk agent executor) → COMPLETED → result.
 //
 // A sdk agent is an executor like any other: it runs its ReAct loop inside one
@@ -37,7 +37,7 @@ type sdkAgentExecutor struct {
 	typ models.AgentType
 }
 
-var _ kernelscheduler.CapabilityExecutor = (*sdkAgentExecutor)(nil)
+var _ kernel.CapabilityExecutor = (*sdkAgentExecutor)(nil)
 
 func (e *sdkAgentExecutor) ID() string { return e.agent.name }
 
@@ -81,7 +81,7 @@ func (r *Runtime) ensureScheduler() {
 	r.schedOnce.Do(func() {
 		r.sdkFabric = taskfabric.NewFabric()
 		r.schedCtx, r.schedCancel = context.WithCancel(context.Background())
-		r.sched = kernelscheduler.New(r.sdkFabric, r.sdkExecutors, nil)
+		r.sched = kernel.New(r.sdkFabric, r.sdkExecutors, nil)
 		r.sched.PollInterval = 20 * time.Millisecond
 		go r.sched.Run(r.schedCtx)
 		// D1: the SDK is a peer-runtime facade — wire the same kernel
@@ -202,7 +202,7 @@ func (r *Runtime) resultFromFabric(tk *taskfabric.Task) (*Result, error) {
 // The registration is protected by agentMu (same lock as RegisterAgent). It
 // returns the interface so a caller-provided adapter (e.g. a test probe) is
 // preserved.
-func (r *Runtime) ensureExecutor(capability string) kernelscheduler.CapabilityExecutor {
+func (r *Runtime) ensureExecutor(capability string) kernel.CapabilityExecutor {
 	if capability == "" {
 		capability = "agent"
 	}

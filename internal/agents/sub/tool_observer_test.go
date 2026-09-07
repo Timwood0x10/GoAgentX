@@ -7,7 +7,7 @@ import (
 
 	apperrors "github.com/Timwood0x10/ares/internal/errors"
 	"github.com/Timwood0x10/ares/internal/feedback"
-	"github.com/Timwood0x10/ares/internal/kernelctx"
+	kctx "github.com/Timwood0x10/ares/internal/kernel/ctx"
 )
 
 // recordingToolObserver captures tool outcomes for assertions.
@@ -70,7 +70,7 @@ func TestObserveToolCalls_ClassifiesOutcomes(t *testing.T) {
 			obs := &recordingToolObserver{}
 			binder := ObserveToolCalls(inner, obs)
 
-			ctx := kernelctx.WithCallerID(context.Background(), "agent-7")
+			ctx := kctx.WithCallerID(context.Background(), "agent-7")
 			_, err := binder.CallTool(ctx, tc.tool, nil)
 			if tc.wantErr != (err != nil) {
 				t.Fatalf("err = %v, wantErr = %v", err, tc.wantErr)

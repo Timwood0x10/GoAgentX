@@ -12,7 +12,7 @@ import (
 	"time"
 
 	"github.com/Timwood0x10/ares/internal/agentfabric"
-	"github.com/Timwood0x10/ares/internal/kernelscheduler"
+	"github.com/Timwood0x10/ares/internal/kernel"
 	"github.com/Timwood0x10/ares/internal/taskfabric"
 )
 
@@ -23,7 +23,7 @@ type Snapshot struct {
 	// Seq is a monotonically increasing frame counter.
 	Seq uint64 `json:"seq"`
 	// Kernel is the scheduler's Domain A view.
-	Kernel kernelscheduler.SchedulerSnapshot `json:"kernel"`
+	Kernel kernel.SchedulerSnapshot `json:"kernel"`
 	// Fabric is the task/lease Domain B view.
 	Fabric []taskfabric.LeaseEntry `json:"fabric"`
 	// Agents is the lifecycle Domain C view.
@@ -41,13 +41,13 @@ type Snapshot struct {
 	// Decisions is the scheduling-decision trail (candidates + scores +
 	// winner) for the Scheduler page (dashboard.md §7). Omitted when the
 	// source is nil.
-	Decisions []kernelscheduler.ScheduleDecision `json:"decisions,omitempty"`
+	Decisions []kernel.ScheduleDecision `json:"decisions,omitempty"`
 }
 
 // Sources abstract the three subsystems so tests can fake them
 // (code_rules: interfaces defined at the consumer).
 type Sources struct {
-	Kernel func() kernelscheduler.SchedulerSnapshot
+	Kernel func() kernel.SchedulerSnapshot
 	Fabric func() []taskfabric.LeaseEntry
 	Agents func() []agentfabric.AgentView
 	// Chaos reports the chaos-subsystem status (monitoring.md #12 Phase 3).
@@ -61,7 +61,7 @@ type Sources struct {
 	Tasks func() []taskfabric.TaskView
 	// Decisions reports the scheduling-decision trail. A nil Decisions source
 	// omits the field.
-	Decisions func() []kernelscheduler.ScheduleDecision
+	Decisions func() []kernel.ScheduleDecision
 }
 
 // Collector produces Snapshots from Sources.

@@ -11,7 +11,7 @@ import (
 	"github.com/Timwood0x10/ares/internal/agents/sub"
 	"github.com/Timwood0x10/ares/internal/aresrecovery"
 	"github.com/Timwood0x10/ares/internal/core/models"
-	"github.com/Timwood0x10/ares/internal/kernelscheduler"
+	"github.com/Timwood0x10/ares/internal/kernel"
 	"github.com/Timwood0x10/ares/internal/taskfabric"
 )
 
@@ -24,7 +24,7 @@ type yieldExecutor struct {
 	done atomic.Bool
 }
 
-var _ kernelscheduler.CapabilityExecutor = (*yieldExecutor)(nil)
+var _ kernel.CapabilityExecutor = (*yieldExecutor)(nil)
 
 func (e *yieldExecutor) ID() string             { return e.id }
 func (e *yieldExecutor) Type() models.AgentType { return models.AgentType(e.typ) }
@@ -47,7 +47,7 @@ type resumeExecutor struct {
 	resumedFrom any
 }
 
-var _ kernelscheduler.CapabilityExecutor = (*resumeExecutor)(nil)
+var _ kernel.CapabilityExecutor = (*resumeExecutor)(nil)
 
 func (e *resumeExecutor) ID() string             { return e.id }
 func (e *resumeExecutor) Type() models.AgentType { return models.AgentType(e.typ) }
@@ -76,7 +76,7 @@ func (e *resumeExecutor) resumed() any {
 //	expiry → aresrecovery.RequeueExpiredLeases → replacement executor resumes
 //	from the preserved checkpoint (not restarts) → COMPLETED.
 //
-// The SDK's shared scheduler (kernelscheduler.Scheduler) and fabric
+// The SDK's shared scheduler (kernel.Scheduler) and fabric
 // (taskfabric.Fabric) are the SAME instances the production kernel would use;
 // the aresrecovery recovery runs on them too. Only a controllable clock is
 // injected so the lease ages deterministically without real sleeping.

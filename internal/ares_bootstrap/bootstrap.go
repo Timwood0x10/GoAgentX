@@ -25,6 +25,7 @@ import (
 	"github.com/Timwood0x10/ares/internal/aresrecovery"
 	"github.com/Timwood0x10/ares/internal/evidence"
 	"github.com/Timwood0x10/ares/internal/evolution/deployment"
+	"github.com/Timwood0x10/ares/internal/kernel"
 	"github.com/Timwood0x10/ares/internal/knowledge"
 	"github.com/Timwood0x10/ares/internal/knowledge/adapter"
 	knowledgeruntime "github.com/Timwood0x10/ares/internal/knowledge/runtime"
@@ -32,7 +33,6 @@ import (
 	"github.com/Timwood0x10/ares/internal/storage"
 	"github.com/Timwood0x10/ares/internal/storage/postgres"
 	"github.com/Timwood0x10/ares/internal/storage/postgres/repositories"
-	"github.com/Timwood0x10/ares/internal/system_runtime"
 	"github.com/Timwood0x10/ares/internal/workflow/engine"
 )
 
@@ -110,10 +110,10 @@ type Components struct {
 	// orchestrator that observes the assembled component graph and provides
 	// lifecycle states, a shared root context, and status snapshots. It is
 	// created at the end of Bootstrap; nil when wiring is skipped on failure.
-	SystemRuntime *system_runtime.Orchestrator
+	SystemRuntime *kernel.Orchestrator
 	// SystemRegistry backs SystemRuntime with one entry per constructed
 	// component, enabling dependency-aware lookup and snapshot queries.
-	SystemRegistry *system_runtime.Registry
+	SystemRegistry *kernel.Registry
 	// Observability holds the shared v0.3.0 M3/M4 observability components:
 	// the evolution trajectory tracer, the human-feedback store, and the
 	// cross-Fabric tracer. All three are created together once in Bootstrap
@@ -188,18 +188,18 @@ func (c *Components) WaitBackground() {
 // observability). It returns an empty snapshot when the System Runtime
 // registry is not wired (Bootstrap failed before wiring completed), so
 // callers can always consume a valid value without nil guards.
-func (c *Components) Snapshot() system_runtime.Snapshot {
+func (c *Components) Snapshot() kernel.Snapshot {
 	if c == nil || c.SystemRegistry == nil {
-		return system_runtime.Snapshot{}
+		return kernel.Snapshot{}
 	}
 	return c.SystemRegistry.Snapshot()
 }
 
 // ComponentStatus returns the status of one managed component by name.
 // The bool is false when the component is not registered.
-func (c *Components) ComponentStatus(name string) (system_runtime.ComponentStatus, bool) {
+func (c *Components) ComponentStatus(name string) (kernel.ComponentStatus, bool) {
 	if c == nil || c.SystemRegistry == nil {
-		return system_runtime.ComponentStatus{}, false
+		return kernel.ComponentStatus{}, false
 	}
 	return c.SystemRegistry.GetStatus(name)
 }

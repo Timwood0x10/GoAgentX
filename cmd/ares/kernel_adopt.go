@@ -14,7 +14,7 @@ import (
 	"time"
 
 	"github.com/Timwood0x10/ares/internal/ares_bootstrap"
-	"github.com/Timwood0x10/ares/internal/system_runtime"
+	"github.com/Timwood0x10/ares/internal/kernel"
 )
 
 // System Runtime registry names of the six kernel pillars (K2). The
@@ -47,7 +47,7 @@ const (
 type kernelComponent struct {
 	name    string
 	deps    []string
-	mode    system_runtime.Mode
+	mode    kernel.Mode
 	readyFn func(ctx context.Context) error
 	stopFn  func(ctx context.Context) error
 	waitFn  func() error
@@ -119,7 +119,7 @@ func schedulerReady(sched *kernelScheduler) func(ctx context.Context) error {
 // working. A non-nil error from Adopt fails the serve startup loudly — a
 // kernel pillar that cannot join the managed graph would otherwise recreate
 // the "false Ready" blind spot the K group exists to close.
-func (k *kernelHandle) adopt(ctx context.Context, orch *system_runtime.Orchestrator) error {
+func (k *kernelHandle) adopt(ctx context.Context, orch *kernel.Orchestrator) error {
 	if k == nil {
 		return nil
 	}
@@ -157,7 +157,7 @@ func (k *kernelHandle) adopt(ctx context.Context, orch *system_runtime.Orchestra
 			// running reports Degraded + reason, never a false Ready.
 			name: sysCompScheduler,
 			deps: []string{sysCompTaskFabric, sysCompAgentFabric, sysCompDispatcher},
-			mode: system_runtime.ModeDegraded,
+			mode: kernel.ModeDegraded,
 			readyFn: func(ctx context.Context) error {
 				if k.scheduler == nil {
 					return nil
@@ -213,7 +213,7 @@ func (k *kernelHandle) adopt(ctx context.Context, orch *system_runtime.Orchestra
 		}
 		mode := c.mode
 		if mode == 0 {
-			mode = system_runtime.ModeRequired
+			mode = kernel.ModeRequired
 		}
 		if err := orch.Adopt(ctx, c, mode); err != nil {
 			return fmt.Errorf("serve: adopt kernel component %q: %w", c.name, err)

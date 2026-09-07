@@ -9,7 +9,7 @@ import (
 	"github.com/Timwood0x10/ares/internal/agentfabric"
 	"github.com/Timwood0x10/ares/internal/agentsyscall"
 	"github.com/Timwood0x10/ares/internal/core/models"
-	"github.com/Timwood0x10/ares/internal/kernelscheduler"
+	"github.com/Timwood0x10/ares/internal/kernel"
 )
 
 // This file wires the spawn_agent / create_task syscalls (D1) into the SDK
@@ -89,7 +89,7 @@ func (t *syscallTool) Capabilities() []string { return nil }
 // peerExecutorAdapter in peer mode; code_rules: no second executor
 // copy).
 type sdkSyscallExecutor struct {
-	inner kernelscheduler.CapabilityExecutor
+	inner kernel.CapabilityExecutor
 }
 
 var _ agentsyscall.Executor = (*sdkSyscallExecutor)(nil)

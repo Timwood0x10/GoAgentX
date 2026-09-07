@@ -57,7 +57,7 @@ func (h *Handler) WithEventStore(store ares_events.EventStore) *Handler {
 
 // WithSystemRuntime attaches the System Runtime snapshot provider (K5). The
 // provider must be a read-only, JSON-marshalable value (typically a
-// system_runtime.Snapshot). Optional — without it the snapshot endpoint keeps
+// kernel.Snapshot). Optional — without it the snapshot endpoint keeps
 // its legacy shape.
 func (h *Handler) WithSystemRuntime(provider func() any) *Handler {
 	h.systemRuntime = provider

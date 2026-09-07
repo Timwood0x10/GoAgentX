@@ -14,7 +14,7 @@ import (
 	"github.com/Timwood0x10/ares/internal/ares_events"
 	"github.com/Timwood0x10/ares/internal/core/models"
 	"github.com/Timwood0x10/ares/internal/errors"
-	"github.com/Timwood0x10/ares/internal/kernelctx"
+	kctx "github.com/Timwood0x10/ares/internal/kernel/ctx"
 	"github.com/Timwood0x10/ares/internal/llm/output"
 	resources "github.com/Timwood0x10/ares/internal/tools/resources/core"
 )
@@ -473,7 +473,7 @@ func (c *chatCognition) executeToolCall(ctx context.Context, tc core.ToolCall) (
 	// Stamp the caller identity into the tool context before invoking the
 	// tool so Kernel syscalls (agentsyscall) can enforce provenance
 	// (Task.Origin / ParentID) from the context, never from LLM args.
-	result, err := c.toolBinder.CallTool(kernelctx.WithCallerID(ctx, c.agentID), tc.Function.Name, args)
+	result, err := c.toolBinder.CallTool(kctx.WithCallerID(ctx, c.agentID), tc.Function.Name, args)
 	if err != nil {
 		return "", err
 	}
